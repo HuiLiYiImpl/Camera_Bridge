@@ -39,7 +39,7 @@ class ConnectionKeepAliveService : Service() {
     }
 
     private fun notification(): Notification = NotificationCompat.Builder(this, CHANNEL)
-        .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+        .setSmallIcon(R.drawable.ic_notification)
         .setContentTitle("尼康相机连接中")
         .setContentText("保持相机 Wi‑Fi 连接")
         .setOngoing(true)

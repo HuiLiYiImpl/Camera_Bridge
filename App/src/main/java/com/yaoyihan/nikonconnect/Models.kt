@@ -12,7 +12,6 @@ data class CameraConfig(
     val host: String = "192.168.1.1",
     val port: Int = 15740,
     val autoExport: Boolean = true,
-    val jpegFirst: Boolean = false,
     val lastSsid: String = "",
 )
 
@@ -45,13 +44,12 @@ class AppStore(context: Context) {
         prefs.getString("host", "192.168.1.1") ?: "192.168.1.1",
         prefs.getInt("port", 15740),
         prefs.getBoolean("autoExport", true),
-        prefs.getBoolean("jpegFirst", false),
         prefs.getString("last_ssid", "") ?: "",
     )
 
     fun save(config: CameraConfig) = prefs.edit()
         .putString("host", config.host).putInt("port", config.port)
-        .putBoolean("autoExport", config.autoExport).putBoolean("jpegFirst", config.jpegFirst)
+        .putBoolean("autoExport", config.autoExport)
         .putString("last_ssid", config.lastSsid).apply()
 
     fun downloads(): List<DownloadRecord> = runCatching {

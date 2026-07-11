@@ -35,6 +35,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val isBusy = MutableStateFlow(false)
     val hasMorePhotos = MutableStateFlow(false)
     val thumbnails = mutableStateMapOf<UInt, Bitmap?>()
+    private var lastFailedAsset: PhotoAsset? = null
     private val pageSize = 30
 
     fun updateConfig(transform: (CameraConfig) -> CameraConfig) {
@@ -84,7 +85,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         isBusy.value = true; workflow.value = Workflow.LOADING; notice.value = "正在读取相册"
         runCatching { withContext(Dispatchers.IO) { active.refreshAssets(); active.assets(limit = pageSize) } }
             .onSuccess { result ->
-                photos.value = if (config.value.jpegFirst) result.sortedBy { it.type != "JPEG" } else result
+                photos.value = result
                 hasMorePhotos.value = active.hasMoreAssets(photos.value.size)
                 workflow.value = Workflow.CONNECTED; notice.value = "已读取 ${result.size} 张文件"
             }.onFailure { showError(it.message ?: "读取相册失败") }
@@ -98,7 +99,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         runCatching { withContext(Dispatchers.IO) { active.assets(photos.value.size, pageSize) } }
             .onSuccess { page ->
                 val merged = photos.value + page
-                photos.value = if (config.value.jpegFirst) merged.sortedBy { it.type != "JPEG" } else merged
+                photos.value = merged
                 hasMorePhotos.value = active.hasMoreAssets(merged.size)
             }
             .onFailure { showError(it.message ?: "继续读取照片失败") }
@@ -140,10 +141,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 } }
             }
         }.onSuccess { record ->
-            store.addDownload(record); downloads.value = store.downloads(); workflow.value = Workflow.CONNECTED; notice.value = "已保存到系统相册"
-        }.onFailure { showError(it.message ?: "下载失败") }
+            store.addDownload(record); downloads.value = store.downloads(); workflow.value = Workflow.CONNECTED; notice.value = "已保存到系统相册"; lastFailedAsset = null
+        }.onFailure { lastFailedAsset = asset; showError(it.message ?: "下载失败") }
         isBusy.value = false
     }
+
+    fun retryDownload() { lastFailedAsset?.let { download(it) } }
 
     fun downloadAll(assets: List<PhotoAsset>) = viewModelScope.launch {
         val active = client ?: run { showError("相机连接已断开"); return@launch }
@@ -228,11 +231,5 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         @Suppress("DEPRECATION")
         val ssid = info?.ssid ?: app.getSystemService(WifiManager::class.java).connectionInfo?.ssid
         return ssid?.trim('"')?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
-    }
-
-    fun hasCameraWifi(): Boolean {
-        val remembered = config.value.lastSsid
-        if (remembered.isBlank()) return false
-        return currentSsid() == remembered
     }
 }

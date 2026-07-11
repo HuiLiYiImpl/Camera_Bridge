@@ -103,7 +103,7 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
             }
         }) { padding ->
             Column(Modifier.fillMaxSize().padding(padding)) {
-                if (!landing) notice?.let { ActivityPill(it, busy, Modifier.padding(horizontal = 20.dp, vertical = 10.dp)) }
+                if (!landing) notice?.let { ActivityPill(it, busy, Modifier.padding(horizontal = 20.dp, vertical = 10.dp), if (workflow == Workflow.ERROR) vm::retryDownload else null) }
                 AnimatedContent(tab, label = "tab") { screen ->
                     when (screen) {
                         Tab.CAMERA -> CameraScreen(vm, workflow, busy, notice) { tab = Tab.SETTINGS }
@@ -140,12 +140,13 @@ private fun BridgeNavigation(selected: Tab, select: (Tab) -> Unit) {
 }
 
 @Composable
-private fun ActivityPill(text: String, busy: Boolean, modifier: Modifier) {
-    Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), color = if (busy) BridgeEmber.copy(alpha = .16f) else BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
+private fun ActivityPill(text: String, busy: Boolean, modifier: Modifier, retry: (() -> Unit)? = null) {
+    Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), color = if (busy) BridgeEmber.copy(alpha = .16f) else if (retry != null) Color(0xFFE57373).copy(alpha = .12f) else BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, if (retry != null) Color(0xFFE57373).copy(alpha = .3f) else BridgeWhite.copy(alpha = .1f))) {
         Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (busy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = BridgeEmber) else Icon(Icons.Default.CheckCircle, null, tint = BridgeEmber, modifier = Modifier.size(16.dp))
+            if (busy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = BridgeEmber) else Icon(if (retry != null) Icons.Default.ErrorOutline else Icons.Default.CheckCircle, null, tint = if (retry != null) Color(0xFFE57373) else BridgeEmber, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(8.dp))
-            Text(text, color = BridgeWhite, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(text, Modifier.weight(1f), color = BridgeWhite, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (retry != null) { TextButton(retry, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)) { Text("重试", color = Color(0xFFE57373), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold) } }
         }
     }
 }
@@ -183,7 +184,7 @@ private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, c
     val status = when (state) {
         Workflow.CONNECTING -> "\u6b63\u5728\u5efa\u7acb\u5b89\u5168\u6865\u63a5"
         Workflow.ERROR -> notice ?: "\u8bf7\u68c0\u67e5\u76f8\u673a Wi-Fi"
-        else -> if (lastSsid.isNotBlank()) "\u4e0a\u6b21\u8fde\u63a5\uff1a$lastSsid" else "\u7b49\u5f85\u76f8\u673a Wi-Fi"
+        else -> if (lastSsid.isNotBlank()) "\u4e0a\u6b21\u8fde\u63a5\uff1a$lastSsid" else ""
     }
     Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight, Color(0xFF08070A))))) {
         Box(Modifier.size(420.dp).align(Alignment.TopCenter).offset(y = (-150).dp).background(Brush.radialGradient(listOf(BridgeEmber.copy(alpha = .42f), Color.Transparent)), CircleShape))
@@ -195,10 +196,16 @@ private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, c
             Spacer(Modifier.height(42.dp))
             Text("\u63a5\u5165\u76f8\u673a\nWi-Fi", color = BridgeWhite, fontSize = 38.sp, lineHeight = 42.sp, fontWeight = FontWeight.Normal)
             Spacer(Modifier.height(14.dp))
-            Text(if (lastSsid.isNotBlank()) "\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae\uff0c\u82e5\u5df2\u8fde\u63a5\u76f8\u673a Wi-Fi \u5c06\u81ea\u52a8\u5efa\u7acb\u6865\u63a5\u3002" else "\u5148\u5728\u7cfb\u7edf Wi-Fi \u4e2d\u8fde\u63a5\u76f8\u673a\u70ed\u70b9\uff0c\nCamera_Bridge \u4f1a\u4e3a\u4f60\u5efa\u7acb\u5b89\u5168\u7684\u7167\u7247\u4f20\u8f93\u6865\u63a5\u3002", color = BridgeWhite.copy(alpha = .68f), style = MaterialTheme.typography.bodyMedium)
+            Text(if (lastSsid.isNotBlank()) "\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae\uff0c\u82e5\u5df2\u8fde\u63a5\u76f8\u673a Wi-Fi \u5c06\u81ea\u52a8\u5efa\u7acb\u6865\u63a5\u3002" else "\u6309\u4ee5\u4e0b\u6b65\u9aa4\u8fde\u63a5\u76f8\u673a\uff0c\u5b8c\u6210\u540e\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae\u5efa\u7acb\u6865\u63a5\u3002", color = BridgeWhite.copy(alpha = .68f), style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(18.dp))
-            Surface(shape = RoundedCornerShape(20.dp), color = BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
+            if (status.isNotBlank()) Surface(shape = RoundedCornerShape(20.dp), color = BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
                 Row(Modifier.padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Wifi, null, tint = BridgeEmber, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(7.dp)); Text(status, color = BridgeWhite.copy(alpha = .88f), style = MaterialTheme.typography.labelMedium) }
+            }
+            Spacer(Modifier.height(14.dp))
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                ConnectionStep(1, "\u8fde\u63a5\u5230\u667a\u80fd\u8bbe\u5907", "\u76f8\u673a\u83dc\u5355 \u2192 \u8bbe\u7f6e \u2192 \u8fde\u63a5\u5230\u667a\u80fd\u8bbe\u5907")
+                ConnectionStep(2, "Wi-Fi \u8fde\u63a5", "\u9009\u62e9 AP mode\uff08\u63a5\u5165\u70b9\u6a21\u5f0f\uff09")
+                ConnectionStep(3, "\u5efa\u7acb Wi-Fi \u8fde\u63a5", "\u624b\u673a\u8fde\u63a5\u76f8\u673a\u70ed\u70b9\u540e\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae")
             }
             Spacer(Modifier.weight(1f))
             ConnectionLightField(pulse)
@@ -207,6 +214,17 @@ private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, c
                 Icon(if (busy) Icons.Default.Sync else Icons.Default.Wifi, null); Spacer(Modifier.width(10.dp)); Text(if (busy) "\u6b63\u5728\u5efa\u7acb\u8fde\u63a5" else "\u5f00\u59cb\u5efa\u7acb\u8fde\u63a5", fontWeight = FontWeight.Bold)
             }
             Text("\u8fde\u4e0d\u4e0a\u65f6\u4f1a\u81ea\u52a8\u8df3\u8f6c Wi-Fi \u8bbe\u7f6e", Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 6.dp), color = BridgeWhite.copy(alpha = .48f), style = MaterialTheme.typography.labelSmall, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        }
+    }
+}
+
+@Composable
+private fun ConnectionStep(index: Int, title: String, subtitle: String) {
+    Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp), color = BridgeWhite.copy(alpha = .05f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .08f))) {
+        Row(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Surface(Modifier.size(24.dp), shape = CircleShape, color = BridgeEmber.copy(alpha = .18f)) { Box(contentAlignment = Alignment.Center) { Text("$index", color = BridgeEmber, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold) } }
+            Spacer(Modifier.width(12.dp))
+            Column { Text(title, color = BridgeWhite, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold); Text(subtitle, color = BridgeWhite.copy(alpha = .5f), style = MaterialTheme.typography.bodySmall) }
         }
     }
 }
@@ -274,7 +292,7 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
                     else { vm.loadThumbnail(asset); previewBitmap = null; previewLoading = false; preview = asset }
                 }
             }
-            if (hasMore && filter == PhotoFilter.ALL) item { LaunchedEffect(photos.size) { vm.loadMorePhotos() }; CircularProgressIndicator(Modifier.padding(20.dp), color = BridgeEmber) }
+            if (hasMore && filter == PhotoFilter.ALL) item { Row(Modifier.fillMaxWidth().padding(20.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) { LaunchedEffect(photos.size) { vm.loadMorePhotos() }; CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(10.dp)); Text("正在加载更多", color = BridgeWhite.copy(alpha = .6f), style = MaterialTheme.typography.labelMedium) } }
         }
     }
     preview?.let { asset ->
@@ -285,7 +303,7 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
                 val bitmap = vm.loadOriginalPreview(asset)
                 if (preview?.handle == asset.handle) { previewBitmap = bitmap; previewLoading = false }
             }
-        })
+        }) { vm.download(asset) }
     }
 }
 
