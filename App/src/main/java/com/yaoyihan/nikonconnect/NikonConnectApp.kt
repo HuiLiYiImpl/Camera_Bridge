@@ -119,20 +119,20 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
 
 @Composable
 private fun BridgeNavigation(selected: Tab, select: (Tab) -> Unit) {
-    Box(Modifier.fillMaxWidth().height(82.dp).padding(horizontal = 18.dp, vertical = 10.dp), contentAlignment = Alignment.Center) {
-        Surface(shape = RoundedCornerShape(30.dp), color = Color(0xFF1D191E), shadowElevation = 8.dp, border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = .06f))) {
-            Row(Modifier.padding(5.dp), verticalAlignment = Alignment.CenterVertically) {
+    Box(Modifier.fillMaxWidth().height(99.dp).padding(horizontal = 18.dp).padding(bottom = 36.dp), contentAlignment = Alignment.Center) {
+        Surface(shape = RoundedCornerShape(39.dp), color = Color(0xFF1D191E), shadowElevation = 8.dp, border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = .06f))) {
+            Row(Modifier.padding(7.dp), verticalAlignment = Alignment.CenterVertically) {
                 Tab.entries.forEach { item ->
                     val active = item == selected
                     if (active) {
-                        Surface(shape = RoundedCornerShape(24.dp), color = BridgeWhite) {
-                            Row(Modifier.height(48.dp).animateContentSize().clickable { select(item) }.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Icon(tabIcon(item), null, tint = BridgeNight, modifier = Modifier.size(19.dp))
-                                Spacer(Modifier.width(7.dp))
+                        Surface(shape = RoundedCornerShape(31.dp), color = BridgeWhite) {
+                            Row(Modifier.height(62.dp).animateContentSize().clickable { select(item) }.padding(horizontal = 21.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(tabIcon(item), null, tint = BridgeNight, modifier = Modifier.size(25.dp))
+                                Spacer(Modifier.width(9.dp))
                                 Text(item.title, color = BridgeNight, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
                             }
                         }
-                    } else IconButton({ select(item) }, Modifier.size(48.dp)) { Icon(tabIcon(item), item.title, tint = BridgeWhite.copy(alpha = .62f), modifier = Modifier.size(21.dp)) }
+                    } else IconButton({ select(item) }, Modifier.size(62.dp)) { Icon(tabIcon(item), item.title, tint = BridgeWhite.copy(alpha = .62f), modifier = Modifier.size(27.dp)) }
                 }
             }
         }
@@ -423,15 +423,14 @@ private fun shareUris(context: android.content.Context, uris: List<String>) {
     context.startActivity(android.content.Intent.createChooser(intent, "\u5206\u4eab\u5230"))
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsScreen(vm: MainViewModel) {
     val config by vm.config.collectAsState()
     var host by remember(config.host) { mutableStateOf(config.host) }
     var port by remember(config.port) { mutableStateOf(config.port.toString()) }
     Column(Modifier.fillMaxSize().background(BridgeNight)) {
-        TopAppBar(title = { Text("\u8bbe\u7f6e", fontWeight = FontWeight.Bold) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = BridgeNight, titleContentColor = BridgeWhite))
-        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        BridgePageLabel("\u8bbe\u7f6e", "\u76f8\u673a IP \u4e0e\u7aef\u53e3") {}
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 94.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             item {
                 Text("\u5c3c\u5eb7 PTP/IP", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge); Spacer(Modifier.height(8.dp))
                 Card(colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f)), shape = RoundedCornerShape(20.dp)) { Column(Modifier.padding(16.dp)) {
