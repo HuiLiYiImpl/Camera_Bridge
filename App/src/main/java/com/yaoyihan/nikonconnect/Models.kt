@@ -13,6 +13,7 @@ data class CameraConfig(
     val port: Int = 15740,
     val autoExport: Boolean = true,
     val jpegFirst: Boolean = false,
+    val lastSsid: String = "",
 )
 
 data class CameraSession(val name: String, val host: String, val port: Int)
@@ -45,11 +46,13 @@ class AppStore(context: Context) {
         prefs.getInt("port", 15740),
         prefs.getBoolean("autoExport", true),
         prefs.getBoolean("jpegFirst", false),
+        prefs.getString("last_ssid", "") ?: "",
     )
 
     fun save(config: CameraConfig) = prefs.edit()
         .putString("host", config.host).putInt("port", config.port)
-        .putBoolean("autoExport", config.autoExport).putBoolean("jpegFirst", config.jpegFirst).apply()
+        .putBoolean("autoExport", config.autoExport).putBoolean("jpegFirst", config.jpegFirst)
+        .putString("last_ssid", config.lastSsid).apply()
 
     fun downloads(): List<DownloadRecord> = runCatching {
         val array = JSONArray(prefs.getString("downloads", "[]"))

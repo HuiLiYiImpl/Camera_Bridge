@@ -8,6 +8,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import androidx.compose.runtime.mutableStateMapOf
@@ -40,9 +41,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         config.update(transform); store.save(config.value)
     }
 
-    fun connect() = viewModelScope.launch {
+    fun connect(manual: Boolean = false) = viewModelScope.launch {
         val target = config.value
-        val network = cameraNetwork() ?: run { showError("请先连接相机 Wi‑Fi 后再继续"); return@launch }
+        val network = cameraNetwork()
+        if (network == null) {
+            if (manual) openWifiSettings() else showError("请先连接相机 Wi‑Fi 后再继续")
+            return@launch
+        }
         val host = cameraGateway().ifBlank { target.host.trim() }
         if (target.host.isBlank() || target.port !in 1..65535) { showError("请填写有效的相机地址和端口"); return@launch }
         isBusy.value = true; workflow.value = Workflow.CONNECTING; notice.value = "正在连接 ${target.host}:${target.port}"
@@ -54,9 +59,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             session.value = CameraSession(ptp.cameraName, host, target.port)
             keepConnectionAlive(true)
             workflow.value = Workflow.CONNECTED; notice.value = "已连接 ${ptp.cameraName}"
+            currentSsid()?.let { ssid -> if (ssid.isNotBlank()) updateConfig { c -> c.copy(lastSsid = ssid) } }
             loadPhotos()
-        }.onFailure { showError(it.message ?: "无法连接相机，请确认已连接相机 Wi‑Fi") }
+        }.onFailure {
+            workflow.value = Workflow.WAITING
+            if (manual) openWifiSettings() else showError(it.message ?: "无法连接相机，请确认已连接相机 Wi‑Fi")
+        }
         isBusy.value = false
+    }
+
+    private fun openWifiSettings() {
+        val app = getApplication<Application>()
+        app.startActivity(android.content.Intent(android.provider.Settings.ACTION_WIFI_SETTINGS).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
     fun disconnect() = viewModelScope.launch(Dispatchers.IO) {
@@ -105,6 +119,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         runCatching {
             val bytes = client?.download(asset) { _, _ -> } ?: return@runCatching null
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }.getOrNull()
+    }
+
+    suspend fun loadLocalOriginal(uri: String): Bitmap? = withContext(Dispatchers.IO) {
+        runCatching {
+            getApplication<Application>().contentResolver.openInputStream(android.net.Uri.parse(uri))?.use {
+                BitmapFactory.decodeStream(it)
+            }
         }.getOrNull()
     }
 
@@ -183,5 +205,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val address = getApplication<Application>().getSystemService(WifiManager::class.java).dhcpInfo?.serverAddress ?: return ""
         if (address == 0) return ""
         return listOf(address and 0xFF, address shr 8 and 0xFF, address shr 16 and 0xFF, address shr 24 and 0xFF).joinToString(".")
+    }
+
+    fun currentSsid(): String? {
+        val app = getApplication<Application>()
+        val cm = app.getSystemService(ConnectivityManager::class.java)
+        val network = cameraNetwork() ?: return null
+        val caps = cm.getNetworkCapabilities(network) ?: return null
+        // ponytail: read SSID from WifiInfo (API 31+: via transportInfo to avoid deprecated allNetworks info path)
+        val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) caps.transportInfo as? android.net.wifi.WifiInfo else null
+        @Suppress("DEPRECATION")
+        val ssid = info?.ssid ?: app.getSystemService(WifiManager::class.java).connectionInfo?.ssid
+        return ssid?.trim('"')?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
+    }
+
+    fun hasCameraWifi(): Boolean {
+        val remembered = config.value.lastSsid
+        if (remembered.isBlank()) return false
+        return currentSsid() == remembered
     }
 }

@@ -147,7 +147,8 @@ private fun ActivityPill(text: String, busy: Boolean, modifier: Modifier) {
 private fun CameraScreen(vm: MainViewModel, state: Workflow, busy: Boolean, notice: String?, openSettings: () -> Unit) {
     val session by vm.session.collectAsState()
     val photos by vm.photos.collectAsState()
-    if (session == null) ConnectionLanding(state, busy, notice, vm::connect, openSettings)
+    val config by vm.config.collectAsState()
+    if (session == null) ConnectionLanding(state, busy, notice, { vm.connect(true) }, openSettings, config.lastSsid)
     else Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight))).padding(horizontal = 24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         BridgePageLabel("\u76f8\u673a", "\u5b89\u5168\u6865\u63a5\u5df2\u5efa\u7acb")
         Spacer(Modifier.weight(1f)); LensGlow(state); Spacer(Modifier.height(24.dp))
@@ -170,12 +171,12 @@ private fun CameraScreen(vm: MainViewModel, state: Workflow, busy: Boolean, noti
 }
 
 @Composable
-private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, connect: () -> Unit, openSettings: () -> Unit) {
+private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, connect: () -> Unit, openSettings: () -> Unit, lastSsid: String) {
     val pulse by rememberInfiniteTransition(label = "bridge").animateFloat(0.94f, 1.08f, infiniteRepeatable(tween(1800), RepeatMode.Reverse), label = "signal")
     val status = when (state) {
         Workflow.CONNECTING -> "\u6b63\u5728\u5efa\u7acb\u5b89\u5168\u6865\u63a5"
         Workflow.ERROR -> notice ?: "\u8bf7\u68c0\u67e5\u76f8\u673a Wi-Fi"
-        else -> "\u7b49\u5f85\u76f8\u673a Wi-Fi"
+        else -> if (lastSsid.isNotBlank()) "\u4e0a\u6b21\u8fde\u63a5\uff1a$lastSsid" else "\u7b49\u5f85\u76f8\u673a Wi-Fi"
     }
     Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight, Color(0xFF08070A))))) {
         Box(Modifier.size(420.dp).align(Alignment.TopCenter).offset(y = (-150).dp).background(Brush.radialGradient(listOf(BridgeEmber.copy(alpha = .42f), Color.Transparent)), CircleShape))
@@ -187,7 +188,7 @@ private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, c
             Spacer(Modifier.height(42.dp))
             Text("\u63a5\u5165\u76f8\u673a\nWi-Fi", color = BridgeWhite, fontSize = 38.sp, lineHeight = 42.sp, fontWeight = FontWeight.Normal)
             Spacer(Modifier.height(14.dp))
-            Text("\u5148\u5728\u7cfb\u7edf Wi-Fi \u4e2d\u8fde\u63a5\u76f8\u673a\u70ed\u70b9，\nCamera_Bridge \u4f1a\u4e3a\u4f60\u5efa\u7acb\u5b89\u5168\u7684\u7167\u7247\u4f20\u8f93\u6865\u63a5。", color = BridgeWhite.copy(alpha = .68f), style = MaterialTheme.typography.bodyMedium)
+            Text(if (lastSsid.isNotBlank()) "\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae\uff0c\u82e5\u5df2\u8fde\u63a5\u76f8\u673a Wi-Fi \u5c06\u81ea\u52a8\u5efa\u7acb\u6865\u63a5\u3002" else "\u5148\u5728\u7cfb\u7edf Wi-Fi \u4e2d\u8fde\u63a5\u76f8\u673a\u70ed\u70b9\uff0c\nCamera_Bridge \u4f1a\u4e3a\u4f60\u5efa\u7acb\u5b89\u5168\u7684\u7167\u7247\u4f20\u8f93\u6865\u63a5\u3002", color = BridgeWhite.copy(alpha = .68f), style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(18.dp))
             Surface(shape = RoundedCornerShape(20.dp), color = BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
                 Row(Modifier.padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Wifi, null, tint = BridgeEmber, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(7.dp)); Text(status, color = BridgeWhite.copy(alpha = .88f), style = MaterialTheme.typography.labelMedium) }
@@ -198,7 +199,7 @@ private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, c
             Button(connect, Modifier.fillMaxWidth().height(58.dp), enabled = !busy, shape = RoundedCornerShape(30.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeWhite, disabledContainerColor = BridgeCopper, disabledContentColor = BridgeWhite.copy(alpha = .75f))) {
                 Icon(if (busy) Icons.Default.Sync else Icons.Default.Wifi, null); Spacer(Modifier.width(10.dp)); Text(if (busy) "\u6b63\u5728\u5efa\u7acb\u8fde\u63a5" else "\u5f00\u59cb\u5efa\u7acb\u8fde\u63a5", fontWeight = FontWeight.Bold)
             }
-            Text("\u8bf7\u4fdd\u6301\u8fde\u63a5\u5728\u76f8\u673a Wi-Fi \u7f51\u7edc\u4e2d", Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 6.dp), color = BridgeWhite.copy(alpha = .48f), style = MaterialTheme.typography.labelSmall, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            Text("\u8fde\u4e0d\u4e0a\u65f6\u4f1a\u81ea\u52a8\u8df3\u8f6c Wi-Fi \u8bbe\u7f6e", Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 6.dp), color = BridgeWhite.copy(alpha = .48f), style = MaterialTheme.typography.labelSmall, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
         }
     }
 }
@@ -270,25 +271,25 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
         }
     }
     preview?.let { asset ->
-        PreviewDialog(asset, vm.thumbnails[asset.handle], previewBitmap, previewLoading, { preview = null }, {
+        PreviewDialog(asset.name, asset.size, vm.thumbnails[asset.handle], previewBitmap, previewLoading, { preview = null }, {
             previewBitmap = null
             previewLoading = true
             scope.launch {
                 val bitmap = vm.loadOriginalPreview(asset)
                 if (preview?.handle == asset.handle) { previewBitmap = bitmap; previewLoading = false }
             }
-        }) { vm.download(asset) }
+        })
     }
 }
 
 @Composable
-private fun PreviewDialog(asset: PhotoAsset, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: () -> Unit, download: () -> Unit) {
-    var rotation by remember(asset.handle) { mutableIntStateOf(0) }
+private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, download: (() -> Unit)? = null) {
+    var rotation by remember(name) { mutableIntStateOf(0) }
     Dialog(onDismissRequest = dismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxWidth(.96f).fillMaxHeight(.9f), shape = RoundedCornerShape(28.dp), color = Color(0xFF171015), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
             Column(Modifier.fillMaxSize().padding(16.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) { Text(asset.name, color = BridgeWhite, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(asset.size.prettySize(), color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }
+                    Column(Modifier.weight(1f)) { Text(name, color = BridgeWhite, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(size.prettySize(), color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }
                     IconButton({ rotation = (rotation + 90) % 360 }) { Icon(Icons.Default.RotateRight, "顺时针旋转 90 度", tint = BridgeWhite) }
                     IconButton(dismiss) { Icon(Icons.Default.Close, "关闭", tint = BridgeWhite) }
                 }
@@ -296,9 +297,9 @@ private fun PreviewDialog(asset: PhotoAsset, thumbnail: Bitmap?, bitmap: Bitmap?
                     (bitmap ?: thumbnail)?.let { ZoomableImage(it, rotation) } ?: Text("正在加载缩略图", color = BridgeWhite)
                     if (loading) CircularProgressIndicator(color = BridgeEmber)
                 }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(download) { Text("下载原图", color = BridgeWhite) }
-                    Button(loadOriginal, enabled = !loading, shape = RoundedCornerShape(18.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) { Text(if (bitmap == null) "查看原图" else "重新加载") }
+                if (loadOriginal != null || download != null) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                    if (download != null) TextButton(download) { Text("下载原图", color = BridgeWhite) }
+                    if (loadOriginal != null) Button(loadOriginal, enabled = !loading, shape = RoundedCornerShape(18.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) { Text(if (bitmap == null) "查看原图" else "重新加载") }
                 }
             }
         }
@@ -337,12 +338,23 @@ private fun PhotoCard(asset: PhotoAsset, bitmap: Bitmap?, load: () -> Unit, sele
 @Composable
 private fun DownloadsScreen(vm: MainViewModel) {
     val rows by vm.downloads.collectAsState()
+    var preview by remember { mutableStateOf<DownloadRecord?>(null) }
+    var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var previewLoading by remember { mutableStateOf(false) }
+    LaunchedEffect(preview?.uri) {
+        val uri = preview?.uri ?: return@LaunchedEffect
+        previewBitmap = null; previewLoading = true
+        previewBitmap = vm.loadLocalOriginal(uri); previewLoading = false
+    }
     Column(Modifier.fillMaxSize().background(BridgeNight)) {
         BridgePageLabel("\u4e0b\u8f7d", "\u5df2\u4fdd\u5b58 ${rows.size} \u4e2a\u6587\u4ef6") {}
         if (rows.isEmpty()) BridgeEmptyState(Icons.Default.CloudDownload, "\u6682\u65e0\u4e0b\u8f7d\u8bb0\u5f55", "\u5728\u76f8\u518c\u4e2d\u9009\u62e9\u7167\u7247\u5373\u53ef\u4fdd\u5b58\u5230\u624b\u673a")
         else LazyVerticalStaggeredGrid(StaggeredGridCells.Adaptive(148.dp), Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 94.dp), verticalItemSpacing = 10.dp, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(rows, key = { it.uri }) { DownloadCard(it) }
+            items(rows, key = { it.uri }) { DownloadCard(it) { preview = it } }
         }
+    }
+    preview?.let { row ->
+        PreviewDialog(row.name, row.size, null, previewBitmap, previewLoading, { preview = null }, null)
     }
 }
 
@@ -383,7 +395,7 @@ private fun PreferenceSwitch(title: String, subtitle: String, checked: Boolean, 
 @Composable private fun BridgePageLabel(title: String, subtitle: String, action: @Composable () -> Unit = {}) { Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 10.dp, top = 14.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(title, color = BridgeWhite, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Text(subtitle, color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }; action() } }
 @Composable private fun FilterBar(selected: PhotoFilter, select: (PhotoFilter) -> Unit) { LazyRow(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { items(PhotoFilter.entries) { filter -> Surface(Modifier.clickable { select(filter) }, shape = RoundedCornerShape(18.dp), color = if (filter == selected) BridgeEmber else BridgeWhite.copy(alpha = .08f), border = if (filter == selected) null else androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) { Text(filter.title, Modifier.padding(horizontal = 14.dp, vertical = 8.dp), color = if (filter == selected) BridgeNight else BridgeWhite, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold) } } } }
 @Composable private fun BridgeEmptyState(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, subtitle: String) { Column(Modifier.fillMaxSize().padding(36.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Surface(Modifier.size(72.dp), shape = CircleShape, color = BridgeEmber.copy(alpha = .13f)) { Icon(icon, null, tint = BridgeEmber, modifier = Modifier.padding(21.dp)) }; Spacer(Modifier.height(16.dp)); Text(title, color = BridgeWhite, fontWeight = FontWeight.Bold); Spacer(Modifier.height(5.dp)); Text(subtitle, color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) } }
-@Composable private fun DownloadCard(row: DownloadRecord) { val context = LocalContext.current; val bitmap by produceState<Bitmap?>(null, row.uri) { value = withContext(Dispatchers.IO) { loadDownloadThumbnail(context, row.uri) } }; val ratio = when (row.name.hashCode().and(3)) { 0 -> .72f; 1 -> 1.16f; 2 -> .86f; else -> .98f }; Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) { Box(Modifier.aspectRatio(ratio)) { if (bitmap != null) Image(bitmap!!.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Download, null, tint = BridgeEmber) }; Surface(Modifier.align(Alignment.BottomEnd).padding(7.dp), shape = RoundedCornerShape(10.dp), color = BridgeNight.copy(alpha = .72f)) { Text(row.size.prettySize(), Modifier.padding(horizontal = 7.dp, vertical = 4.dp), color = BridgeWhite, style = MaterialTheme.typography.labelSmall) } } } }
+@Composable private fun DownloadCard(row: DownloadRecord, click: () -> Unit) { val context = LocalContext.current; val bitmap by produceState<Bitmap?>(null, row.uri) { value = withContext(Dispatchers.IO) { loadDownloadThumbnail(context, row.uri) } }; val ratio = when (row.name.hashCode().and(3)) { 0 -> .72f; 1 -> 1.16f; 2 -> .86f; else -> .98f }; Card(Modifier.fillMaxWidth().clickable { click() }, shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) { Box(Modifier.aspectRatio(ratio)) { if (bitmap != null) Image(bitmap!!.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Download, null, tint = BridgeEmber) }; Surface(Modifier.align(Alignment.BottomEnd).padding(7.dp), shape = RoundedCornerShape(10.dp), color = BridgeNight.copy(alpha = .72f)) { Text(row.size.prettySize(), Modifier.padding(horizontal = 7.dp, vertical = 4.dp), color = BridgeWhite, style = MaterialTheme.typography.labelSmall) } } } }
 private fun loadDownloadThumbnail(context: android.content.Context, uri: String): Bitmap? = runCatching { val parsed = Uri.parse(uri); if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) context.contentResolver.loadThumbnail(parsed, Size(480, 640), null) else context.contentResolver.openInputStream(parsed)?.use { BitmapFactory.decodeStream(it) } }.getOrNull()
 @Composable private fun bridgeFieldColors() = OutlinedTextFieldDefaults.colors(focusedTextColor = BridgeWhite, unfocusedTextColor = BridgeWhite, focusedLabelColor = BridgeEmber, unfocusedLabelColor = BridgeWhite.copy(alpha = .55f), focusedBorderColor = BridgeEmber, unfocusedBorderColor = BridgeWhite.copy(alpha = .2f), cursorColor = BridgeEmber)
 @Composable private fun Header(title: String, subtitle: String, action: @Composable () -> Unit) { Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 10.dp, top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Text(subtitle, color = Muted, style = MaterialTheme.typography.bodySmall) }; action() } }
