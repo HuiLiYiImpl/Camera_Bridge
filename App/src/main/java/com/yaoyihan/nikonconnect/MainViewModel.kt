@@ -172,6 +172,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         isBusy.value = false
     }
 
+    fun deleteDownloads(uris: Set<String>) = viewModelScope.launch {
+        if (uris.isEmpty()) return@launch
+        val resolver = getApplication<Application>().contentResolver
+        withContext(Dispatchers.IO) {
+            uris.forEach { uri -> runCatching { resolver.delete(android.net.Uri.parse(uri), null, null) } }
+        }
+        store.removeDownloads(uris)
+        downloads.value = store.downloads()
+        notice.value = "已删除 ${uris.size} 个文件"
+    }
+
     private fun saveToMediaStore(asset: PhotoAsset, exportToGallery: Boolean, write: (java.io.OutputStream) -> Long): DownloadRecord {
         val resolver = getApplication<Application>().contentResolver
         val mime = when (asset.name.substringAfterLast('.', "").lowercase()) { "jpg", "jpeg" -> "image/jpeg"; "png" -> "image/png"; "mov" -> "video/quicktime"; "mp4" -> "video/mp4"; else -> "application/octet-stream" }

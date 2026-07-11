@@ -67,6 +67,13 @@ class AppStore(context: Context) {
         rows.forEach { array.put(JSONObject().put("name", it.name).put("size", it.size).put("uri", it.uri).put("time", it.completedAt)) }
         prefs.edit().putString("downloads", array.toString()).apply()
     }
+
+    fun removeDownloads(uris: Set<String>) {
+        val rows = downloads().filter { it.uri !in uris }
+        val array = JSONArray()
+        rows.forEach { array.put(JSONObject().put("name", it.name).put("size", it.size).put("uri", it.uri).put("time", it.completedAt)) }
+        prefs.edit().putString("downloads", array.toString()).apply()
+    }
 }
 
 fun Long.prettySize(): String = when {
