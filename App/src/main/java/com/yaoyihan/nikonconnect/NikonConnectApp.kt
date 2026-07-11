@@ -1,6 +1,10 @@
 package com.yaoyihan.nikonconnect
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Build
+import android.util.Size
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.RepeatMode
@@ -16,11 +20,15 @@ import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.staggeredgrid.LazyVerticalStaggeredGrid
+import androidx.compose.foundation.lazy.staggeredgrid.StaggeredGridCells
+import androidx.compose.foundation.lazy.staggeredgrid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -39,6 +47,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -48,6 +57,8 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.Date
 
 private val Canvas = Color(0xFFF9F9F8)
@@ -62,6 +73,13 @@ private val BridgeEmber = Color(0xFFFF7133)
 private val BridgeCopper = Color(0xFFB95732)
 private val BridgeWhite = Color(0xFFFFF7F1)
 private enum class Tab(val title: String) { CAMERA("\u76f8\u673a"), PHOTOS("\u7167\u7247"), DOWNLOADS("\u4e0b\u8f7d"), SETTINGS("\u8bbe\u7f6e") }
+private enum class PhotoFilter(val title: String) { ALL("\u5168\u90e8"), JPG("JPG"), RAW("RAW"), VIDEO("\u89c6\u9891") }
+private fun PhotoAsset.matches(filter: PhotoFilter) = when (filter) {
+    PhotoFilter.ALL -> true
+    PhotoFilter.JPG -> type == "JPEG"
+    PhotoFilter.RAW -> type == "RAW"
+    PhotoFilter.VIDEO -> type in setOf("MOV", "MP4")
+}
 
 @Composable
 fun NikonConnectApp(vm: MainViewModel = viewModel()) {
@@ -71,8 +89,8 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
     val session by vm.session.collectAsState()
     var tab by remember { mutableStateOf(Tab.CAMERA) }
     val landing = tab == Tab.CAMERA && session == null
-    MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(background = Canvas, surface = Color.White, primary = Ink, onPrimary = Color.White)) {
-        Scaffold(containerColor = if (landing) BridgeNight else Canvas, bottomBar = {
+    MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(background = BridgeNight, surface = Color(0xFF181015), primary = BridgeEmber, onPrimary = BridgeWhite)) {
+        Scaffold(containerColor = BridgeNight, bottomBar = {
             if (!landing) {
                 BridgeNavigation(tab) { tab = it }
             }
@@ -116,11 +134,11 @@ private fun BridgeNavigation(selected: Tab, select: (Tab) -> Unit) {
 
 @Composable
 private fun ActivityPill(text: String, busy: Boolean, modifier: Modifier) {
-    Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), color = if (busy) AmberSoft else Color.White, shadowElevation = 2.dp) {
+    Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), color = if (busy) BridgeEmber.copy(alpha = .16f) else BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
         Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (busy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = Amber) else Icon(Icons.Default.CheckCircle, null, tint = Green, modifier = Modifier.size(16.dp))
+            if (busy) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = BridgeEmber) else Icon(Icons.Default.CheckCircle, null, tint = BridgeEmber, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(8.dp))
-            Text(text, color = Ink, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(text, color = BridgeWhite, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -130,22 +148,23 @@ private fun CameraScreen(vm: MainViewModel, state: Workflow, busy: Boolean, noti
     val session by vm.session.collectAsState()
     val photos by vm.photos.collectAsState()
     if (session == null) ConnectionLanding(state, busy, notice, vm::connect, openSettings)
-    else Column(Modifier.fillMaxSize().padding(horizontal = 20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+    else Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight))).padding(horizontal = 24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        BridgePageLabel("\u76f8\u673a", "\u5b89\u5168\u6865\u63a5\u5df2\u5efa\u7acb")
         Spacer(Modifier.weight(1f)); LensGlow(state); Spacer(Modifier.height(24.dp))
-        Text("${session!!.name} \u5df2\u8fde\u63a5", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = Ink)
+        Text("${session!!.name} \u5df2\u8fde\u63a5", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = BridgeWhite)
         Spacer(Modifier.height(10.dp)); Status(state); Spacer(Modifier.weight(1f))
-        Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(22.dp), elevation = CardDefaults.cardElevation(2.dp)) {
+        Card(colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f)), shape = RoundedCornerShape(24.dp)) {
             Column(Modifier.fillMaxWidth().padding(18.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.CameraAlt, null, tint = Color.White, modifier = Modifier.background(Green, RoundedCornerShape(10.dp)).padding(8.dp))
-                    Spacer(Modifier.width(12.dp)); Column { Text(session!!.name, fontWeight = FontWeight.Bold, color = Ink); Text("\u5df2\u51c6\u5907\u597d\u6d4f\u89c8\u548c\u4e0b\u8f7d", color = Muted, style = MaterialTheme.typography.bodySmall) }
+                    Icon(Icons.Default.CameraAlt, null, tint = BridgeNight, modifier = Modifier.background(BridgeEmber, RoundedCornerShape(10.dp)).padding(8.dp))
+                    Spacer(Modifier.width(12.dp)); Column { Text(session!!.name, fontWeight = FontWeight.Bold, color = BridgeWhite); Text("\u5df2\u51c6\u5907\u597d\u6d4f\u89c8\u548c\u4e0b\u8f7d", color = BridgeWhite.copy(alpha = .58f), style = MaterialTheme.typography.bodySmall) }
                 }
-                if (photos.isNotEmpty()) Text("\u5df2\u627e\u5230 ${photos.size} \u4e2a\u6587\u4ef6", Modifier.padding(top = 14.dp), color = Muted)
-                Spacer(Modifier.height(14.dp)); SecondaryButton("\u8bfb\u53d6\u7167\u7247", Icons.Default.Refresh, !busy, vm::loadPhotos)
+                if (photos.isNotEmpty()) Text("\u5df2\u627e\u5230 ${photos.size} \u4e2a\u6587\u4ef6", Modifier.padding(top = 14.dp), color = BridgeWhite.copy(alpha = .7f))
+                Spacer(Modifier.height(14.dp)); Button(vm::loadPhotos, Modifier.fillMaxWidth(), enabled = !busy, shape = RoundedCornerShape(16.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) { Icon(Icons.Default.Refresh, null); Spacer(Modifier.width(8.dp)); Text("\u8bfb\u53d6\u7167\u7247") }
             }
         }
         Spacer(Modifier.height(12.dp))
-        Button(vm::disconnect, Modifier.fillMaxWidth(), enabled = !busy, colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFFCD2830))) { Text("\u65ad\u5f00\u8fde\u63a5") }
+        Button(vm::disconnect, Modifier.fillMaxWidth(), enabled = !busy, shape = RoundedCornerShape(20.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeWhite.copy(alpha = .08f), contentColor = BridgeWhite)) { Text("\u65ad\u5f00\u8fde\u63a5") }
         Spacer(Modifier.height(22.dp))
     }
 }
@@ -197,22 +216,22 @@ private fun ConnectionLightField(pulse: Float) {
 @Composable
 private fun LensGlow(state: Workflow) {
     val pulse by rememberInfiniteTransition(label = "lens").animateFloat(0.92f, 1.12f, infiniteRepeatable(tween(1400), RepeatMode.Reverse), label = "pulse")
-    val color = if (state == Workflow.CONNECTED) Green else Amber
+    val color = BridgeEmber
     Box(Modifier.size(136.dp), contentAlignment = Alignment.Center) {
         Box(Modifier.size(116.dp).scale(if (state == Workflow.CONNECTING || state == Workflow.LOADING) pulse else 1f).background(color.copy(alpha = .12f), CircleShape))
-        Surface(Modifier.size(82.dp), shape = CircleShape, color = Ink, shadowElevation = 8.dp) { Icon(Icons.Default.CameraAlt, null, Modifier.padding(21.dp), tint = Color.White) }
+        Surface(Modifier.size(82.dp), shape = CircleShape, color = BridgeWhite, shadowElevation = 8.dp) { Icon(Icons.Default.CameraAlt, null, Modifier.padding(21.dp), tint = BridgeNight) }
     }
 }
 
 @Composable
 private fun Status(state: Workflow) {
     val (label, color) = when (state) {
-        Workflow.WAITING -> "\u7b49\u5f85\u76f8\u673a Wi-Fi" to Color(0xFF3F68B2)
-        Workflow.CONNECTING -> "\u6b63\u5728\u8fde\u63a5" to Amber
-        Workflow.CONNECTED -> "\u5df2\u8fde\u63a5" to Green
-        Workflow.LOADING -> "\u6b63\u5728\u8bfb\u53d6\u7167\u7247" to Amber
-        Workflow.DOWNLOADING -> "\u6b63\u5728\u4e0b\u8f7d" to Amber
-        Workflow.ERROR -> "\u9700\u8981\u5904\u7406" to Color(0xFFCB2630)
+        Workflow.WAITING -> "\u7b49\u5f85\u76f8\u673a Wi-Fi" to BridgeCopper
+        Workflow.CONNECTING -> "\u6b63\u5728\u8fde\u63a5" to BridgeEmber
+        Workflow.CONNECTED -> "\u5df2\u8fde\u63a5" to BridgeEmber
+        Workflow.LOADING -> "\u6b63\u5728\u8bfb\u53d6\u7167\u7247" to BridgeEmber
+        Workflow.DOWNLOADING -> "\u6b63\u5728\u4e0b\u8f7d" to BridgeEmber
+        Workflow.ERROR -> "\u9700\u8981\u5904\u7406" to BridgeCopper
     }
     Surface(shape = RoundedCornerShape(40.dp), color = color.copy(alpha = .11f)) { Text(label, Modifier.padding(horizontal = 12.dp, vertical = 6.dp), color = color, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold) }
 }
@@ -224,26 +243,30 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
     var preview by remember { mutableStateOf<PhotoAsset?>(null) }
     var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var previewLoading by remember { mutableStateOf(false) }
+    var filter by remember { mutableStateOf(PhotoFilter.ALL) }
     val scope = rememberCoroutineScope()
     var selectionMode by remember { mutableStateOf(false) }
     var selectedHandles by remember { mutableStateOf<Set<UInt>>(emptySet()) }
-    Column(Modifier.fillMaxSize()) {
-        Header("\u7167\u7247", if (photos.isNotEmpty()) "${photos.size} \u4e2a\u6587\u4ef6" else "\u8fde\u63a5\u76f8\u673a\u540e\u5f00\u59cb") {
+    val visiblePhotos = photos.filter { it.matches(filter) }
+    Column(Modifier.fillMaxSize().background(BridgeNight)) {
+        BridgePageLabel("\u76f8\u518c", if (photos.isNotEmpty()) "${visiblePhotos.size} \u4e2a\u6587\u4ef6" else "\u8fde\u63a5\u76f8\u673a\u540e\u5f00\u59cb") {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 TextButton({ selectionMode = !selectionMode; if (!selectionMode) selectedHandles = emptySet() }, enabled = !busy) { Text(if (selectionMode) "\u53d6\u6d88" else "\u591a\u9009") }
                 if (selectionMode) TextButton({ vm.downloadAll(photos.filter { it.handle in selectedHandles }); selectedHandles = emptySet(); selectionMode = false }, enabled = !busy && selectedHandles.isNotEmpty()) { Text("\u4e0b\u8f7d\uff08${selectedHandles.size}\uff09") }
                 IconButton(vm::loadPhotos, enabled = !busy) { Icon(Icons.Default.Refresh, "\u5237\u65b0") }
             }
         }
-        if (photos.isEmpty()) EmptyState(Icons.Default.PhotoLibrary, "\u6682\u65e0\u7167\u7247", "\u8fde\u63a5\u76f8\u673a\u5e76\u8bfb\u53d6\u76f8\u518c")
-        else LazyVerticalGrid(GridCells.Adaptive(118.dp), Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(photos, key = { it.handle.toString() }) { asset ->
+        FilterBar(filter) { filter = it }
+        if (photos.isEmpty()) BridgeEmptyState(Icons.Default.PhotoLibrary, "\u6682\u65e0\u7167\u7247", "\u8fde\u63a5\u76f8\u673a\u5e76\u8bfb\u53d6\u76f8\u518c")
+        else if (visiblePhotos.isEmpty()) BridgeEmptyState(Icons.Default.FilterAlt, "\u6b64\u5206\u7c7b\u6682\u65e0\u6587\u4ef6", "\u8bd5\u8bd5\u5176\u4ed6\u5206\u7c7b")
+        else LazyVerticalStaggeredGrid(StaggeredGridCells.Adaptive(148.dp), Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 94.dp), verticalItemSpacing = 10.dp, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(visiblePhotos, key = { it.handle.toString() }) { asset ->
                 PhotoCard(asset, vm.thumbnails[asset.handle], { vm.loadThumbnail(asset) }, asset.handle in selectedHandles) {
                     if (selectionMode) selectedHandles = if (asset.handle in selectedHandles) selectedHandles - asset.handle else selectedHandles + asset.handle
                     else { vm.loadThumbnail(asset); previewBitmap = null; previewLoading = false; preview = asset }
                 }
             }
-            if (hasMore) item(span = { GridItemSpan(maxLineSpan) }) { LaunchedEffect(photos.size) { vm.loadMorePhotos() }; LinearProgressIndicator(Modifier.fillMaxWidth().padding(20.dp), color = Amber) }
+            if (hasMore && filter == PhotoFilter.ALL) item { LaunchedEffect(photos.size) { vm.loadMorePhotos() }; CircularProgressIndicator(Modifier.padding(20.dp), color = BridgeEmber) }
         }
     }
     preview?.let { asset ->
@@ -262,20 +285,20 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
 private fun PreviewDialog(asset: PhotoAsset, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: () -> Unit, download: () -> Unit) {
     var rotation by remember(asset.handle) { mutableIntStateOf(0) }
     Dialog(onDismissRequest = dismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-        Surface(Modifier.fillMaxWidth(.96f).fillMaxHeight(.9f), shape = RoundedCornerShape(24.dp), color = Color.White) {
+        Surface(Modifier.fillMaxWidth(.96f).fillMaxHeight(.9f), shape = RoundedCornerShape(28.dp), color = Color(0xFF171015), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
             Column(Modifier.fillMaxSize().padding(16.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) { Text(asset.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(asset.size.prettySize(), color = Muted, style = MaterialTheme.typography.bodySmall) }
-                    IconButton({ rotation = (rotation + 90) % 360 }) { Icon(Icons.Default.RotateRight, "顺时针旋转 90 度") }
-                    IconButton(dismiss) { Icon(Icons.Default.Close, "关闭") }
+                    Column(Modifier.weight(1f)) { Text(asset.name, color = BridgeWhite, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(asset.size.prettySize(), color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }
+                    IconButton({ rotation = (rotation + 90) % 360 }) { Icon(Icons.Default.RotateRight, "顺时针旋转 90 度", tint = BridgeWhite) }
+                    IconButton(dismiss) { Icon(Icons.Default.Close, "关闭", tint = BridgeWhite) }
                 }
-                Box(Modifier.fillMaxWidth().weight(1f).padding(vertical = 14.dp).background(Color.Black, RoundedCornerShape(16.dp)).clipToBounds(), contentAlignment = Alignment.Center) {
-                    (bitmap ?: thumbnail)?.let { ZoomableImage(it, rotation) } ?: Text("正在加载缩略图", color = Color.White)
-                    if (loading) CircularProgressIndicator(color = Amber)
+                Box(Modifier.fillMaxWidth().weight(1f).padding(vertical = 14.dp).background(BridgeNight, RoundedCornerShape(20.dp)).clipToBounds(), contentAlignment = Alignment.Center) {
+                    (bitmap ?: thumbnail)?.let { ZoomableImage(it, rotation) } ?: Text("正在加载缩略图", color = BridgeWhite)
+                    if (loading) CircularProgressIndicator(color = BridgeEmber)
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(download) { Text("下载原图") }
-                    TextButton(loadOriginal, enabled = !loading) { Text(if (bitmap == null) "查看原图" else "重新加载") }
+                    TextButton(download) { Text("下载原图", color = BridgeWhite) }
+                    Button(loadOriginal, enabled = !loading, shape = RoundedCornerShape(18.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) { Text(if (bitmap == null) "查看原图" else "重新加载") }
                 }
             }
         }
@@ -302,12 +325,11 @@ private fun ZoomableImage(bitmap: Bitmap, rotation: Int) {
 @Composable
 private fun PhotoCard(asset: PhotoAsset, bitmap: Bitmap?, load: () -> Unit, selected: Boolean, click: () -> Unit) {
     LaunchedEffect(asset.handle) { load() }
-    Card(Modifier.fillMaxWidth().clickable { click() }, shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = if (selected) AmberSoft else Color.White)) {
-        Box(Modifier.aspectRatio(.78f)) {
-            if (bitmap != null) Image(bitmap.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) else Box(Modifier.fillMaxSize().background(AmberSoft), contentAlignment = Alignment.Center) { Icon(Icons.Default.Image, null, tint = Amber, modifier = Modifier.size(32.dp)) }
-            Surface(Modifier.align(Alignment.TopEnd).padding(7.dp), shape = RoundedCornerShape(8.dp), color = Ink.copy(alpha = .76f)) { Text(asset.type, Modifier.padding(horizontal = 6.dp, vertical = 3.dp), color = Color.White, style = MaterialTheme.typography.labelSmall) }
-            if (selected) Surface(Modifier.align(Alignment.TopStart).padding(7.dp), shape = CircleShape, color = Green) { Icon(Icons.Default.Check, "已选择", tint = Color.White, modifier = Modifier.padding(5.dp).size(18.dp)) }
-            Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().background(Color.White.copy(alpha = .94f)).padding(8.dp)) { Text(asset.name, color = Ink, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(asset.size.prettySize(), color = Muted, style = MaterialTheme.typography.labelSmall) }
+    val ratio = when (asset.handle.toInt().and(3)) { 0 -> .72f; 1 -> 1.16f; 2 -> .86f; else -> .98f }
+    Card(Modifier.fillMaxWidth().clickable { click() }, shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = if (selected) androidx.compose.foundation.BorderStroke(2.dp, BridgeEmber) else null) {
+        Box(Modifier.aspectRatio(ratio)) {
+            if (bitmap != null) Image(bitmap.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Image, null, tint = BridgeEmber, modifier = Modifier.size(32.dp)) }
+            if (selected) Surface(Modifier.align(Alignment.TopEnd).padding(8.dp), shape = CircleShape, color = BridgeEmber) { Icon(Icons.Default.Check, "已选择", tint = BridgeNight, modifier = Modifier.padding(6.dp).size(17.dp)) }
         }
     }
 }
@@ -315,12 +337,11 @@ private fun PhotoCard(asset: PhotoAsset, bitmap: Bitmap?, load: () -> Unit, sele
 @Composable
 private fun DownloadsScreen(vm: MainViewModel) {
     val rows by vm.downloads.collectAsState()
-    Column(Modifier.fillMaxSize()) {
-        Header("\u4e0b\u8f7d", "\u5df2\u4fdd\u5b58\u5230\u7cfb\u7edf\u76f8\u518c") {}
-        if (rows.isEmpty()) EmptyState(Icons.Default.CloudDownload, "\u6682\u65e0\u4e0b\u8f7d\u8bb0\u5f55", "\u8f7b\u89e6\u7167\u7247\u5373\u53ef\u4fdd\u5b58\u5230\u624b\u673a")
-        else LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(rows) { row -> Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(18.dp)) { Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Download, null, tint = Amber, modifier = Modifier.size(25.dp)); Spacer(Modifier.width(12.dp)); Column(Modifier.weight(1f)) { Text(row.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis); Text("${row.size.prettySize()} - ${Date(row.completedAt).prettyDate()}", color = Muted, style = MaterialTheme.typography.bodySmall) } } }
-            }
+    Column(Modifier.fillMaxSize().background(BridgeNight)) {
+        BridgePageLabel("\u4e0b\u8f7d", "\u5df2\u4fdd\u5b58 ${rows.size} \u4e2a\u6587\u4ef6") {}
+        if (rows.isEmpty()) BridgeEmptyState(Icons.Default.CloudDownload, "\u6682\u65e0\u4e0b\u8f7d\u8bb0\u5f55", "\u5728\u76f8\u518c\u4e2d\u9009\u62e9\u7167\u7247\u5373\u53ef\u4fdd\u5b58\u5230\u624b\u673a")
+        else LazyVerticalStaggeredGrid(StaggeredGridCells.Adaptive(148.dp), Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 94.dp), verticalItemSpacing = 10.dp, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(rows, key = { it.uri }) { DownloadCard(it) }
         }
     }
 }
@@ -331,16 +352,16 @@ private fun SettingsScreen(vm: MainViewModel) {
     val config by vm.config.collectAsState()
     var host by remember(config.host) { mutableStateOf(config.host) }
     var port by remember(config.port) { mutableStateOf(config.port.toString()) }
-    Column(Modifier.fillMaxSize()) {
-        TopAppBar(title = { Text("\u8bbe\u7f6e", fontWeight = FontWeight.Bold) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = Canvas))
+    Column(Modifier.fillMaxSize().background(BridgeNight)) {
+        TopAppBar(title = { Text("\u8bbe\u7f6e", fontWeight = FontWeight.Bold) }, colors = TopAppBarDefaults.topAppBarColors(containerColor = BridgeNight, titleContentColor = BridgeWhite))
         LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             item {
-                Text("\u5c3c\u5eb7 PTP/IP", color = Muted, style = MaterialTheme.typography.labelLarge); Spacer(Modifier.height(8.dp))
-                Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(20.dp)) { Column(Modifier.padding(16.dp)) {
-                    OutlinedTextField(host, { host = it; vm.updateConfig { c -> c.copy(host = it.trim()) } }, Modifier.fillMaxWidth(), label = { Text("\u76f8\u673a IP \u5730\u5740") }, singleLine = true)
+                Text("\u5c3c\u5eb7 PTP/IP", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge); Spacer(Modifier.height(8.dp))
+                Card(colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f)), shape = RoundedCornerShape(20.dp)) { Column(Modifier.padding(16.dp)) {
+                    OutlinedTextField(host, { host = it; vm.updateConfig { c -> c.copy(host = it.trim()) } }, Modifier.fillMaxWidth(), label = { Text("\u76f8\u673a IP \u5730\u5740") }, singleLine = true, colors = bridgeFieldColors())
                     Spacer(Modifier.height(10.dp))
-                    OutlinedTextField(port, { value -> port = value.filter(Char::isDigit); value.toIntOrNull()?.let { number -> vm.updateConfig { c -> c.copy(port = number) } } }, Modifier.fillMaxWidth(), label = { Text("\u7aef\u53e3") }, singleLine = true)
-                    Text("\u5c3c\u5eb7\u9ed8\u8ba4\uff1a192.168.1.1:15740", Modifier.padding(top = 10.dp), color = Muted, style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(port, { value -> port = value.filter(Char::isDigit); value.toIntOrNull()?.let { number -> vm.updateConfig { c -> c.copy(port = number) } } }, Modifier.fillMaxWidth(), label = { Text("\u7aef\u53e3") }, singleLine = true, colors = bridgeFieldColors())
+                    Text("\u5c3c\u5eb7\u9ed8\u8ba4\uff1a192.168.1.1:15740", Modifier.padding(top = 10.dp), color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall)
                 } }
             }
             item {
@@ -348,8 +369,8 @@ private fun SettingsScreen(vm: MainViewModel) {
                 PreferenceSwitch("\u4f18\u5148\u663e\u793a JPEG", "\u76f8\u673a\u540c\u65f6\u5305\u542b RAW \u4e0e JPEG \u65f6\u4f7f\u7528", config.jpegFirst) { vm.updateConfig { c -> c.copy(jpegFirst = it) } }
             }
             item {
-                Text("\u5c0f\u7c73 14 \u4f7f\u7528\u63d0\u793a", color = Muted, style = MaterialTheme.typography.labelLarge)
-                Card(colors = CardDefaults.cardColors(containerColor = AmberSoft), shape = RoundedCornerShape(18.dp)) { Text("\u8bf7\u5148\u5728 Wi-Fi \u8bbe\u7f6e\u4e2d\u8fde\u63a5\u76f8\u673a\u70ed\u70b9\u3002\u82e5 HyperOS \u63d0\u793a\u8be5\u7f51\u7edc\u65e0\u4e92\u8054\u7f51\uff0c\u8bf7\u4fdd\u6301\u8fde\u63a5\uff0c\u8fd4\u56de\u5e94\u7528\u540e\u70b9\u51fb\u300c\u8fde\u63a5\u76f8\u673a\u300d\u3002", Modifier.padding(16.dp), color = Ink, style = MaterialTheme.typography.bodyMedium) }
+                Text("\u5c0f\u7c73 14 \u4f7f\u7528\u63d0\u793a", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge)
+                Card(colors = CardDefaults.cardColors(containerColor = BridgeEmber.copy(alpha = .12f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeEmber.copy(alpha = .25f)), shape = RoundedCornerShape(18.dp)) { Text("\u8bf7\u5148\u5728 Wi-Fi \u8bbe\u7f6e\u4e2d\u8fde\u63a5\u76f8\u673a\u70ed\u70b9\u3002\u82e5 HyperOS \u63d0\u793a\u8be5\u7f51\u7edc\u65e0\u4e92\u8054\u7f51\uff0c\u8bf7\u4fdd\u6301\u8fde\u63a5\uff0c\u8fd4\u56de\u5e94\u7528\u540e\u70b9\u51fb\u300c\u8fde\u63a5\u76f8\u673a\u300d\u3002", Modifier.padding(16.dp), color = BridgeWhite, style = MaterialTheme.typography.bodyMedium) }
             }
         }
     }
@@ -357,8 +378,14 @@ private fun SettingsScreen(vm: MainViewModel) {
 
 @Composable
 private fun PreferenceSwitch(title: String, subtitle: String, checked: Boolean, change: (Boolean) -> Unit) {
-    Card(colors = CardDefaults.cardColors(containerColor = Color.White), shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(title, fontWeight = FontWeight.SemiBold); Text(subtitle, color = Muted, style = MaterialTheme.typography.bodySmall) }; Switch(checked, change) } }
+    Card(colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f)), shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) { Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(title, color = BridgeWhite, fontWeight = FontWeight.SemiBold); Text(subtitle, color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }; Switch(checked, change, colors = SwitchDefaults.colors(checkedThumbColor = BridgeNight, checkedTrackColor = BridgeEmber, uncheckedThumbColor = BridgeWhite.copy(alpha = .7f), uncheckedTrackColor = BridgeWhite.copy(alpha = .16f))) } }
 }
+@Composable private fun BridgePageLabel(title: String, subtitle: String, action: @Composable () -> Unit = {}) { Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 10.dp, top = 14.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(title, color = BridgeWhite, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Text(subtitle, color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }; action() } }
+@Composable private fun FilterBar(selected: PhotoFilter, select: (PhotoFilter) -> Unit) { LazyRow(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) { items(PhotoFilter.entries) { filter -> Surface(Modifier.clickable { select(filter) }, shape = RoundedCornerShape(18.dp), color = if (filter == selected) BridgeEmber else BridgeWhite.copy(alpha = .08f), border = if (filter == selected) null else androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) { Text(filter.title, Modifier.padding(horizontal = 14.dp, vertical = 8.dp), color = if (filter == selected) BridgeNight else BridgeWhite, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold) } } } }
+@Composable private fun BridgeEmptyState(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, subtitle: String) { Column(Modifier.fillMaxSize().padding(36.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Surface(Modifier.size(72.dp), shape = CircleShape, color = BridgeEmber.copy(alpha = .13f)) { Icon(icon, null, tint = BridgeEmber, modifier = Modifier.padding(21.dp)) }; Spacer(Modifier.height(16.dp)); Text(title, color = BridgeWhite, fontWeight = FontWeight.Bold); Spacer(Modifier.height(5.dp)); Text(subtitle, color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) } }
+@Composable private fun DownloadCard(row: DownloadRecord) { val context = LocalContext.current; val bitmap by produceState<Bitmap?>(null, row.uri) { value = withContext(Dispatchers.IO) { loadDownloadThumbnail(context, row.uri) } }; val ratio = when (row.name.hashCode().and(3)) { 0 -> .72f; 1 -> 1.16f; 2 -> .86f; else -> .98f }; Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) { Box(Modifier.aspectRatio(ratio)) { if (bitmap != null) Image(bitmap!!.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Download, null, tint = BridgeEmber) }; Surface(Modifier.align(Alignment.BottomEnd).padding(7.dp), shape = RoundedCornerShape(10.dp), color = BridgeNight.copy(alpha = .72f)) { Text(row.size.prettySize(), Modifier.padding(horizontal = 7.dp, vertical = 4.dp), color = BridgeWhite, style = MaterialTheme.typography.labelSmall) } } } }
+private fun loadDownloadThumbnail(context: android.content.Context, uri: String): Bitmap? = runCatching { val parsed = Uri.parse(uri); if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) context.contentResolver.loadThumbnail(parsed, Size(480, 640), null) else context.contentResolver.openInputStream(parsed)?.use { BitmapFactory.decodeStream(it) } }.getOrNull()
+@Composable private fun bridgeFieldColors() = OutlinedTextFieldDefaults.colors(focusedTextColor = BridgeWhite, unfocusedTextColor = BridgeWhite, focusedLabelColor = BridgeEmber, unfocusedLabelColor = BridgeWhite.copy(alpha = .55f), focusedBorderColor = BridgeEmber, unfocusedBorderColor = BridgeWhite.copy(alpha = .2f), cursorColor = BridgeEmber)
 @Composable private fun Header(title: String, subtitle: String, action: @Composable () -> Unit) { Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 10.dp, top = 14.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Text(subtitle, color = Muted, style = MaterialTheme.typography.bodySmall) }; action() } }
 @Composable private fun EmptyState(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, subtitle: String) { Column(Modifier.fillMaxSize().padding(36.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Icon(icon, null, tint = Amber, modifier = Modifier.size(50.dp)); Spacer(Modifier.height(14.dp)); Text(title, fontWeight = FontWeight.Bold, color = Ink); Text(subtitle, color = Muted, style = MaterialTheme.typography.bodySmall) } }
 @Composable private fun PrimaryButton(text: String, icon: androidx.compose.ui.graphics.vector.ImageVector, enabled: Boolean, click: () -> Unit) { Button(click, Modifier.fillMaxWidth().height(54.dp), enabled = enabled, shape = RoundedCornerShape(28.dp), colors = ButtonDefaults.buttonColors(containerColor = Ink, contentColor = Color.White)) { Icon(icon, null); Spacer(Modifier.width(8.dp)); Text(text, fontWeight = FontWeight.Bold) } }
