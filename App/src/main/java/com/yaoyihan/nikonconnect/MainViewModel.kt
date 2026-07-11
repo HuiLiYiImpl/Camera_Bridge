@@ -101,6 +101,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    suspend fun loadOriginalPreview(asset: PhotoAsset): Bitmap? = withContext(Dispatchers.IO) {
+        runCatching {
+            val bytes = client?.download(asset) { _, _ -> } ?: return@runCatching null
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }.getOrNull()
+    }
+
     fun download(asset: PhotoAsset) = viewModelScope.launch {
         val active = client ?: run { showError("相机连接已断开"); return@launch }
         isBusy.value = true; workflow.value = Workflow.DOWNLOADING; notice.value = "正在下载 ${asset.name}"

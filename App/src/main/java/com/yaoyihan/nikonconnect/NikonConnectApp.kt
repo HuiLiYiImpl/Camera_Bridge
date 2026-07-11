@@ -10,6 +10,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -24,15 +26,23 @@ import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.launch
 import java.util.Date
 
 private val Canvas = Color(0xFFF9F9F8)
@@ -142,6 +152,9 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
     val photos by vm.photos.collectAsState()
     val hasMore by vm.hasMorePhotos.collectAsState()
     var preview by remember { mutableStateOf<PhotoAsset?>(null) }
+    var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var previewLoading by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     var selectionMode by remember { mutableStateOf(false) }
     var selectedHandles by remember { mutableStateOf<Set<UInt>>(emptySet()) }
     Column(Modifier.fillMaxSize()) {
@@ -157,27 +170,63 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
             items(photos, key = { it.handle.toString() }) { asset ->
                 PhotoCard(asset, vm.thumbnails[asset.handle], { vm.loadThumbnail(asset) }, asset.handle in selectedHandles) {
                     if (selectionMode) selectedHandles = if (asset.handle in selectedHandles) selectedHandles - asset.handle else selectedHandles + asset.handle
-                    else preview = asset
+                    else { vm.loadThumbnail(asset); previewBitmap = null; previewLoading = false; preview = asset }
                 }
             }
             if (hasMore) item(span = { GridItemSpan(maxLineSpan) }) { LaunchedEffect(photos.size) { vm.loadMorePhotos() }; LinearProgressIndicator(Modifier.fillMaxWidth().padding(20.dp), color = Amber) }
         }
     }
-    preview?.let { asset -> PreviewDialog(asset, vm.thumbnails[asset.handle], { preview = null }) { vm.download(asset) } }
+    preview?.let { asset ->
+        PreviewDialog(asset, vm.thumbnails[asset.handle], previewBitmap, previewLoading, { preview = null }, {
+            previewBitmap = null
+            previewLoading = true
+            scope.launch {
+                val bitmap = vm.loadOriginalPreview(asset)
+                if (preview?.handle == asset.handle) { previewBitmap = bitmap; previewLoading = false }
+            }
+        }) { vm.download(asset) }
+    }
 }
 
 @Composable
-private fun PreviewDialog(asset: PhotoAsset, bitmap: Bitmap?, dismiss: () -> Unit, download: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = dismiss,
-        title = { Text(asset.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-        text = {
-            if (bitmap != null) Image(bitmap.asImageBitmap(), null, Modifier.fillMaxWidth().aspectRatio(1f), contentScale = ContentScale.Fit)
-            else Text("此文件暂时没有可用预览", color = Muted)
-        },
-        confirmButton = { TextButton(download) { Text("下载原图") } },
-        dismissButton = { TextButton(dismiss) { Text("关闭") } },
-    )
+private fun PreviewDialog(asset: PhotoAsset, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: () -> Unit, download: () -> Unit) {
+    var rotation by remember(asset.handle) { mutableIntStateOf(0) }
+    Dialog(onDismissRequest = dismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxWidth(.96f).fillMaxHeight(.9f), shape = RoundedCornerShape(24.dp), color = Color.White) {
+            Column(Modifier.fillMaxSize().padding(16.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) { Text(asset.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(asset.size.prettySize(), color = Muted, style = MaterialTheme.typography.bodySmall) }
+                    IconButton({ rotation = (rotation + 90) % 360 }) { Icon(Icons.Default.RotateRight, "顺时针旋转 90 度") }
+                    IconButton(dismiss) { Icon(Icons.Default.Close, "关闭") }
+                }
+                Box(Modifier.fillMaxWidth().weight(1f).padding(vertical = 14.dp).background(Color.Black, RoundedCornerShape(16.dp)).clipToBounds(), contentAlignment = Alignment.Center) {
+                    (bitmap ?: thumbnail)?.let { ZoomableImage(it, rotation) } ?: Text("正在加载缩略图", color = Color.White)
+                    if (loading) CircularProgressIndicator(color = Amber)
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(download) { Text("下载原图") }
+                    TextButton(loadOriginal, enabled = !loading) { Text(if (bitmap == null) "查看原图" else "重新加载") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ZoomableImage(bitmap: Bitmap, rotation: Int) {
+    var scale by remember(bitmap) { mutableFloatStateOf(1f) }
+    var offset by remember(bitmap) { mutableStateOf(Offset.Zero) }
+    var viewport by remember { mutableStateOf(IntSize.Zero) }
+    val sourceWidth = if (rotation % 180 == 0) bitmap.width else bitmap.height
+    val sourceHeight = if (rotation % 180 == 0) bitmap.height else bitmap.width
+    val fitScale = if (viewport == IntSize.Zero) 1f else minOf(viewport.width.toFloat() / sourceWidth, viewport.height.toFloat() / sourceHeight)
+    val transform = rememberTransformableState { zoom, pan, _ ->
+        scale = (scale * zoom).coerceIn(1f, 12f)
+        val maxX = ((sourceWidth * fitScale * scale - viewport.width) / 2f).coerceAtLeast(0f)
+        val maxY = ((sourceHeight * fitScale * scale - viewport.height) / 2f).coerceAtLeast(0f)
+        offset = if (scale == 1f) Offset.Zero else Offset((offset.x + pan.x).coerceIn(-maxX, maxX), (offset.y + pan.y).coerceIn(-maxY, maxY))
+    }
+    Image(bitmap.asImageBitmap(), null, Modifier.fillMaxSize().onSizeChanged { viewport = it }.transformable(transform).graphicsLayer { scaleX = scale; scaleY = scale; rotationZ = rotation.toFloat(); translationX = offset.x; translationY = offset.y }, contentScale = ContentScale.Fit)
 }
 
 @Composable
