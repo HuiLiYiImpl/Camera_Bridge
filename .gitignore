@@ -1,0 +1,25 @@
+# OS X
+.DS_Store
+
+# Xcode build products
+build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace
+xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Generated Xcode projects (since project.yml and generate_project.sh are tracked)
+NikonConnectIOS.xcodeproj/
+
+# Android / Gradle
+.gradle/
+.kotlin/
+local.properties
+*.apk
+
+# Local protocol reverse-engineering artifacts
+analysis/
