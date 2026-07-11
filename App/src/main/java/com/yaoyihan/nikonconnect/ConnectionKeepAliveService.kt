@@ -47,7 +47,7 @@ class ConnectionKeepAliveService : Service() {
         .build()
 
     companion object {
-        private const val CHANNEL = "camera_connection"
-        private const val NOTIFICATION_ID = 1001
+        const val CHANNEL = "camera_connection"
+        const val NOTIFICATION_ID = 1001
     }
 }

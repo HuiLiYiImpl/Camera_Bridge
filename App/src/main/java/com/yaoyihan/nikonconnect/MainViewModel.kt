@@ -137,12 +137,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         runCatching {
             withContext(Dispatchers.IO) {
                 saveToMediaStore(asset, config.value.autoExport) { stream -> active.downloadTo(asset, stream) { done, total ->
-                    viewModelScope.launch { notice.value = "正在下载 ${asset.name} · ${done.prettySize()} / ${total.prettySize()}" }
+                    viewModelScope.launch { notice.value = "正在下载 ${asset.name} · ${done.prettySize()} / ${total.prettySize()}"; updateDownloadNotif(asset.name, done, total) }
                 } }
             }
         }.onSuccess { record ->
-            store.addDownload(record); downloads.value = store.downloads(); workflow.value = Workflow.CONNECTED; notice.value = "已保存到系统相册"; lastFailedAsset = null
-        }.onFailure { lastFailedAsset = asset; showError(it.message ?: "下载失败") }
+            store.addDownload(record); downloads.value = store.downloads(); workflow.value = Workflow.CONNECTED; notice.value = "已保存到系统相册"; lastFailedAsset = null; clearDownloadNotif()
+        }.onFailure { lastFailedAsset = asset; showError(it.message ?: "下载失败"); clearDownloadNotif() }
         isBusy.value = false
     }
 
@@ -158,13 +158,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) {
                     saveToMediaStore(asset, config.value.autoExport) { stream ->
                         active.downloadTo(asset, stream) { done, total ->
-                            viewModelScope.launch { notice.value = "正在下载 ${index + 1}/${assets.size}：${done.prettySize()} / ${total.prettySize()}" }
+                            viewModelScope.launch { notice.value = "正在下载 ${index + 1}/${assets.size}：${done.prettySize()} / ${total.prettySize()}"; updateDownloadNotif("${index + 1}/${assets.size} ${asset.name}", done, total) }
                         }
                     }
                 }
             }.getOrElse { error ->
                 showError(error.message ?: "下载失败")
                 isBusy.value = false
+                clearDownloadNotif()
                 return@launch
             }
             store.addDownload(record)
@@ -172,6 +173,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         downloads.value = store.downloads()
         workflow.value = Workflow.CONNECTED
         notice.value = "已下载 ${assets.size} 张照片"
+        clearDownloadNotif()
         isBusy.value = false
     }
 
@@ -206,6 +208,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val app = getApplication<Application>()
         val intent = Intent(app, ConnectionKeepAliveService::class.java)
         if (enabled) ContextCompat.startForegroundService(app, intent) else app.stopService(intent)
+    }
+
+    private fun updateDownloadNotif(name: String, done: Long, total: Long) {
+        val app = getApplication<Application>()
+        val percent = if (total > 0) (done * 100 / total).toInt() else 0
+        val notif = androidx.core.app.NotificationCompat.Builder(app, "camera_connection")
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("正在下载 $name")
+            .setContentText("${done.prettySize()} / ${total.prettySize()} · $percent%")
+            .setProgress(100, percent, false)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .build()
+        app.getSystemService(android.app.NotificationManager::class.java).notify(1001, notif)
+    }
+
+    private fun clearDownloadNotif() {
+        val app = getApplication<Application>()
+        val notif = androidx.core.app.NotificationCompat.Builder(app, "camera_connection")
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("尼康相机连接中")
+            .setContentText("保持相机 Wi‑Fi 连接")
+            .setOngoing(true)
+            .build()
+        app.getSystemService(android.app.NotificationManager::class.java).notify(1001, notif)
     }
 
     private fun cameraNetwork() = getApplication<Application>().getSystemService(ConnectivityManager::class.java)

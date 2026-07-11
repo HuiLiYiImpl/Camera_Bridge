@@ -315,7 +315,7 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
             Column(Modifier.fillMaxSize().padding(16.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) { Text(name, color = BridgeWhite, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(size.prettySize(), color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }
-                    IconButton({ rotation = (rotation + 90) % 360 }) { Icon(Icons.Default.RotateRight, "顺时针旋转 90 度", tint = BridgeWhite) }
+                    IconButton({ rotation = (rotation - 90 + 360) % 360 }) { Icon(Icons.Default.RotateLeft, "逆时针旋转 90 度", tint = BridgeWhite) }
                     IconButton(dismiss) { Icon(Icons.Default.Close, "关闭", tint = BridgeWhite) }
                 }
                 Box(Modifier.fillMaxWidth().weight(1f).padding(vertical = 14.dp).background(BridgeNight, RoundedCornerShape(20.dp)).clipToBounds(), contentAlignment = Alignment.Center) {
