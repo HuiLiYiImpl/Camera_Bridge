@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -52,6 +53,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val host = cameraGateway().ifBlank { target.host.trim() }
         if (target.host.isBlank() || target.port !in 1..65535) { showError("请填写有效的相机地址和端口"); return@launch }
         isBusy.value = true; workflow.value = Workflow.CONNECTING; notice.value = "正在连接 ${target.host}:${target.port}"
+        bindCameraNetwork(network)
         runCatching {
             withContext(Dispatchers.IO) {
                 client?.close(); PtpIpClient(host, target.port, network.socketFactory).also { it.connect(); client = it }
@@ -63,6 +65,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             currentSsid()?.let { ssid -> if (ssid.isNotBlank()) updateConfig { c -> c.copy(lastSsid = ssid) } }
             loadPhotos()
         }.onFailure {
+            bindCameraNetwork(null)
             workflow.value = Workflow.WAITING
             if (manual) openWifiSettings() else showError(it.message ?: "无法连接相机，请确认已连接相机 Wi‑Fi")
         }
@@ -76,7 +79,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() = viewModelScope.launch(Dispatchers.IO) {
         keepConnectionAlive(false)
-        client?.close(); client = null; hasMorePhotos.value = false
+        client?.close(); client = null; bindCameraNetwork(null); hasMorePhotos.value = false
         withContext(Dispatchers.Main) { session.value = null; photos.value = emptyList(); thumbnails.clear(); workflow.value = Workflow.WAITING; notice.value = "连接已断开" }
     }
 
@@ -202,7 +205,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun showError(message: String) { workflow.value = Workflow.ERROR; notice.value = message }
-    override fun onCleared() { keepConnectionAlive(false); client?.close() }
+    override fun onCleared() { keepConnectionAlive(false); client?.close(); bindCameraNetwork(null) }
 
     private fun keepConnectionAlive(enabled: Boolean) {
         val app = getApplication<Application>()
@@ -240,6 +243,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             getApplication<Application>().getSystemService(ConnectivityManager::class.java)
                 .getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
         }
+
+    private fun bindCameraNetwork(network: Network?) {
+        getApplication<Application>().getSystemService(ConnectivityManager::class.java).bindProcessToNetwork(network)
+    }
 
     @Suppress("DEPRECATION")
     private fun cameraGateway(): String {
