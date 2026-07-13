@@ -57,6 +57,11 @@ class PtpIpClient(
     fun hasMoreAssets(offset: Int): Boolean = offset < (objectHandles?.size ?: Int.MAX_VALUE)
     fun refreshAssets() { objectHandles = null }
 
+    fun checkConnection(): Boolean {
+        requestData(GET_DEVICE_INFO, next())
+        return true
+    }
+
     fun thumbnail(asset: PhotoAsset): ByteArray? = runCatching { requestData(GET_THUMB, next(), asset.handle) }.getOrNull()
     fun download(asset: PhotoAsset, progress: (Long, Long) -> Unit): ByteArray {
         val output = java.io.ByteArrayOutputStream(asset.size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())

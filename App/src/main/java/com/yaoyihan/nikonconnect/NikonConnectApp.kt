@@ -5,8 +5,17 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.util.Size
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -55,9 +64,13 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.util.Date
 
@@ -72,7 +85,8 @@ private val BridgeWine = Color(0xFF35140F)
 private val BridgeEmber = Color(0xFFFF7133)
 private val BridgeCopper = Color(0xFFB95732)
 private val BridgeWhite = Color(0xFFFFF7F1)
-private enum class Tab(val title: String) { CAMERA("\u76f8\u673a"), PHOTOS("\u7167\u7247"), DOWNLOADS("\u4e0b\u8f7d"), SETTINGS("\u8bbe\u7f6e") }
+private data class InlineTask(val title: String, val detail: String, val running: Boolean, val failed: Boolean = false)
+private enum class Tab(val title: String) { CAMERA("\u76f8\u673a"), PHOTOS("\u7167\u7247"), DOWNLOADS("\u4e0b\u8f7d"), LUT("LUT"), SETTINGS("\u8bbe\u7f6e") }
 private enum class PhotoFilter(val title: String) { ALL("\u5168\u90e8"), JPG("JPG"), RAW("RAW"), VIDEO("\u89c6\u9891") }
 private fun PhotoAsset.matches(filter: PhotoFilter) = when (filter) {
     PhotoFilter.ALL -> true
@@ -93,22 +107,37 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
     val workflow by vm.workflow.collectAsState()
     val busy by vm.isBusy.collectAsState()
     val notice by vm.notice.collectAsState()
+    val snackbarText by vm.snackbar.collectAsState()
     val session by vm.session.collectAsState()
+    val hasLoadedPhotos by vm.hasLoadedPhotos.collectAsState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val snackbarHostState = remember { SnackbarHostState() }
     var tab by remember { mutableStateOf(Tab.CAMERA) }
     val landing = tab == Tab.CAMERA && session == null
+    LaunchedEffect(session, hasLoadedPhotos) {
+        if (session == null) tab = Tab.CAMERA
+        else if (hasLoadedPhotos) tab = Tab.PHOTOS
+    }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_RESUME) vm.checkConnectionOnResume() }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    LaunchedEffect(snackbarText) { snackbarText?.let { snackbarHostState.showSnackbar(it, duration = SnackbarDuration.Short) } }
     MaterialTheme(colorScheme = MaterialTheme.colorScheme.copy(background = BridgeNight, surface = Color(0xFF181015), primary = BridgeEmber, onPrimary = BridgeWhite)) {
-        Scaffold(containerColor = BridgeNight, bottomBar = {
+        Scaffold(containerColor = BridgeNight, snackbarHost = { SnackbarHost(snackbarHostState) }, bottomBar = {
             if (!landing) {
                 BridgeNavigation(tab) { tab = it }
             }
         }) { padding ->
             Column(Modifier.fillMaxSize().padding(padding)) {
-                if (!landing) notice?.let { ActivityPill(it, busy, Modifier.padding(horizontal = 20.dp, vertical = 10.dp), if (workflow == Workflow.ERROR) vm::retryDownload else null) }
+                if (!landing) AnimatedActivityPill(notice, busy, if (workflow == Workflow.ERROR) vm::retry else null)
                 AnimatedContent(tab, label = "tab") { screen ->
                     when (screen) {
                         Tab.CAMERA -> CameraScreen(vm, workflow, busy, notice) { tab = Tab.SETTINGS }
                         Tab.PHOTOS -> GalleryScreen(vm, busy)
                         Tab.DOWNLOADS -> DownloadsScreen(vm)
+                        Tab.LUT -> LutScreen(vm)
                         Tab.SETTINGS -> SettingsScreen(vm)
                     }
                 }
@@ -125,13 +154,7 @@ private fun BridgeNavigation(selected: Tab, select: (Tab) -> Unit) {
                 Tab.entries.forEach { item ->
                     val active = item == selected
                     if (active) {
-                        Surface(shape = RoundedCornerShape(31.dp), color = BridgeWhite) {
-                            Row(Modifier.height(62.dp).animateContentSize().clickable { select(item) }.padding(horizontal = 21.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Icon(tabIcon(item), null, tint = BridgeNight, modifier = Modifier.size(25.dp))
-                                Spacer(Modifier.width(9.dp))
-                                Text(item.title, color = BridgeNight, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
-                            }
-                        }
+                        Surface(Modifier.size(62.dp), shape = RoundedCornerShape(31.dp), color = BridgeWhite) { IconButton({ select(item) }) { Icon(tabIcon(item), item.title, tint = BridgeNight, modifier = Modifier.size(25.dp)) } }
                     } else IconButton({ select(item) }, Modifier.size(62.dp)) { Icon(tabIcon(item), item.title, tint = BridgeWhite.copy(alpha = .62f), modifier = Modifier.size(27.dp)) }
                 }
             }
@@ -156,7 +179,7 @@ private fun CameraScreen(vm: MainViewModel, state: Workflow, busy: Boolean, noti
     val session by vm.session.collectAsState()
     val photos by vm.photos.collectAsState()
     val config by vm.config.collectAsState()
-    if (session == null) ConnectionLanding(state, busy, notice, { vm.connect(true) }, openSettings, config.lastSsid)
+    if (session == null) ConnectionLanding(state, busy, notice, { vm.connect(true) }, openSettings, config.lastSsid, config.brand) { brand -> vm.updateConfig { it.copy(brand = brand) } }
     else Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight))).padding(horizontal = 24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         BridgePageLabel("\u76f8\u673a", "\u5b89\u5168\u6865\u63a5\u5df2\u5efa\u7acb")
         Spacer(Modifier.weight(1f)); LensGlow(state); Spacer(Modifier.height(24.dp))
@@ -168,7 +191,7 @@ private fun CameraScreen(vm: MainViewModel, state: Workflow, busy: Boolean, noti
                     Icon(Icons.Default.CameraAlt, null, tint = BridgeNight, modifier = Modifier.background(BridgeEmber, RoundedCornerShape(10.dp)).padding(8.dp))
                     Spacer(Modifier.width(12.dp)); Column { Text(session!!.name, fontWeight = FontWeight.Bold, color = BridgeWhite); Text("\u5df2\u51c6\u5907\u597d\u6d4f\u89c8\u548c\u4e0b\u8f7d", color = BridgeWhite.copy(alpha = .58f), style = MaterialTheme.typography.bodySmall) }
                 }
-                if (photos.isNotEmpty()) Text("\u5df2\u627e\u5230 ${photos.size} \u4e2a\u6587\u4ef6", Modifier.padding(top = 14.dp), color = BridgeWhite.copy(alpha = .7f))
+                if (photos.isNotEmpty()) Text("已连接 ${session!!.name} · 已读取 ${photos.size} 张", Modifier.padding(top = 14.dp), color = BridgeWhite.copy(alpha = .7f))
                 Spacer(Modifier.height(14.dp)); Button(vm::loadPhotos, Modifier.fillMaxWidth(), enabled = !busy, shape = RoundedCornerShape(16.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) { Icon(Icons.Default.Refresh, null); Spacer(Modifier.width(8.dp)); Text("\u8bfb\u53d6\u7167\u7247") }
             }
         }
@@ -179,12 +202,13 @@ private fun CameraScreen(vm: MainViewModel, state: Workflow, busy: Boolean, noti
 }
 
 @Composable
-private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, connect: () -> Unit, openSettings: () -> Unit, lastSsid: String) {
+private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, connect: () -> Unit, openSettings: () -> Unit, lastSsid: String, brand: CameraBrand, selectBrand: (CameraBrand) -> Unit) {
     val pulse by rememberInfiniteTransition(label = "bridge").animateFloat(0.94f, 1.08f, infiniteRepeatable(tween(1800), RepeatMode.Reverse), label = "signal")
+    var showCameraPicker by remember { mutableStateOf(false) }
     val status = when (state) {
         Workflow.CONNECTING -> "\u6b63\u5728\u5efa\u7acb\u5b89\u5168\u6865\u63a5"
         Workflow.ERROR -> notice ?: "\u8bf7\u68c0\u67e5\u76f8\u673a Wi-Fi"
-        else -> if (lastSsid.isNotBlank()) "\u4e0a\u6b21\u8fde\u63a5\uff1a$lastSsid" else ""
+        else -> notice ?: if (lastSsid.isNotBlank()) "\u4e0a\u6b21\u8fde\u63a5\uff1a$lastSsid" else ""
     }
     Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight, Color(0xFF08070A))))) {
         Box(Modifier.size(420.dp).align(Alignment.TopCenter).offset(y = (-150).dp).background(Brush.radialGradient(listOf(BridgeEmber.copy(alpha = .42f), Color.Transparent)), CircleShape))
@@ -198,6 +222,27 @@ private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, c
             Spacer(Modifier.height(14.dp))
             Text(if (lastSsid.isNotBlank()) "\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae\uff0c\u82e5\u5df2\u8fde\u63a5\u76f8\u673a Wi-Fi \u5c06\u81ea\u52a8\u5efa\u7acb\u6865\u63a5\u3002" else "\u6309\u4ee5\u4e0b\u6b65\u9aa4\u8fde\u63a5\u76f8\u673a\uff0c\u5b8c\u6210\u540e\u70b9\u51fb\u4e0b\u65b9\u6309\u94ae\u5efa\u7acb\u6865\u63a5\u3002", color = BridgeWhite.copy(alpha = .68f), style = MaterialTheme.typography.bodyMedium)
             Spacer(Modifier.height(18.dp))
+            Box {
+                Surface(Modifier.fillMaxWidth().clickable { showCameraPicker = true }, shape = RoundedCornerShape(18.dp), color = BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
+                    Row(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CameraAlt, null, tint = BridgeEmber, modifier = Modifier.size(20.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) { Text("选择你的相机", color = BridgeWhite, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold); Text("${brand.title} · ${brand.subtitle}", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }
+                        Icon(Icons.Default.KeyboardArrowDown, "选择相机品牌", tint = BridgeWhite.copy(alpha = .7f))
+                    }
+                }
+                DropdownMenu(showCameraPicker, { showCameraPicker = false }, modifier = Modifier.background(Color(0xFF251215))) {
+                    CameraBrand.entries.forEach { item ->
+                        DropdownMenuItem(
+                            text = { Text("${item.title} · ${item.subtitle}", color = if (item.available) BridgeWhite else BridgeWhite.copy(alpha = .42f)) },
+                            onClick = { if (item.available) { selectBrand(item); showCameraPicker = false } },
+                            enabled = item.available,
+                            leadingIcon = if (item == brand) ({ Icon(Icons.Default.Check, null, tint = BridgeEmber) }) else null,
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
             if (status.isNotBlank()) Surface(shape = RoundedCornerShape(20.dp), color = BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
                 Row(Modifier.padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Wifi, null, tint = BridgeEmber, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(7.dp)); Text(status, color = BridgeWhite.copy(alpha = .88f), style = MaterialTheme.typography.labelMedium) }
             }
@@ -211,7 +256,7 @@ private fun ConnectionLanding(state: Workflow, busy: Boolean, notice: String?, c
             ConnectionLightField(pulse)
             Spacer(Modifier.weight(1f))
             Button(connect, Modifier.fillMaxWidth().height(58.dp), enabled = !busy, shape = RoundedCornerShape(30.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeWhite, disabledContainerColor = BridgeCopper, disabledContentColor = BridgeWhite.copy(alpha = .75f))) {
-                Icon(if (busy) Icons.Default.Sync else Icons.Default.Wifi, null); Spacer(Modifier.width(10.dp)); Text(if (busy) "\u6b63\u5728\u5efa\u7acb\u8fde\u63a5" else "\u5f00\u59cb\u5efa\u7acb\u8fde\u63a5", fontWeight = FontWeight.Bold)
+                Icon(if (busy) Icons.Default.Sync else Icons.Default.Wifi, null); Spacer(Modifier.width(10.dp)); Text(if (busy) "\u6b63\u5728\u68c0\u6d4b\u8fde\u63a5" else "\u5f00\u59cb\u5efa\u7acb\u8fde\u63a5", fontWeight = FontWeight.Bold)
             }
             Text("\u8fde\u4e0d\u4e0a\u65f6\u4f1a\u81ea\u52a8\u8df3\u8f6c Wi-Fi \u8bbe\u7f6e", Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 6.dp), color = BridgeWhite.copy(alpha = .48f), style = MaterialTheme.typography.labelSmall, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
         }
@@ -266,6 +311,9 @@ private fun Status(state: Workflow) {
 private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
     val photos by vm.photos.collectAsState()
     val hasMore by vm.hasMorePhotos.collectAsState()
+    val pageTask by vm.pageTask.collectAsState()
+    val luts by vm.luts.collectAsState()
+    val recentLutIds by vm.recentLutIds.collectAsState()
     var preview by remember { mutableStateOf<PhotoAsset?>(null) }
     var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var previewLoading by remember { mutableStateOf(false) }
@@ -273,15 +321,54 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
     val scope = rememberCoroutineScope()
     var selectionMode by remember { mutableStateOf(false) }
     var selectedHandles by remember { mutableStateOf<Set<UInt>>(emptySet()) }
+    var selectionMenu by remember { mutableStateOf(false) }
+    var showBatchLutPicker by remember { mutableStateOf(false) }
+    var batchLutEntry by remember { mutableStateOf<LutEntry?>(null) }
+    var batchLut by remember { mutableStateOf<CubeLut?>(null) }
+    var batchLutLoading by remember { mutableStateOf(false) }
+    var showBatchConfirm by remember { mutableStateOf(false) }
+    var gradedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var grading by remember { mutableStateOf(false) }
+    var selectedLutEntry by remember { mutableStateOf<LutEntry?>(null) }
+    var selectedLut by remember { mutableStateOf<CubeLut?>(null) }
+    var inlineTask by remember { mutableStateOf<InlineTask?>(null) }
+    var inlineRetry by remember { mutableStateOf<() -> Unit>({}) }
+    var lutRetry by remember { mutableIntStateOf(0) }
     val visiblePhotos = photos.filter { it.matches(filter) }
+    LaunchedEffect(previewBitmap, selectedLut, lutRetry) {
+        val original = previewBitmap; val lut = selectedLut
+        if (original == null || lut == null) {
+            gradedBitmap = null; grading = false
+            if (lut == null && inlineTask?.title?.startsWith("正在应用") == true) inlineTask = null
+        } else {
+            inlineTask = InlineTask("正在应用 LUT…", "${selectedLutEntry?.name ?: lut.name} · 预览", running = true)
+            grading = true
+            val result = runCatching { withContext(Dispatchers.Default) { CubeLuts.apply(original, lut) } }
+            result.onSuccess { gradedBitmap = it; inlineTask = InlineTask("✓ 已应用 LUT", "${selectedLutEntry?.name ?: lut.name} · 预览", running = false) }
+                .onFailure { gradedBitmap = null; inlineTask = InlineTask("应用 LUT 失败：${it.message ?: "无法处理图片"}", "", running = false, failed = true); inlineRetry = { lutRetry++ } }
+            grading = false
+        }
+    }
     Column(Modifier.fillMaxSize().background(BridgeNight)) {
         BridgePageLabel("\u76f8\u518c", if (photos.isNotEmpty()) "${visiblePhotos.size} \u4e2a\u6587\u4ef6" else "\u8fde\u63a5\u76f8\u673a\u540e\u5f00\u59cb") {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                TextButton({ selectionMode = !selectionMode; if (!selectionMode) selectedHandles = emptySet() }, enabled = !busy) { Text(if (selectionMode) "\u53d6\u6d88" else "\u591a\u9009") }
-                if (selectionMode) TextButton({ vm.downloadAll(photos.filter { it.handle in selectedHandles }); selectedHandles = emptySet(); selectionMode = false }, enabled = !busy && selectedHandles.isNotEmpty()) { Text("\u4e0b\u8f7d\uff08${selectedHandles.size}\uff09") }
-                IconButton(vm::loadPhotos, enabled = !busy) { Icon(Icons.Default.Refresh, "\u5237\u65b0") }
+                if (selectionMode) {
+                    TextButton({ selectionMode = false; selectedHandles = emptySet() }, enabled = !busy) { Text("\u53d6\u6d88", color = BridgeWhite) }
+                    Text("${selectedHandles.size} \u5f20", Modifier.padding(horizontal = 8.dp), color = BridgeWhite.copy(alpha = .72f), style = MaterialTheme.typography.labelLarge)
+                    Box {
+                        TextButton({ selectionMenu = true }, enabled = !busy && selectedHandles.isNotEmpty()) { Text("\u64cd\u4f5c \u25be", color = BridgeWhite) }
+                        DropdownMenu(selectionMenu, { selectionMenu = false }) {
+                            DropdownMenuItem({ Text("\u4e0b\u8f7d\u539f\u56fe") }, { vm.downloadAll(photos.filter { it.handle in selectedHandles }); selectedHandles = emptySet(); selectionMode = false; selectionMenu = false })
+                            DropdownMenuItem({ Text("\u5957 LUT") }, { showBatchLutPicker = true; selectionMenu = false })
+                        }
+                    }
+                } else {
+                    TextButton({ selectionMode = true }, enabled = !busy) { Text("\u591a\u9009", color = BridgeWhite) }
+                    IconButton(vm::loadPhotos, enabled = !busy) { Icon(Icons.Default.Refresh, "\u5237\u65b0", tint = BridgeWhite) }
+                }
             }
         }
+        PageTaskBar(pageTask, vm::retryPageTask)
         FilterBar(filter) { filter = it }
         if (photos.isEmpty()) BridgeEmptyState(Icons.Default.PhotoLibrary, "\u6682\u65e0\u7167\u7247", "\u8fde\u63a5\u76f8\u673a\u5e76\u8bfb\u53d6\u76f8\u518c")
         else if (visiblePhotos.isEmpty()) BridgeEmptyState(Icons.Default.FilterAlt, "\u6b64\u5206\u7c7b\u6682\u65e0\u6587\u4ef6", "\u8bd5\u8bd5\u5176\u4ed6\u5206\u7c7b")
@@ -289,27 +376,169 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
             items(visiblePhotos, key = { it.handle.toString() }) { asset ->
                 PhotoCard(asset, vm.thumbnails[asset.handle], { vm.loadThumbnail(asset) }, asset.handle in selectedHandles) {
                     if (selectionMode) selectedHandles = if (asset.handle in selectedHandles) selectedHandles - asset.handle else selectedHandles + asset.handle
-                    else { vm.loadThumbnail(asset); previewBitmap = null; previewLoading = false; preview = asset }
+                    else { vm.loadThumbnail(asset); previewBitmap = null; previewLoading = false; selectedLut = null; selectedLutEntry = null; inlineTask = null; inlineRetry = {}; preview = asset }
                 }
             }
             if (hasMore && filter == PhotoFilter.ALL) item { Row(Modifier.fillMaxWidth().padding(20.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) { LaunchedEffect(photos.size) { vm.loadMorePhotos() }; CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(10.dp)); Text("正在加载更多", color = BridgeWhite.copy(alpha = .6f), style = MaterialTheme.typography.labelMedium) } }
+            if (!hasMore && filter == PhotoFilter.ALL && photos.isNotEmpty()) item { Text("已全部加载", Modifier.fillMaxWidth().padding(18.dp), color = BridgeWhite.copy(alpha = .45f), style = MaterialTheme.typography.labelSmall, textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
         }
     }
     preview?.let { asset ->
-        PreviewDialog(asset.name, asset.size, vm.thumbnails[asset.handle], previewBitmap, previewLoading, { preview = null }, {
-            previewBitmap = null
-            previewLoading = true
-            scope.launch {
-                val bitmap = vm.loadOriginalPreview(asset)
-                if (preview?.handle == asset.handle) { previewBitmap = bitmap; previewLoading = false }
+        val startLoadOriginal: () -> Unit = {
+            val run = {
+                inlineTask = InlineTask("正在加载原图…", asset.name, running = true)
+                previewBitmap = null; previewLoading = true
+                scope.launch {
+                    val bitmap = vm.loadOriginalPreview(asset)
+                    if (preview?.handle == asset.handle) {
+                        previewBitmap = bitmap; previewLoading = false
+                        inlineTask = if (bitmap != null) InlineTask("✓ 已加载原图", asset.name, running = false) else InlineTask("加载原图失败：无法解码图片", asset.name, running = false, failed = true)
+                    }
+                }
+                Unit
             }
-        }) { vm.download(asset) }
+            inlineRetry = run; run()
+        }
+        val startDownload: () -> Unit = {
+            val run = {
+                inlineTask = InlineTask("正在下载原图…", asset.name, running = true)
+                vm.download(asset, inline = true) { result -> result.fold({ inlineTask = InlineTask("✓ 已下载原图", it.name, running = false) }, { inlineTask = InlineTask("下载失败：${it.message ?: "未知错误"}", "", running = false, failed = true) }) }
+                Unit
+            }
+            inlineRetry = run; run()
+        }
+        val startExport: (() -> Unit)? = if (gradedBitmap != null && selectedLut != null) {
+            {
+                val run = {
+                    inlineTask = InlineTask("正在导出套色图…", "${selectedLutEntry?.name ?: selectedLut!!.name} · 高质量 JPG", running = true)
+                    vm.exportLut(asset, gradedBitmap!!, selectedLut!!, inline = true) { result -> result.fold({ inlineTask = InlineTask("✓ 已导出套色图", it.name, running = false) }, { inlineTask = InlineTask("导出失败：${it.message ?: "未知错误"}", "", running = false, failed = true) }) }
+                    Unit
+                }
+                inlineRetry = run; run()
+            }
+        } else null
+        PreviewDialog(asset.name, asset.size, vm.thumbnails[asset.handle], gradedBitmap ?: previewBitmap, previewLoading || grading, { preview = null }, {
+            startLoadOriginal()
+        }, previewBitmap != null, luts, recentLutIds, { entry ->
+            if (entry == null) { selectedLutEntry = null; selectedLut = null; inlineTask = null; inlineRetry = {} }
+            else {
+                vm.markLutUsed(entry)
+                scope.launch { selectedLut = runCatching { vm.readLut(entry) }.getOrNull(); selectedLutEntry = if (selectedLut != null) entry else null }
+            }
+        }, selectedLutEntry?.name, startExport, startDownload, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry)
+    }
+    LutPickerSheet(showBatchLutPicker, luts, recentLutIds, { showBatchLutPicker = false }, { entry ->
+        if (entry != null) {
+            showBatchLutPicker = false
+            batchLutEntry = entry
+            batchLut = null
+            batchLutLoading = true
+            showBatchConfirm = true
+            scope.launch {
+                vm.markLutUsed(entry)
+                val loaded = runCatching { vm.readLut(entry) }.getOrNull()
+                if (batchLutEntry?.id == entry.id) {
+                    batchLut = loaded
+                    batchLutLoading = false
+                    if (loaded == null) showBatchConfirm = false
+                }
+            }
+        }
+    })
+    if (showBatchConfirm && batchLutEntry != null) {
+        val selected = photos.filter { it.handle in selectedHandles }
+        val rawCount = selected.count { it.type == "RAW" }
+        val videoCount = selected.count { it.type in setOf("MOV", "MP4") }
+        val suffix = buildString { if (rawCount > 0) append(" RAW 将导出为 JPG。"); if (videoCount > 0) append(" 视频将自动跳过。") }
+        AlertDialog(onDismissRequest = { showBatchConfirm = false }, title = { Text("批量套用 LUT", color = BridgeWhite) }, text = { Column { Text("将为 ${selected.size} 张图片应用「${batchLutEntry!!.name}」并导出新图片。$suffix", color = BridgeWhite.copy(alpha = .8f)); if (batchLutLoading) { Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(8.dp)); Text("正在读取 LUT…", color = BridgeWhite.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall) } } } }, confirmButton = { TextButton({ batchLut?.let { lut -> showBatchConfirm = false; batchLutLoading = false; vm.downloadAllWithLut(selected, lut) { selectionMode = false; selectedHandles = emptySet() } } }, enabled = !batchLutLoading && batchLut != null) { Text("开始导出", color = if (batchLutLoading) BridgeWhite.copy(alpha = .35f) else BridgeEmber) } }, dismissButton = { TextButton({ showBatchConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = Color(0xFF171015), titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
     }
 }
 
 @Composable
-private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, download: (() -> Unit)? = null) {
+private fun AnimatedActivityPill(text: String?, busy: Boolean, retry: (() -> Unit)?) {
+    var shownText by remember { mutableStateOf(text) }
+    LaunchedEffect(text) {
+        if (text != null) shownText = text
+        else { delay(180); shownText = null }
+    }
+    AnimatedVisibility(visible = text != null, enter = fadeIn(tween(220)) + expandVertically(tween(220), expandFrom = Alignment.Top) + slideInVertically(tween(220)) { -it / 3 }, exit = fadeOut(tween(180)) + shrinkVertically(tween(180), shrinkTowards = Alignment.Top) + slideOutVertically(tween(180)) { -it / 3 }) {
+        shownText?.let { ActivityPill(it, busy, Modifier.padding(horizontal = 20.dp, vertical = 10.dp), retry) }
+    }
+}
+
+@Composable
+private fun PageTaskBar(task: PageTask?, retry: () -> Unit) {
+    var shownTask by remember { mutableStateOf(task) }
+    LaunchedEffect(task) { if (task != null) shownTask = task else { delay(180); shownTask = null } }
+    AnimatedVisibility(visible = task != null, enter = fadeIn(tween(220)) + expandVertically(tween(220), expandFrom = Alignment.Top) + slideInVertically(tween(220)) { -it / 3 }, exit = fadeOut(tween(180)) + shrinkVertically(tween(180), shrinkTowards = Alignment.Top) + slideOutVertically(tween(180)) { -it / 3 }) {
+        shownTask?.let { current ->
+            val accent = if (current.failed) Color(0xFFE57373) else BridgeEmber
+            Surface(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), shape = RoundedCornerShape(16.dp), color = accent.copy(alpha = .13f), border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = .28f))) {
+                Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (current.running) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = accent) else Icon(if (current.failed) Icons.Default.ErrorOutline else Icons.Default.CheckCircle, null, tint = accent, modifier = Modifier.size(17.dp))
+                    Spacer(Modifier.width(8.dp)); Text(current.message, Modifier.weight(1f), color = BridgeWhite, style = MaterialTheme.typography.bodySmall)
+                    if (current.failed) TextButton(retry, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Text("重试", color = accent) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun InlineStatusCard(task: InlineTask?, dismiss: () -> Unit, retry: () -> Unit) {
+    var shownTask by remember { mutableStateOf(task) }
+    LaunchedEffect(task) {
+        if (task != null) {
+            shownTask = task
+            if (!task.running && !task.failed) { delay(3_000); dismiss() }
+        } else { delay(180); shownTask = null }
+    }
+    AnimatedVisibility(visible = task != null, enter = fadeIn(tween(220)) + expandVertically(tween(220), expandFrom = Alignment.Bottom) + slideInVertically(tween(220)) { it / 2 }, exit = fadeOut(tween(180)) + shrinkVertically(tween(180), shrinkTowards = Alignment.Bottom) + slideOutVertically(tween(180)) { it / 2 }) {
+        shownTask?.let { current ->
+            val accent = if (current.failed) Color(0xFFE57373) else BridgeEmber
+            Surface(Modifier.fillMaxWidth().padding(top = 10.dp), shape = RoundedCornerShape(16.dp), color = accent.copy(alpha = .13f), border = androidx.compose.foundation.BorderStroke(1.dp, accent.copy(alpha = .3f))) {
+                Row(Modifier.padding(horizontal = 14.dp, vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (current.running) CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp, color = accent) else Icon(if (current.failed) Icons.Default.ErrorOutline else Icons.Default.CheckCircle, null, tint = accent, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(9.dp)); Column(Modifier.weight(1f)) { Text(current.title, color = BridgeWhite, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold); if (current.detail.isNotBlank()) Text(current.detail, color = BridgeWhite.copy(alpha = .65f), style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    if (current.failed) TextButton(retry, contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp)) { Text("重试", color = accent) }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LutPickerSheet(visible: Boolean, luts: List<LutEntry>, recentIds: List<String>, dismiss: () -> Unit, select: (LutEntry?) -> Unit) {
+    if (!visible) return
+    var category by remember { mutableStateOf<LutCategory?>(null) }
+    var recentOnly by remember { mutableStateOf(false) }
+    val visibleLuts = if (recentOnly) recentIds.mapNotNull { id -> luts.firstOrNull { it.id == id } } else luts.filter { category == null || it.category == category }
+    ModalBottomSheet(onDismissRequest = dismiss, containerColor = Color(0xFF171015), contentColor = BridgeWhite) {
+        Text("选择 LUT", Modifier.padding(horizontal = 20.dp), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        LazyRow(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            item { LutCategoryChip("最近使用", recentOnly) { recentOnly = true; category = null } }
+            item { LutCategoryChip("全部", !recentOnly && category == null) { recentOnly = false; category = null } }
+            items(LutCategory.entries) { item -> LutCategoryChip(item.title, !recentOnly && category == item) { recentOnly = false; category = item } }
+        }
+        if (visibleLuts.isEmpty()) {
+            Text(if (recentOnly) "暂无最近使用" else "请先在 LUT 页面导入预设", Modifier.fillMaxWidth().padding(28.dp), color = BridgeWhite.copy(alpha = .62f), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        } else LazyColumn(Modifier.fillMaxWidth().heightIn(max = 360.dp), contentPadding = PaddingValues(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(visibleLuts, key = { it.id }) { entry ->
+                Surface(Modifier.fillMaxWidth().clickable { select(entry) }, shape = RoundedCornerShape(16.dp), color = BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
+                    Row(Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.ColorLens, null, tint = BridgeEmber, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(12.dp)); Column { Text(entry.name, color = BridgeWhite, fontWeight = FontWeight.SemiBold); Text(entry.category.title, color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) } }
+                }
+            }
+        }
+        TextButton({ select(null) }, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) { Text("不使用 LUT", color = BridgeWhite.copy(alpha = .8f)) }
+        Spacer(Modifier.navigationBarsPadding())
+    }
+}
+
+@Composable
+private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}) {
     var rotation by remember(name) { mutableIntStateOf(0) }
+    var lutMenu by remember(name) { mutableStateOf(false) }
     Dialog(onDismissRequest = dismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxWidth(.96f).fillMaxHeight(.9f), shape = RoundedCornerShape(28.dp), color = Color(0xFF171015), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
             Column(Modifier.fillMaxSize().padding(16.dp)) {
@@ -320,15 +549,22 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
                 }
                 Box(Modifier.fillMaxWidth().weight(1f).padding(vertical = 14.dp).background(BridgeNight, RoundedCornerShape(20.dp)).clipToBounds(), contentAlignment = Alignment.Center) {
                     (bitmap ?: thumbnail)?.let { ZoomableImage(it, rotation) } ?: Text("正在加载缩略图", color = BridgeWhite)
-                    if (loading) CircularProgressIndicator(color = BridgeEmber)
+                    if (loading) Column(horizontalAlignment = Alignment.CenterHorizontally) { CircularProgressIndicator(color = BridgeEmber); Spacer(Modifier.height(8.dp)); Text(if (bitmap != null) "正在套用 LUT" else "正在加载", color = BridgeWhite.copy(alpha = .7f), style = MaterialTheme.typography.labelSmall) }
                 }
-                if (loadOriginal != null || download != null) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
-                    if (download != null) TextButton(download) { Text("下载原图", color = BridgeWhite) }
-                    if (loadOriginal != null) Button(loadOriginal, enabled = !loading, shape = RoundedCornerShape(18.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) { Text(if (bitmap == null) "查看原图" else "重新加载") }
+                val taskRunning = inlineTask?.running == true
+                val exportRunning = taskRunning && inlineTask?.title?.startsWith("正在导出") == true
+                val downloadRunning = taskRunning && inlineTask?.title?.startsWith("正在下载") == true
+                if (loadOriginal != null || download != null || selectLut != null) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                    if (download != null) TextButton({ download() }, enabled = !taskRunning) { if (downloadRunning) { CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp, color = BridgeWhite); Spacer(Modifier.width(6.dp)); Text("正在下载…", color = BridgeWhite) } else Text("下载原图", color = BridgeWhite) }
+                    if (selectLut != null) TextButton({ lutMenu = true }, enabled = originalLoaded) { Text(if (lutName == null) "LUT" else lutName, color = if (originalLoaded) BridgeWhite else BridgeWhite.copy(alpha = .35f)) }
+                    if (selectLut != null) TextButton({ exportLut?.invoke() }, enabled = exportLut != null && !taskRunning) { if (exportRunning) { CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(6.dp)); Text("正在导出…", color = BridgeEmber) } else Text("导出套色图", color = if (exportLut != null) BridgeEmber else BridgeEmber.copy(alpha = .35f)) }
+                    if (loadOriginal != null) Button({ loadOriginal() }, enabled = !loading && !taskRunning, shape = RoundedCornerShape(18.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) { Text(if (taskRunning) "正在处理…" else if (bitmap == null) "查看原图" else "重新加载") }
                 }
+                InlineStatusCard(inlineTask, dismissInline, retryInline)
             }
         }
     }
+    if (lutMenu && selectLut != null) LutPickerSheet(true, luts, recentLutIds, { lutMenu = false }, { entry -> lutMenu = false; selectLut(entry) })
 }
 
 @Composable
@@ -363,30 +599,72 @@ private fun PhotoCard(asset: PhotoAsset, bitmap: Bitmap?, load: () -> Unit, sele
 @Composable
 private fun DownloadsScreen(vm: MainViewModel) {
     val rows by vm.downloads.collectAsState()
+    val luts by vm.luts.collectAsState()
+    val recentLutIds by vm.recentLutIds.collectAsState()
+    val pageTask by vm.pageTask.collectAsState()
     var preview by remember { mutableStateOf<DownloadRecord?>(null) }
     var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var previewLoading by remember { mutableStateOf(false) }
+    var gradedBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var grading by remember { mutableStateOf(false) }
+    var previewLut by remember { mutableStateOf<LutEntry?>(null) }
     var selectionMode by remember { mutableStateOf(false) }
     var selectedUris by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var selectionMenu by remember { mutableStateOf(false) }
+    var showBatchLutPicker by remember { mutableStateOf(false) }
+    var batchLutEntry by remember { mutableStateOf<LutEntry?>(null) }
+    var batchLut by remember { mutableStateOf<CubeLut?>(null) }
+    var batchLutLoading by remember { mutableStateOf(false) }
+    var showBatchConfirm by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf(PhotoFilter.ALL) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var inlineTask by remember { mutableStateOf<InlineTask?>(null) }
+    var inlineRetry by remember { mutableStateOf<() -> Unit>({}) }
+    var lutRetry by remember { mutableIntStateOf(0) }
+    var originalReload by remember { mutableIntStateOf(0) }
     val visibleRows = rows.filter { it.matches(filter) }
-    LaunchedEffect(preview?.uri) {
+    LaunchedEffect(preview?.uri, originalReload) {
         val uri = preview?.uri ?: return@LaunchedEffect
+        val name = preview?.name ?: "图片"
+        inlineTask = InlineTask("正在加载原图…", name, running = true)
         previewBitmap = null; previewLoading = true
-        previewBitmap = vm.loadLocalOriginal(uri); previewLoading = false
+        val bitmap = vm.loadLocalOriginal(uri)
+        previewBitmap = bitmap; previewLoading = false
+        if (bitmap != null) inlineTask = InlineTask("✓ 已加载原图", name, running = false)
+        else { inlineTask = InlineTask("加载原图失败：无法读取图片", name, running = false, failed = true); inlineRetry = { originalReload++ } }
+    }
+    LaunchedEffect(previewBitmap, previewLut, lutRetry) {
+        val original = previewBitmap; val entry = previewLut
+        if (original == null || entry == null) { gradedBitmap = null; grading = false; if (entry == null && inlineTask?.title?.startsWith("正在应用") == true) inlineTask = null }
+        else {
+            inlineTask = InlineTask("正在应用 LUT…", "${entry.name} · 预览", running = true)
+            grading = true
+            val result = runCatching { withContext(Dispatchers.Default) { val source = context.filesDir.resolve("luts").resolve(entry.id).readText(); CubeLuts.apply(original, CubeLuts.parse(entry.name, source)) } }
+            result.onSuccess { gradedBitmap = it; inlineTask = InlineTask("✓ 已应用 LUT", "${entry.name} · 预览", running = false) }
+                .onFailure { gradedBitmap = null; inlineTask = InlineTask("应用 LUT 失败：${it.message ?: "无法处理图片"}", "", running = false, failed = true); inlineRetry = { lutRetry++ } }
+            grading = false
+        }
     }
     Column(Modifier.fillMaxSize().background(BridgeNight)) {
         BridgePageLabel("\u4e0b\u8f7d", "\u5df2\u4fdd\u5b58 ${rows.size} \u4e2a\u6587\u4ef6") {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                TextButton({ selectionMode = !selectionMode; if (!selectionMode) selectedUris = emptySet() }) { Text(if (selectionMode) "\u53d6\u6d88" else "\u591a\u9009", color = BridgeWhite) }
                 if (selectionMode) {
-                    TextButton({ shareUris(context, visibleRows.filter { it.uri in selectedUris }.map { it.uri }); selectedUris = emptySet(); selectionMode = false }, enabled = selectedUris.isNotEmpty()) { Text("\u5206\u4eab\uff08${selectedUris.size}\uff09", color = if (selectedUris.isNotEmpty()) BridgeEmber else BridgeWhite.copy(alpha = .4f)) }
-                    TextButton({ showDeleteConfirm = true }, enabled = selectedUris.isNotEmpty()) { Text("\u5220\u9664\uff08${selectedUris.size}\uff09", color = if (selectedUris.isNotEmpty()) Color(0xFFE57373) else BridgeWhite.copy(alpha = .4f)) }
-                }
+                    TextButton({ selectionMode = false; selectedUris = emptySet() }) { Text("取消", color = BridgeWhite) }
+                    Text("${selectedUris.size} 个", Modifier.padding(horizontal = 8.dp), color = BridgeWhite.copy(alpha = .72f), style = MaterialTheme.typography.labelLarge)
+                    Box {
+                        TextButton({ selectionMenu = true }, enabled = selectedUris.isNotEmpty()) { Text("操作 ▾", color = BridgeWhite) }
+                        DropdownMenu(selectionMenu, { selectionMenu = false }) {
+                            DropdownMenuItem({ Text("套 LUT") }, { showBatchLutPicker = true; selectionMenu = false })
+                            DropdownMenuItem({ Text("分享") }, { shareUris(context, rows.filter { it.uri in selectedUris }.map { it.uri }); selectedUris = emptySet(); selectionMode = false; selectionMenu = false })
+                            DropdownMenuItem({ Text("删除", color = Color(0xFFE57373)) }, { showDeleteConfirm = true; selectionMenu = false })
+                        }
+                    }
+                } else TextButton({ selectionMode = true }) { Text("多选", color = BridgeWhite) }
             }
         }
+        PageTaskBar(pageTask, vm::retryPageTask)
         FilterBar(filter) { filter = it; selectedUris = emptySet() }
         if (rows.isEmpty()) BridgeEmptyState(Icons.Default.CloudDownload, "\u6682\u65e0\u4e0b\u8f7d\u8bb0\u5f55", "\u5728\u76f8\u518c\u4e2d\u9009\u62e9\u7167\u7247\u5373\u53ef\u4fdd\u5b58\u5230\u624b\u673a")
         else if (visibleRows.isEmpty()) BridgeEmptyState(Icons.Default.FilterAlt, "\u6b64\u5206\u7c7b\u6682\u65e0\u6587\u4ef6", "\u8bd5\u8bd5\u5176\u4ed6\u5206\u7c7b")
@@ -394,13 +672,48 @@ private fun DownloadsScreen(vm: MainViewModel) {
             items(visibleRows, key = { it.uri }) { row ->
                 DownloadCard(row, row.uri in selectedUris) {
                     if (selectionMode) selectedUris = if (row.uri in selectedUris) selectedUris - row.uri else selectedUris + row.uri
-                    else preview = row
+                    else { previewLut = null; gradedBitmap = null; inlineTask = null; inlineRetry = {}; preview = row }
                 }
             }
         }
     }
     preview?.let { row ->
-        PreviewDialog(row.name, row.size, null, previewBitmap, previewLoading, { preview = null }, null)
+        val startExport: (() -> Unit)? = if (gradedBitmap != null && previewLut != null) {
+            {
+                val run = {
+                    inlineTask = InlineTask("正在导出套色图…", "${previewLut!!.name} · 高质量 JPG", running = true)
+                    vm.exportLutDownload(row, gradedBitmap!!, CubeLuts.parse(previewLut!!.name, context.filesDir.resolve("luts").resolve(previewLut!!.id).readText()), inline = true) { result -> result.fold({ inlineTask = InlineTask("✓ 已导出套色图", it.name, running = false) }, { inlineTask = InlineTask("导出失败：${it.message ?: "未知错误"}", "", running = false, failed = true) }) }
+                    Unit
+                }
+                inlineRetry = run; run()
+            }
+        } else null
+        PreviewDialog(row.name, row.size, null, gradedBitmap ?: previewBitmap, previewLoading || grading, { preview = null; previewLut = null; gradedBitmap = null; inlineTask = null; inlineRetry = {} }, null, previewBitmap != null, luts, recentLutIds, { entry -> previewLut = entry; entry?.let(vm::markLutUsed) }, previewLut?.name, startExport, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry)
+    }
+    LutPickerSheet(showBatchLutPicker, luts, recentLutIds, { showBatchLutPicker = false }, { entry ->
+        if (entry != null) {
+            showBatchLutPicker = false
+            batchLutEntry = entry
+            batchLut = null
+            batchLutLoading = true
+            showBatchConfirm = true
+            scope.launch {
+                vm.markLutUsed(entry)
+                val loaded = runCatching { vm.readLut(entry) }.getOrNull()
+                if (batchLutEntry?.id == entry.id) {
+                    batchLut = loaded
+                    batchLutLoading = false
+                    if (loaded == null) showBatchConfirm = false
+                }
+            }
+        }
+    })
+    if (showBatchConfirm && batchLutEntry != null) {
+        val selected = rows.filter { it.uri in selectedUris }
+        val rawCount = selected.count { it.name.substringAfterLast('.', "").lowercase() in setOf("nef", "nrw", "cr2", "arw", "dng", "raf") }
+        val videoCount = selected.count { !it.name.supportsLutInput() }
+        val suffix = buildString { if (rawCount > 0) append(" RAW 将导出为 JPG。"); if (videoCount > 0) append(" 视频将自动跳过。") }
+        AlertDialog(onDismissRequest = { showBatchConfirm = false }, title = { Text("批量套用 LUT", color = BridgeWhite) }, text = { Column { Text("将为 ${selected.size} 个文件应用「${batchLutEntry!!.name}」并导出为新图片。$suffix", color = BridgeWhite.copy(alpha = .8f)); if (batchLutLoading) { Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(8.dp)); Text("正在读取 LUT…", color = BridgeWhite.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall) } } } }, confirmButton = { TextButton({ batchLut?.let { lut -> showBatchConfirm = false; batchLutLoading = false; vm.applyLutToDownloads(selected, lut) { selectionMode = false; selectedUris = emptySet() } } }, enabled = !batchLutLoading && batchLut != null) { Text("开始导出", color = if (batchLutLoading) BridgeWhite.copy(alpha = .35f) else BridgeEmber) } }, dismissButton = { TextButton({ showBatchConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = Color(0xFF171015), titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
     }
     if (showDeleteConfirm) {
         AlertDialog(
@@ -422,6 +735,59 @@ private fun shareUris(context: android.content.Context, uris: List<String>) {
     intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
     context.startActivity(android.content.Intent.createChooser(intent, "\u5206\u4eab\u5230"))
 }
+
+@Composable
+private fun LutScreen(vm: MainViewModel) {
+    val luts by vm.luts.collectAsState()
+    var category by remember { mutableStateOf<LutCategory?>(null) }
+    var menuFor by remember { mutableStateOf<String?>(null) }
+    var editing by remember { mutableStateOf<LutEntry?>(null) }
+    var editName by remember { mutableStateOf("") }
+    var categoryEditor by remember { mutableStateOf<LutEntry?>(null) }
+    var deleteConfirm by remember { mutableStateOf<LutEntry?>(null) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let(vm::importLut) }
+    val visible = luts.filter { category == null || it.category == category }
+    Column(Modifier.fillMaxSize().background(BridgeNight)) {
+        BridgePageLabel("LUT", "已导入 ${luts.size} 个预设") { TextButton({ picker.launch(arrayOf("*/*")) }) { Text("导入", color = BridgeEmber) } }
+        LazyRow(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            item { LutCategoryChip("\u5168\u90e8", category == null) { category = null } }
+            items(LutCategory.entries) { item -> LutCategoryChip(item.title, category == item) { category = item } }
+        }
+        if (visible.isEmpty()) BridgeEmptyState(Icons.Default.ColorLens, "\u6682\u65e0 LUT", "\u5bfc\u5165 .cube \u6587\u4ef6\u540e\u53ef\u5728\u8be6\u60c5\u9875\u9009\u62e9")
+        else LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 94.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(visible, key = { it.id }) { entry ->
+                Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f))) {
+                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Surface(Modifier.size(42.dp), shape = CircleShape, color = BridgeEmber.copy(alpha = .15f)) { Icon(Icons.Default.ColorLens, null, Modifier.padding(11.dp), tint = BridgeEmber) }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) { Text(entry.name, color = BridgeWhite, fontWeight = FontWeight.SemiBold); Text(entry.category.title, color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) }
+                        Box {
+                            IconButton({ menuFor = entry.id }) { Icon(Icons.Default.MoreVert, "\u7ba1\u7406", tint = BridgeWhite) }
+                            DropdownMenu(menuFor == entry.id, { menuFor = null }) {
+                                DropdownMenuItem({ Text("\u91cd\u547d\u540d") }, { editName = entry.name; editing = entry; menuFor = null })
+                                DropdownMenuItem({ Text("修改分类") }, { categoryEditor = entry; menuFor = null })
+                                DropdownMenuItem({ Text("删除", color = Color(0xFFE57373)) }, { deleteConfirm = entry; menuFor = null })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    editing?.let { entry ->
+        AlertDialog(onDismissRequest = { editing = null }, title = { Text("重命名 LUT", color = BridgeWhite) }, text = { OutlinedTextField(editName, { editName = it }, singleLine = true, colors = bridgeFieldColors()) }, confirmButton = { TextButton({ vm.updateLut(entry, name = editName); editing = null }) { Text("保存", color = BridgeEmber) } }, dismissButton = { TextButton({ editing = null }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = Color(0xFF171015), titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
+    }
+    categoryEditor?.let { entry ->
+        AlertDialog(onDismissRequest = { categoryEditor = null }, title = { Text("修改分类", color = BridgeWhite) }, text = {
+            Column { LutCategory.entries.forEach { type -> Row(Modifier.fillMaxWidth().clickable { vm.updateLut(entry, category = type); categoryEditor = null }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) { RadioButton(type == entry.category, { vm.updateLut(entry, category = type); categoryEditor = null }, colors = RadioButtonDefaults.colors(selectedColor = BridgeEmber)); Text(type.title, color = BridgeWhite) } } }
+        }, confirmButton = {}, containerColor = Color(0xFF171015), titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
+    }
+    deleteConfirm?.let { entry ->
+        AlertDialog(onDismissRequest = { deleteConfirm = null }, title = { Text("删除 LUT", color = BridgeWhite) }, text = { Text("删除后不会影响已经导出的图片。", color = BridgeWhite.copy(alpha = .8f)) }, confirmButton = { TextButton({ vm.removeLut(entry); deleteConfirm = null }) { Text("删除", color = Color(0xFFE57373)) } }, dismissButton = { TextButton({ deleteConfirm = null }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = Color(0xFF171015), titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
+    }
+}
+
+@Composable private fun LutCategoryChip(title: String, selected: Boolean, click: () -> Unit) { Surface(Modifier.clickable { click() }, shape = RoundedCornerShape(18.dp), color = if (selected) BridgeEmber else BridgeWhite.copy(alpha = .08f)) { Text(title, Modifier.padding(horizontal = 14.dp, vertical = 8.dp), color = if (selected) BridgeNight else BridgeWhite, style = MaterialTheme.typography.labelMedium) } }
 
 @Composable
 private fun SettingsScreen(vm: MainViewModel) {
@@ -454,4 +820,4 @@ private fun loadDownloadThumbnail(context: android.content.Context, uri: String)
 @Composable private fun EmptyState(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String, subtitle: String) { Column(Modifier.fillMaxSize().padding(36.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Icon(icon, null, tint = Amber, modifier = Modifier.size(50.dp)); Spacer(Modifier.height(14.dp)); Text(title, fontWeight = FontWeight.Bold, color = Ink); Text(subtitle, color = Muted, style = MaterialTheme.typography.bodySmall) } }
 @Composable private fun PrimaryButton(text: String, icon: androidx.compose.ui.graphics.vector.ImageVector, enabled: Boolean, click: () -> Unit) { Button(click, Modifier.fillMaxWidth().height(54.dp), enabled = enabled, shape = RoundedCornerShape(28.dp), colors = ButtonDefaults.buttonColors(containerColor = Ink, contentColor = Color.White)) { Icon(icon, null); Spacer(Modifier.width(8.dp)); Text(text, fontWeight = FontWeight.Bold) } }
 @Composable private fun SecondaryButton(text: String, icon: androidx.compose.ui.graphics.vector.ImageVector, enabled: Boolean, click: () -> Unit) { Button(click, Modifier.fillMaxWidth(), enabled = enabled, shape = RoundedCornerShape(16.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF1F1F2), contentColor = Ink)) { Icon(icon, null); Spacer(Modifier.width(8.dp)); Text(text) } }
-private fun tabIcon(tab: Tab) = when (tab) { Tab.CAMERA -> Icons.Default.CameraAlt; Tab.PHOTOS -> Icons.Default.PhotoLibrary; Tab.DOWNLOADS -> Icons.Default.Download; Tab.SETTINGS -> Icons.Default.Settings }
+private fun tabIcon(tab: Tab) = when (tab) { Tab.CAMERA -> Icons.Default.CameraAlt; Tab.PHOTOS -> Icons.Default.PhotoLibrary; Tab.DOWNLOADS -> Icons.Default.Download; Tab.LUT -> Icons.Default.ColorLens; Tab.SETTINGS -> Icons.Default.Settings }
