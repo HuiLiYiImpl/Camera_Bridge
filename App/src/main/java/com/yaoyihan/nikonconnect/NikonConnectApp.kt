@@ -1310,11 +1310,7 @@ private fun ZoomableImage(bitmap: Bitmap, rotation: Int) {
 @Composable
 private fun PhotoCard(asset: PhotoAsset, bitmap: Bitmap?, load: () -> Unit, selected: Boolean, click: () -> Unit) {
     LaunchedEffect(asset.handle) { load() }
-    val ratio = when {
-        bitmap == null || bitmap.width > bitmap.height -> 16f / 8f
-        bitmap.width < bitmap.height -> 8f / 16f
-        else -> 1f
-    }
+    val ratio = when (asset.handle.toInt().and(3)) { 0 -> .72f; 1 -> 1.16f; 2 -> .86f; else -> .98f }
     Card(Modifier.fillMaxWidth().clickable { click() }, shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = if (selected) androidx.compose.foundation.BorderStroke(2.dp, BridgeEmber) else null) {
         Box(Modifier.aspectRatio(ratio)) {
             if (bitmap != null) Image(bitmap.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Image, null, tint = BridgeEmber, modifier = Modifier.size(32.dp)) }

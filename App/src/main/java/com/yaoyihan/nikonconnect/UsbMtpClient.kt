@@ -72,6 +72,12 @@ class UsbMtpClient(
             val buffer = ByteArray(size)
             val read = mtp.getPartialObject64(asset.handle.toInt(), 0L, size.toLong(), buffer).toInt()
             buffer.copyOf(read.coerceIn(0, size)).takeIf { it.isNotEmpty() }
+        }.getOrNull() ?: runCatching {
+            // ponytail: Nikon Zf over MTP rejects getPartialObject64; fall back to getPartialObject (32-bit)
+            val size = minOf(asset.size.takeIf { it > 0 } ?: IMAGE_HEADER_SIZE.toLong(), IMAGE_HEADER_SIZE.toLong()).toInt()
+            val buffer = ByteArray(size)
+            val read = mtp.getPartialObject(asset.handle.toInt(), 0L, size.toLong(), buffer).toInt()
+            buffer.copyOf(read.coerceIn(0, size)).takeIf { it.isNotEmpty() }
         }.getOrNull()
     }
 
@@ -127,5 +133,5 @@ class UsbMtpClient(
                 if (info != null && info.getFormat() != MtpConstants.FORMAT_ASSOCIATION) add(handle)
             }
         }
-    }.distinct()
+    }.distinct().asReversed()
 }
