@@ -17,14 +17,16 @@ class PtpIpClient(
     private val host: String,
     private val port: Int,
     private val socketFactory: SocketFactory = SocketFactory.getDefault(),
-) : AutoCloseable {
+) : CameraClient {
     private lateinit var command: Channel
     private lateinit var event: Channel
     private var transaction = 1u
     private var objectHandles: List<UInt>? = null
-    var cameraName: String = "Nikon 相机"; private set
+    override var cameraName: String = "Nikon 相机"; private set
+    override var cameraDetails: CameraDetails = CameraDetails(manufacturer = "Nikon"); private set
+    override val transport = ConnectionTransport.WIFI
 
-    fun connect() {
+    override fun connect() {
         command = Channel(host, port, socketFactory).also { it.open() }
         // Nikon's Android client identifies its PTP/IP session with this stable value.
         command.send(packet(INIT_COMMAND_REQUEST, NIKON_ANDROID_GUID + utf16z("Android Device") + le32(PROTOCOL_VERSION)))
@@ -33,20 +35,22 @@ class PtpIpClient(
         val ackReader = Reader(ack.payload)
         val connectionNumber = ackReader.u32()
         ackReader.bytes(16)
-        cameraName = ackReader.utf16z().ifBlank { "Nikon 相机" }
+        val connectionName = ackReader.utf16z().ifBlank { "Nikon 相机" }
         val version = ackReader.u32()
         require(version shr 16 == 1u) { "不支持的 PTP/IP 协议版本" }
 
         event = Channel(host, port, socketFactory).also { it.open() }
         event.send(packet(INIT_EVENT_REQUEST, le32(connectionNumber)))
         require(event.read().type == INIT_EVENT_ACK) { "相机拒绝了事件通道连接" }
-        val device = requestData(GET_DEVICE_INFO, 0u)
-        cameraName = parseDeviceName(device).ifBlank { cameraName }
+        val device = parseDeviceInfo(requestData(GET_DEVICE_INFO, 0u))
+        cameraDetails = device.details
+        cameraName = cameraDisplayName(cameraDetails, connectionName)
         requestResponse(OPEN_SESSION, 0u, 1u)
         transaction = 1u
+        cameraDetails = readLiveCameraDetails(cameraDetails, device.supportedProperties)
     }
 
-    fun assets(offset: Int = 0, limit: Int = 250): List<PhotoAsset> {
+    override fun assets(offset: Int, limit: Int): List<PhotoAsset> {
         // Zf rejects GetStorageIDs over its SnapBridge PTP session; Nikon's client
         // queries all objects directly with the PTP “all storages” sentinel instead.
         val handles = objectHandles ?: Reader(requestData(GET_OBJECT_HANDLES, next(), UInt.MAX_VALUE, 0u, 0u)).u32Array().asReversed().also { objectHandles = it }
@@ -54,16 +58,21 @@ class PtpIpClient(
         return page.mapNotNull { handle -> runCatching { parseObject(handle, requestData(GET_OBJECT_INFO, next(), handle)) }.getOrNull() }
     }
 
-    fun hasMoreAssets(offset: Int): Boolean = offset < (objectHandles?.size ?: Int.MAX_VALUE)
-    fun refreshAssets() { objectHandles = null }
+    override fun hasMoreAssets(offset: Int): Boolean = offset < (objectHandles?.size ?: Int.MAX_VALUE)
+    override fun refreshAssets() { objectHandles = null }
 
-    fun checkConnection(): Boolean {
+    override fun checkConnection(): Boolean {
         requestData(GET_DEVICE_INFO, next())
         return true
     }
 
-    fun thumbnail(asset: PhotoAsset): ByteArray? = runCatching { requestData(GET_THUMB, next(), asset.handle) }.getOrNull()
-    fun download(asset: PhotoAsset, progress: (Long, Long) -> Unit): ByteArray {
+    override fun thumbnail(asset: PhotoAsset): ByteArray? = runCatching { requestData(GET_THUMB, next(), asset.handle) }.getOrNull()
+    override fun imageHeader(asset: PhotoAsset): ByteArray? = runCatching {
+        val length = minOf(asset.size.takeIf { it > 0 } ?: IMAGE_HEADER_SIZE.toLong(), IMAGE_HEADER_SIZE.toLong()).toUInt()
+        requestData(GET_PARTIAL_OBJECT, next(), asset.handle, 0u, length)
+    }.getOrNull()
+
+    override fun download(asset: PhotoAsset, progress: (Long, Long) -> Unit): ByteArray {
         val output = java.io.ByteArrayOutputStream(asset.size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
         downloadTo(asset, output, progress)
         return output.toByteArray()
@@ -74,7 +83,7 @@ class PtpIpClient(
      * 小文件（≤ [FULL_OBJECT_THRESHOLD]）优先整文件下载，失败回退到分块；
      * 大文件用 [AdaptiveChunkController] 自适应调整 chunk 大小（1MB~8MB）。
      */
-    fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit): Long {
+    override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit): Long {
         // 小文件：尝试一次性 GET_OBJECT 整文件下载，省去分块往返
         if (asset.size in 1..FULL_OBJECT_THRESHOLD) {
             runCatching { requestToStream(GET_OBJECT, next(), asset.handle, output, progress, asset.size, 0L) }
@@ -128,10 +137,69 @@ class PtpIpClient(
         return PhotoAsset(handle, name, size, format, date)
     }
 
-    private fun parseDeviceName(data: ByteArray): String = runCatching {
-        val r = Reader(data); r.u16(); r.u32(); r.u16(); r.ptpString(); r.u16Array(); r.u16Array(); r.u16Array(); r.u16Array(); r.u16Array(); r.u16Array()
-        val manufacturer = r.ptpString(); val model = r.ptpString(); "$manufacturer $model".trim()
-    }.getOrDefault("")
+    private fun parseDeviceInfo(data: ByteArray): ParsedDeviceInfo {
+        val r = Reader(data)
+        r.u16(); r.u32(); r.u16(); r.ptpString(); r.u16()
+        r.u16Array()
+        r.u16Array()
+        val supportedProperties = r.u16Array().toSet()
+        r.u16Array()
+        r.u16Array()
+        return ParsedDeviceInfo(
+            CameraDetails(
+                manufacturer = r.ptpString().ifBlank { null },
+                model = r.ptpString().ifBlank { null },
+                deviceVersion = r.ptpString().ifBlank { null },
+                serialNumber = r.ptpString().ifBlank { null },
+            ),
+            supportedProperties,
+        )
+    }
+
+    private fun readLiveCameraDetails(details: CameraDetails, supportedProperties: Set<Int>): CameraDetails {
+        fun property(code: Int): Long? {
+            if (code !in supportedProperties) return null
+            return runCatching {
+                val bytes = requestData(GET_DEVICE_PROP_VALUE, next(), code.toUInt())
+                val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+                when (bytes.size) {
+                    1 -> bytes[0].toLong() and 0xff
+                    2 -> buffer.short.toLong() and 0xffff
+                    4 -> buffer.int.toLong() and 0xffffffffL
+                    8 -> buffer.long
+                    else -> null
+                }
+            }.getOrNull()
+        }
+
+        val minFocal = property(NIKON_FOCAL_LENGTH_MIN)
+        val maxFocal = property(NIKON_FOCAL_LENGTH_MAX)
+        val minAperture = property(NIKON_MAX_APERTURE_MIN)
+        val maxAperture = property(NIKON_MAX_APERTURE_MAX)
+        val focalText = when {
+            minFocal == null && maxFocal == null -> null
+            minFocal == maxFocal || maxFocal == null -> "${formatHundredths(minFocal!!)}mm"
+            minFocal == null -> "${formatHundredths(maxFocal)}mm"
+            else -> "${formatHundredths(minFocal)}–${formatHundredths(maxFocal)}mm"
+        }
+        val apertureText = when {
+            minAperture == null && maxAperture == null -> null
+            minAperture == maxAperture || maxAperture == null -> "f/${formatHundredths(minAperture!!)}"
+            minAperture == null -> "f/${formatHundredths(maxAperture)}"
+            else -> "f/${formatHundredths(minAperture)}–${formatHundredths(maxAperture)}"
+        }
+        return details.copy(
+            batteryPercent = property(BATTERY_LEVEL)?.toInt()?.takeIf { it in 0..100 },
+            lensSpec = listOfNotNull(focalText, apertureText).joinToString(" · ").ifBlank { null },
+        )
+    }
+
+    private fun formatHundredths(value: Long): String {
+        val scaled = value / 100.0
+        return if (scaled % 1.0 == 0.0) scaled.toInt().toString() else "%.1f".format(Locale.US, scaled)
+    }
+
+    private data class ParsedDeviceInfo(val details: CameraDetails, val supportedProperties: Set<Int>)
 
     private fun requestResponse(operation: Int, id: UInt, vararg parameters: UInt) {
         command.send(operationPacket(operation, id, parameters)); val response = command.read()
@@ -241,8 +309,13 @@ class PtpIpClient(
         private const val PROTOCOL_VERSION = 0x00010000u
         private const val INIT_COMMAND_REQUEST = 1; private const val INIT_COMMAND_ACK = 2; private const val INIT_EVENT_REQUEST = 3; private const val INIT_EVENT_ACK = 4
         private const val OPERATION_REQUEST = 6; private const val OPERATION_RESPONSE = 7; private const val START_DATA = 9; private const val DATA = 10; private const val END_DATA = 12
-        private const val GET_DEVICE_INFO = 0x1001; private const val OPEN_SESSION = 0x1002; private const val CLOSE_SESSION = 0x1003; private const val GET_STORAGE_IDS = 0x1004; private const val GET_OBJECT_HANDLES = 0x1007; private const val GET_OBJECT_INFO = 0x1008; private const val GET_OBJECT = 0x1009; private const val GET_THUMB = 0x100A; private const val GET_PARTIAL_OBJECT = 0x101B
+        private const val GET_DEVICE_INFO = 0x1001; private const val OPEN_SESSION = 0x1002; private const val CLOSE_SESSION = 0x1003; private const val GET_STORAGE_IDS = 0x1004; private const val GET_OBJECT_HANDLES = 0x1007; private const val GET_OBJECT_INFO = 0x1008; private const val GET_OBJECT = 0x1009; private const val GET_THUMB = 0x100A; private const val GET_DEVICE_PROP_VALUE = 0x1015; private const val GET_PARTIAL_OBJECT = 0x101B
         private const val RESPONSE_OK = 0x2001
+        private const val BATTERY_LEVEL = 0x5001
+        private const val NIKON_FOCAL_LENGTH_MIN = 0xD0E3
+        private const val NIKON_FOCAL_LENGTH_MAX = 0xD0E4
+        private const val NIKON_MAX_APERTURE_MIN = 0xD0E5
+        private const val NIKON_MAX_APERTURE_MAX = 0xD0E6
 
         // —— 动态 chunk 拥塞控制参数 ——
         private const val MIN_CHUNK_SIZE = 1_048_576          // 1 MiB 下限

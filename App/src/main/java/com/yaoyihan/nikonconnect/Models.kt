@@ -12,7 +12,16 @@ enum class CameraBrand(val title: String, val subtitle: String, val available: B
     NIKON("尼康", "PTP/IP", true),
     CANON("佳能", "即将支持", false),
     SONY("索尼", "即将支持", false),
+    PANASONIC("松下", "即将支持", false),
     FUJIFILM("富士", "即将支持", false),
+    OTHER("其他品牌", "即将支持", false),
+}
+
+enum class AppColorTheme(val title: String, val subtitle: String) {
+    DARKROOM_ORANGE("暗房橙", "暖调胶片"),
+    NIKON_YELLOW("尼康黄", "经典醒目"),
+    PROFESSIONAL_GRAY("专业灰", "中性克制"),
+    DEEP_BLUE("深海蓝", "现代科技"),
 }
 
 data class CameraConfig(
@@ -21,9 +30,24 @@ data class CameraConfig(
     val autoExport: Boolean = true,
     val lastSsid: String = "",
     val brand: CameraBrand = CameraBrand.NIKON,
+    val lastCameraName: String = "",
+    val lastTransport: ConnectionTransport = ConnectionTransport.WIFI,
+    val wifiAutoRestore: Boolean = true,
+    val usbAutoRead: Boolean = true,
+    val keepWifiAlive: Boolean = true,
+    val jpegQuality: Int = 95,
+    val fileNamingRule: String = "原文件名_编辑类型",
+    val thumbnailCacheEnabled: Boolean = true,
+    val colorTheme: AppColorTheme = AppColorTheme.DARKROOM_ORANGE,
 )
 
-data class CameraSession(val name: String, val host: String, val port: Int)
+data class CameraSession(
+    val name: String,
+    val host: String,
+    val port: Int,
+    val transport: ConnectionTransport = ConnectionTransport.WIFI,
+    val details: CameraDetails = CameraDetails(),
+)
 
 data class PhotoAsset(
     val handle: UInt,
@@ -60,13 +84,31 @@ class AppStore(context: Context) {
         prefs.getBoolean("autoExport", true),
         prefs.getString("last_ssid", "") ?: "",
         prefs.getString("camera_brand", CameraBrand.NIKON.name)?.let { runCatching { CameraBrand.valueOf(it) }.getOrDefault(CameraBrand.NIKON) } ?: CameraBrand.NIKON,
+        prefs.getString("last_camera_name", "") ?: "",
+        prefs.getString("last_transport", ConnectionTransport.WIFI.name)?.let { runCatching { ConnectionTransport.valueOf(it) }.getOrDefault(ConnectionTransport.WIFI) } ?: ConnectionTransport.WIFI,
+        prefs.getBoolean("wifi_auto_restore", true),
+        prefs.getBoolean("usb_auto_read", true),
+        prefs.getBoolean("keep_wifi_alive", true),
+        prefs.getInt("jpeg_quality", 95),
+        prefs.getString("file_naming_rule", "原文件名_编辑类型") ?: "原文件名_编辑类型",
+        prefs.getBoolean("thumbnail_cache_enabled", true),
+        prefs.getString("color_theme", AppColorTheme.DARKROOM_ORANGE.name)?.let { runCatching { AppColorTheme.valueOf(it) }.getOrDefault(AppColorTheme.DARKROOM_ORANGE) } ?: AppColorTheme.DARKROOM_ORANGE,
     )
 
     fun save(config: CameraConfig) = prefs.edit()
         .putString("host", config.host).putInt("port", config.port)
         .putBoolean("autoExport", config.autoExport)
         .putString("last_ssid", config.lastSsid)
-        .putString("camera_brand", config.brand.name).apply()
+        .putString("camera_brand", config.brand.name)
+        .putString("last_camera_name", config.lastCameraName)
+        .putString("last_transport", config.lastTransport.name)
+        .putBoolean("wifi_auto_restore", config.wifiAutoRestore)
+        .putBoolean("usb_auto_read", config.usbAutoRead)
+        .putBoolean("keep_wifi_alive", config.keepWifiAlive)
+        .putInt("jpeg_quality", config.jpegQuality)
+        .putString("file_naming_rule", config.fileNamingRule)
+        .putBoolean("thumbnail_cache_enabled", config.thumbnailCacheEnabled)
+        .putString("color_theme", config.colorTheme.name).apply()
 
     fun downloads(): List<DownloadRecord> = runCatching {
         val array = JSONArray(prefs.getString("downloads", "[]"))
@@ -108,9 +150,9 @@ class AppStore(context: Context) {
     fun saveRecentLuts(ids: List<String>) = prefs.edit().putString("recent_luts", ids.joinToString(",")).apply()
 
     fun watermarks(): List<WatermarkPreset> = runCatching {
-        if (!prefs.contains("watermarks")) return defaultWatermarkPresets()
+        if (!prefs.contains("watermarks")) return@runCatching defaultWatermarkPresets()
         val array = JSONArray(prefs.getString("watermarks", "[]"))
-        (0 until array.length()).map { i ->
+        val loaded = (0 until array.length()).map { i ->
             array.getJSONObject(i).let { json ->
                 WatermarkPreset(
                     id = json.getString("id"),
@@ -123,10 +165,12 @@ class AppStore(context: Context) {
                     backgroundAlpha = json.optInt("backgroundAlpha", 68),
                     margin = json.optInt("margin", 28),
                     showBorder = json.optBoolean("showBorder", false),
+                    frameEnabled = json.optBoolean("frameEnabled", false),
+                    frameThickness = json.optInt("frameThickness", 24),
                     customText = json.optString("customText"),
                     copyrightText = json.optString("copyrightText"),
-                    logoEnabled = json.optBoolean("logoEnabled", true),
-                    useBrandLogo = json.optBoolean("useBrandLogo", true),
+                    logoEnabled = json.optBoolean("logoEnabled", false),
+                    useBrandLogo = json.optBoolean("useBrandLogo", false),
                     logoUri = json.optString("logoUri").takeIf { it.isNotBlank() },
                     logoScale = json.optInt("logoScale", 100),
                     logoAlpha = json.optInt("logoAlpha", 100),
@@ -134,6 +178,10 @@ class AppStore(context: Context) {
                     quality = json.optInt("quality", 95),
                 )
             }
+        }
+        if (prefs.getInt("watermark_template_version", 0) >= 3) loaded else {
+            val builtInIds = setOf("minimal", "left", "right", "white", "custom")
+            (defaultWatermarkPresets() + loaded.filterNot { it.id in builtInIds }).also(::saveWatermarks)
         }
     }.getOrDefault(defaultWatermarkPresets())
 
@@ -143,21 +191,56 @@ class AppStore(context: Context) {
             array.put(JSONObject().apply {
                 put("id", entry.id); put("name", entry.name); put("layout", entry.layout.name); put("fields", entry.fields.joinToString(",") { it.name })
                 put("fontSize", entry.fontSize); put("textColor", entry.textColor); put("backgroundColor", entry.backgroundColor); put("backgroundAlpha", entry.backgroundAlpha)
-                put("margin", entry.margin); put("showBorder", entry.showBorder); put("customText", entry.customText); put("copyrightText", entry.copyrightText)
+                put("margin", entry.margin); put("showBorder", entry.showBorder); put("frameEnabled", entry.frameEnabled); put("frameThickness", entry.frameThickness); put("customText", entry.customText); put("copyrightText", entry.copyrightText)
                 put("logoEnabled", entry.logoEnabled); put("useBrandLogo", entry.useBrandLogo); put("logoUri", entry.logoUri ?: ""); put("logoScale", entry.logoScale); put("logoAlpha", entry.logoAlpha); put("logoPosition", entry.logoPosition.name); put("quality", entry.quality)
             })
         }
-        prefs.edit().putString("watermarks", array.toString()).apply()
+        prefs.edit().putString("watermarks", array.toString()).putInt("watermark_template_version", 3).apply()
     }
 
 }
 
 private fun defaultWatermarkPresets() = listOf(
-    WatermarkPreset("minimal", "极简底部信息", WatermarkLayout.MINIMAL),
-    WatermarkPreset("left", "左下角摄影参数", WatermarkLayout.LEFT_PARAMS, setOf(WatermarkField.CAMERA_MODEL, WatermarkField.LENS_MODEL, WatermarkField.FOCAL_LENGTH, WatermarkField.APERTURE, WatermarkField.SHUTTER, WatermarkField.ISO)),
-    WatermarkPreset("right", "右下角摄影参数", WatermarkLayout.RIGHT_PARAMS),
-    WatermarkPreset("white", "白色底边框信息", WatermarkLayout.WHITE_BORDER, showBorder = true, backgroundColor = android.graphics.Color.WHITE, textColor = android.graphics.Color.BLACK, backgroundAlpha = 230),
-    WatermarkPreset("custom", "仅自定义文字", WatermarkLayout.CUSTOM, setOf(WatermarkField.CUSTOM_TEXT), logoEnabled = false, useBrandLogo = false),
+    WatermarkPreset(
+        id = "minimal",
+        name = "氛围模糊背景",
+        layout = WatermarkLayout.MINIMAL,
+        fields = setOf(WatermarkField.CAMERA_BRAND, WatermarkField.CAMERA_MODEL, WatermarkField.FOCAL_LENGTH, WatermarkField.APERTURE, WatermarkField.SHUTTER, WatermarkField.ISO),
+        logoEnabled = false,
+        useBrandLogo = false,
+    ),
+    WatermarkPreset(
+        id = "right",
+        name = "底部信息条（Logo 右）",
+        layout = WatermarkLayout.RIGHT_PARAMS,
+        fields = setOf(WatermarkField.CAMERA_BRAND, WatermarkField.CAMERA_MODEL, WatermarkField.LENS_MODEL, WatermarkField.FOCAL_LENGTH, WatermarkField.APERTURE, WatermarkField.SHUTTER, WatermarkField.ISO, WatermarkField.CAPTURE_DATE),
+        logoPosition = WatermarkLogoPosition.TOP_RIGHT,
+        logoEnabled = true,
+        useBrandLogo = true,
+        textColor = android.graphics.Color.BLACK,
+    ),
+    WatermarkPreset(
+        id = "left",
+        name = "底部信息条（Logo 左）",
+        layout = WatermarkLayout.LEFT_PARAMS,
+        fields = setOf(WatermarkField.CAMERA_BRAND, WatermarkField.CAMERA_MODEL, WatermarkField.LENS_MODEL, WatermarkField.FOCAL_LENGTH, WatermarkField.APERTURE, WatermarkField.SHUTTER, WatermarkField.ISO, WatermarkField.CAPTURE_DATE),
+        logoPosition = WatermarkLogoPosition.TOP_LEFT,
+        logoEnabled = true,
+        useBrandLogo = true,
+        frameEnabled = true,
+        frameThickness = 24,
+        textColor = android.graphics.Color.BLACK,
+    ),
+    WatermarkPreset(
+        id = "white",
+        name = "正方形白边框",
+        layout = WatermarkLayout.WHITE_BORDER,
+        fields = emptySet(),
+        logoEnabled = false,
+        useBrandLogo = false,
+        backgroundColor = android.graphics.Color.WHITE,
+        textColor = android.graphics.Color.BLACK,
+    ),
 )
 
 fun Long.prettySize(): String = when {

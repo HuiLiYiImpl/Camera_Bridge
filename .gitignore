@@ -8,3 +8,6 @@ local.properties
 
 # Local protocol reverse-engineering artifacts
 analysis/
+
+# ZCode AI agent artifacts
+.zcode/

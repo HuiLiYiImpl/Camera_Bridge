@@ -6,6 +6,8 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.ExifInterface
@@ -16,13 +18,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 enum class WatermarkLayout(val title: String) {
-    MINIMAL("极简底部信息条"),
-    LEFT_PARAMS("左下角摄影参数"),
-    RIGHT_PARAMS("右下角摄影参数"),
-    WHITE_BORDER("白色底边框信息条"),
+    MINIMAL("氛围模糊背景"),
+    LEFT_PARAMS("底部信息条（Logo 左）"),
+    RIGHT_PARAMS("底部信息条（Logo 右）"),
+    WHITE_BORDER("正方形白边框"),
     CUSTOM("仅自定义文字"),
 }
 
@@ -41,9 +44,11 @@ enum class WatermarkField(val title: String) {
 }
 
 enum class WatermarkLogoPosition(val title: String) {
-    TOP_LEFT("左上"),
-    TOP_RIGHT("右上"),
+    TOP_LEFT("左侧"),
+    TOP_RIGHT("右侧"),
 }
+
+fun WatermarkLayout.uiTitle(): String = title
 
 data class WatermarkPreset(
     val id: String,
@@ -53,13 +58,15 @@ data class WatermarkPreset(
     val fontSize: Int = 34,
     val textColor: Int = Color.WHITE,
     val backgroundColor: Int = Color.BLACK,
-    val backgroundAlpha: Int = 68,
+    val backgroundAlpha: Int = 82,
     val margin: Int = 28,
     val showBorder: Boolean = false,
+    val frameEnabled: Boolean = false,
+    val frameThickness: Int = 24,
     val customText: String = "",
     val copyrightText: String = "",
-    val logoEnabled: Boolean = true,
-    val useBrandLogo: Boolean = true,
+    val logoEnabled: Boolean = false,
+    val useBrandLogo: Boolean = false,
     val logoUri: String? = null,
     val logoScale: Int = 100,
     val logoAlpha: Int = 100,
@@ -77,6 +84,7 @@ data class PhotoMetadata(
     val focalLength: String? = null,
     val equivalentFocalLength: String? = null,
     val capturedAt: Date? = null,
+    val orientation: Int? = null,
     val customText: String? = null,
     val copyrightText: String? = null,
 )
@@ -95,19 +103,22 @@ object ExifMetadataReader {
     private fun ExifInterface.toMetadata(fallback: PhotoMetadata): PhotoMetadata {
         val make = getAttribute(ExifInterface.TAG_MAKE).clean()
         val model = getAttribute(ExifInterface.TAG_MODEL).clean()
-        // These tags are not exposed as constants by the platform ExifInterface
-        // on every API level supported by the app, so keep their standard names.
         val lens = getAttribute("LensModel").clean()
         val iso = getAttributeInt("PhotographicSensitivity", 0).takeIf { it > 0 }
             ?: getAttributeInt("ISOSpeedRatings", 0).takeIf { it > 0 }
         val exposure = getAttributeDouble(ExifInterface.TAG_EXPOSURE_TIME, 0.0).takeIf { it > 0 }?.let { value ->
             if (value < 1.0) "1/${(1.0 / value).roundToInt()}s" else "${"%.2f".format(Locale.US, value)}s"
         }
-        val fNumber = getAttributeDouble(ExifInterface.TAG_F_NUMBER, 0.0).takeIf { it > 0 }?.let { "f/${"%.1f".format(Locale.US, it)}" }
-        val focal = getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0).takeIf { it > 0 }?.let { "${it.roundToInt()}mm" }
-        val equivalent = getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, 0).takeIf { it > 0 }?.let { "${it}mm" }
+        val fNumber = getAttributeDouble(ExifInterface.TAG_F_NUMBER, 0.0).takeIf { it > 0 }
+            ?.let { "f/${"%.1f".format(Locale.US, it)}" }
+        val focal = getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0).takeIf { it > 0 }
+            ?.let { "${it.roundToInt()}mm" }
+        val equivalent = getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, 0).takeIf { it > 0 }
+            ?.let { "${it}mm" }
         val date = getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL)?.parseExifDate()
             ?: getAttribute(ExifInterface.TAG_DATETIME)?.parseExifDate()
+        val orientation = getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED)
+            .takeIf { it != ExifInterface.ORIENTATION_UNDEFINED }
         return PhotoMetadata(
             cameraBrand = make ?: fallback.cameraBrand,
             cameraModel = model ?: fallback.cameraModel,
@@ -118,118 +129,370 @@ object ExifMetadataReader {
             focalLength = focal ?: fallback.focalLength,
             equivalentFocalLength = equivalent ?: fallback.equivalentFocalLength,
             capturedAt = date ?: fallback.capturedAt,
+            orientation = orientation ?: fallback.orientation,
             customText = fallback.customText,
             copyrightText = getAttribute(ExifInterface.TAG_COPYRIGHT).clean() ?: fallback.copyrightText,
         )
     }
 
-    private fun String?.clean(): String? = this?.trim()?.takeIf { it.isNotBlank() && !it.equals("unknown", true) && it != "0mm" }
-    private fun String.parseExifDate(): Date? = runCatching { SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).parse(this) }.getOrNull()
+    private fun String?.clean(): String? = this?.trim()?.takeIf {
+        it.isNotBlank() && !it.equals("unknown", true) && it != "0mm" && it != "0"
+    }
+
+    private fun String.parseExifDate(): Date? = runCatching {
+        SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).parse(this)
+    }.getOrNull()
 }
 
 object WatermarkRenderer {
-    fun render(source: Bitmap, metadata: PhotoMetadata, preset: WatermarkPreset, context: Context? = null): Bitmap {
-        val output = source.copy(Bitmap.Config.ARGB_8888, true)
+    private const val MAX_ATMOSPHERE_EDGE = 6000
+    private val imagePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+
+    fun render(source: Bitmap, metadata: PhotoMetadata, preset: WatermarkPreset, context: Context? = null): Bitmap = when (preset.layout) {
+        WatermarkLayout.MINIMAL -> renderAtmosphere(source, metadata, preset, context)
+        WatermarkLayout.RIGHT_PARAMS -> renderInfoStrip(source, metadata, preset, context, logoOnRight = true)
+        WatermarkLayout.LEFT_PARAMS -> renderInfoStrip(source, metadata, preset, context, logoOnRight = false)
+        WatermarkLayout.WHITE_BORDER -> renderSquare(source)
+        WatermarkLayout.CUSTOM -> renderCustom(source, metadata, preset, context)
+    }
+
+    private fun renderAtmosphere(source: Bitmap, metadata: PhotoMetadata, preset: WatermarkPreset, context: Context?): Bitmap {
+        val rawWidth = source.width
+        val rawHeight = max((rawWidth * 1.25f).roundToInt(), source.height + (rawWidth * .28f).roundToInt())
+        val outputScale = min(1f, MAX_ATMOSPHERE_EDGE.toFloat() / max(rawWidth, rawHeight))
+        val width = max(1, (rawWidth * outputScale).roundToInt())
+        val height = max(1, (rawHeight * outputScale).roundToInt())
+        val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(output)
-        val scale = output.width / 1080f
-        val textSize = max(18f, preset.fontSize * scale)
-        val lines = metadata.lines(preset)
-        val hasBrandLogo = context != null && preset.logoEnabled && preset.useBrandLogo && brandLogoResource(context, metadata.cameraBrand) != 0
-        if (lines.isEmpty() && preset.logoUri == null && !hasBrandLogo) return output
-        val bodyPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = preset.textColor; this.textSize = textSize; typeface = watermarkTypeface(context, false) }
-        val titlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = preset.textColor; this.textSize = textSize; typeface = watermarkTypeface(context, true) }
-        val lineHeight = textSize * 1.28f
-        val padding = preset.margin * scale
-        val blockHeight = max(lineHeight + padding * 2, lines.size * lineHeight + padding * 2)
-        val blockWidth = output.width * if (preset.layout == WatermarkLayout.WHITE_BORDER || preset.layout == WatermarkLayout.MINIMAL) 1f else .62f
-        val top = output.height - blockHeight - padding
-        val left = when (preset.layout) {
-            WatermarkLayout.RIGHT_PARAMS -> output.width - blockWidth - padding
-            else -> padding
+
+        val tinyScale = min(1f, 160f / max(source.width, source.height))
+        val tiny = Bitmap.createScaledBitmap(
+            source,
+            max(1, (source.width * tinyScale).roundToInt()),
+            max(1, (source.height * tinyScale).roundToInt()),
+            true,
+        )
+        canvas.drawBitmap(
+            tiny,
+            centerCropSource(tiny.width, tiny.height, width.toFloat(), height.toFloat(), 1.11f),
+            RectF(0f, 0f, width.toFloat(), height.toFloat()),
+            imagePaint,
+        )
+        if (tiny !== source) tiny.recycle()
+        canvas.drawColor(Color.argb(preset.backgroundAlpha.coerceIn(64, 102), 0, 0, 0))
+
+        val side = width * (.05f + preset.margin.coerceIn(12, 64) / 1080f)
+        val top = height * .035f
+        val imageAreaBottom = height - max(height * .16f, width * .20f)
+        val photoRect = fitCenterRect(
+            source.width,
+            source.height,
+            RectF(side, top, width - side, imageAreaBottom),
+        )
+        val radius = width * .03f
+        val clip = Path().apply { addRoundRect(photoRect, radius, radius, Path.Direction.CW) }
+        canvas.save()
+        canvas.clipPath(clip)
+        canvas.drawBitmap(source, null, photoRect, imagePaint)
+        canvas.restore()
+
+        val camera = metadata.cameraLabel(preset)
+        val parameters = metadata.shootingLabel(preset, " ")
+        val caption = metadata.captionLabel(preset)
+        val titlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = preset.textColor
+            textAlign = Paint.Align.CENTER
+            textSize = max(24f, width * .036f * preset.fontSize / 34f)
+            typeface = watermarkTypeface(context, true)
         }
-        val right = when (preset.layout) {
-            WatermarkLayout.RIGHT_PARAMS -> output.width - padding
-            else -> minOf(output.width - padding, left + blockWidth)
+        val bodyPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = withAlpha(preset.textColor, 220)
+            textAlign = Paint.Align.CENTER
+            textSize = max(18f, width * .025f * preset.fontSize / 34f)
+            typeface = watermarkTypeface(context, false)
         }
-        val background = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(preset.backgroundAlpha.coerceIn(0, 255), Color.red(preset.backgroundColor), Color.green(preset.backgroundColor), Color.blue(preset.backgroundColor))
-            style = Paint.Style.FILL
+        val textTop = photoRect.bottom + max(height * .025f, width * .025f)
+        val center = width / 2f
+        var baseline = textTop + titlePaint.textSize
+        if (camera != null) {
+            canvas.drawText(ellipsize(camera, titlePaint, width * .84f), center, baseline, titlePaint)
+            baseline += bodyPaint.textSize * 1.65f
         }
-        val rect = RectF(left, top, right, output.height.toFloat() - padding / 2)
-        if (preset.layout != WatermarkLayout.CUSTOM) canvas.drawRoundRect(rect, 12f * scale, 12f * scale, background)
-        if (preset.showBorder || preset.layout == WatermarkLayout.WHITE_BORDER) {
-            val border = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = if (preset.layout == WatermarkLayout.WHITE_BORDER) Color.WHITE else preset.textColor; style = Paint.Style.STROKE; strokeWidth = max(1f, 2f * scale) }
-            canvas.drawRoundRect(rect, 12f * scale, 12f * scale, border)
+        if (parameters != null) {
+            canvas.drawText(ellipsize(parameters, bodyPaint, width * .86f), center, baseline, bodyPaint)
+            baseline += bodyPaint.textSize * 1.45f
         }
-        var baseline = top + padding + textSize
-        lines.forEachIndexed { index, line ->
-            val textPaint = if (index == 0) titlePaint else bodyPaint
-            textPaint.textAlign = if (preset.layout == WatermarkLayout.RIGHT_PARAMS) Paint.Align.RIGHT else Paint.Align.LEFT
-            val x = if (preset.layout == WatermarkLayout.RIGHT_PARAMS) right - padding else left + padding
-            canvas.drawText(line, x, baseline, textPaint)
-            baseline += lineHeight
+        if (caption != null && baseline < height - bodyPaint.textSize * .3f) {
+            canvas.drawText(ellipsize(caption, bodyPaint, width * .86f), center, baseline, bodyPaint)
         }
-        if (context != null && preset.logoEnabled) drawLogo(canvas, context, preset, metadata.cameraBrand, left, top, right, scale)
         return output
     }
 
-    private fun drawLogo(canvas: Canvas, context: Context, preset: WatermarkPreset, cameraBrand: String?, left: Float, top: Float, right: Float, scale: Float) {
-        val logo = runCatching {
-            if (preset.logoUri != null) context.contentResolver.openInputStream(Uri.parse(preset.logoUri))?.use(BitmapFactory::decodeStream)
-            else if (preset.useBrandLogo) brandLogoResource(context, cameraBrand).takeIf { it != 0 }?.let { BitmapFactory.decodeResource(context.resources, it) }
-            else null
-        }.getOrNull() ?: return
-        val target = (64f * scale * preset.logoScale / 100f).roundToInt().coerceAtLeast(16)
-        val ratio = logo.width.toFloat() / logo.height.coerceAtLeast(1)
-        val width = (target * ratio).roundToInt().coerceAtLeast(1)
-        val rect = when (preset.logoPosition) {
-            WatermarkLogoPosition.TOP_LEFT -> RectF(left + 18f * scale, top + 14f * scale, left + width + 18f * scale, top + target + 14f * scale)
-            WatermarkLogoPosition.TOP_RIGHT -> RectF(right - width - 18f * scale, top + 14f * scale, right - 18f * scale, top + target + 14f * scale)
+    private fun renderInfoStrip(
+        source: Bitmap,
+        metadata: PhotoMetadata,
+        preset: WatermarkPreset,
+        context: Context?,
+        logoOnRight: Boolean,
+    ): Bitmap {
+        val scale = source.width / 1080f
+        val frame = if (preset.frameEnabled) max(1, (preset.frameThickness * scale).roundToInt()) else 0
+        val stripHeight = max(48, (source.width * .13f).roundToInt())
+        val width = source.width + frame * 2
+        val height = source.height + stripHeight + frame * 2
+        val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        canvas.drawColor(Color.WHITE)
+        canvas.drawBitmap(source, frame.toFloat(), frame.toFloat(), imagePaint)
+
+        val stripTop = (frame + source.height).toFloat()
+        val imageLeft = frame.toFloat()
+        val imageRight = (frame + source.width).toFloat()
+        val padding = max(source.width * .015f, preset.margin * scale)
+        val contentLeft = imageLeft + padding
+        val contentRight = imageRight - padding
+        val stripBottom = stripTop + stripHeight
+        canvas.drawLine(imageLeft, stripTop, imageRight, stripTop, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(232, 232, 232)
+            strokeWidth = max(1f, scale)
+        })
+
+        val titlePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(24, 24, 24)
+            textSize = max(16f, source.width * .024f * preset.fontSize / 34f)
+            typeface = watermarkTypeface(context, true)
         }
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { alpha = (255 * preset.logoAlpha / 100f).roundToInt() }
-        canvas.drawBitmap(logo, null, rect, paint)
-        logo.recycle()
+        val detailPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(125, 125, 125)
+            textSize = max(13f, source.width * .019f * preset.fontSize / 34f)
+            typeface = watermarkTypeface(context, false)
+        }
+        val parameterPaint = TextPaint(titlePaint).apply { textSize = max(15f, source.width * .0215f * preset.fontSize / 34f) }
+        val paramsWidth = source.width * .32f
+        val paramsLeft = contentRight - paramsWidth
+        val hasBuiltInLogo = context != null && preset.useBrandLogo && brandLogoResource(context, metadata.cameraBrand) != 0
+        val hasLogoSlot = preset.logoEnabled && (!preset.logoUri.isNullOrBlank() || hasBuiltInLogo || (WatermarkField.CAMERA_BRAND in preset.fields && metadata.cameraBrand.cleanDisplay() != null))
+        val logoSlotWidth = if (hasLogoSlot) source.width * .09f else 0f
+        val gap = source.width * .016f
+        val lens = metadata.lensLabel(preset) ?: metadata.cameraLabel(preset) ?: metadata.captionLabel(preset)
+        val camera = metadata.secondaryInfoLabel(preset, lens)
+        val parameters = metadata.shootingLabel(preset, " · ")
+        val date = metadata.dateLabel(preset)
+
+        if (logoOnRight) {
+            val logoRight = paramsLeft - gap
+            val logoLeft = logoRight - logoSlotWidth
+            drawTwoLines(canvas, lens, camera, contentLeft, if (hasLogoSlot) logoLeft - gap else paramsLeft - gap, stripTop, stripBottom, titlePaint, detailPaint)
+            if (hasLogoSlot) {
+                drawLogoOrBrand(canvas, context, preset, metadata, RectF(logoLeft, stripTop + stripHeight * .18f, logoRight, stripBottom - stripHeight * .18f), titlePaint)
+                drawDivider(canvas, paramsLeft - gap * .45f, stripTop, stripBottom, scale)
+            }
+        } else {
+            val logoLeft = contentLeft
+            val logoRight = logoLeft + logoSlotWidth
+            if (hasLogoSlot) {
+                drawLogoOrBrand(canvas, context, preset, metadata, RectF(logoLeft, stripTop + stripHeight * .16f, logoRight, stripBottom - stripHeight * .16f), titlePaint)
+                drawDivider(canvas, logoRight + gap * .45f, stripTop, stripBottom, scale)
+            }
+            drawTwoLines(canvas, lens, camera, if (hasLogoSlot) logoRight + gap * 1.4f else contentLeft, paramsLeft - gap, stripTop, stripBottom, titlePaint, detailPaint)
+        }
+        drawTwoLines(canvas, parameters, date, paramsLeft, contentRight, stripTop, stripBottom, parameterPaint, detailPaint)
+        return output
+    }
+
+    private fun renderSquare(source: Bitmap): Bitmap {
+        val side = max(source.width, source.height)
+        val output = Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        canvas.drawColor(Color.WHITE)
+        canvas.drawBitmap(source, ((side - source.width) / 2f), ((side - source.height) / 2f), imagePaint)
+        return output
+    }
+
+    private fun renderCustom(source: Bitmap, metadata: PhotoMetadata, preset: WatermarkPreset, context: Context?): Bitmap {
+        val output = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        canvas.drawBitmap(source, 0f, 0f, imagePaint)
+        val text = metadata.captionLabel(preset) ?: return output
+        val scale = source.width / 1080f
+        val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = preset.textColor
+            textSize = max(18f, preset.fontSize * scale)
+            typeface = watermarkTypeface(context, true)
+        }
+        val padding = max(12f, preset.margin * scale)
+        val fitted = ellipsize(text, paint, source.width - padding * 4)
+        val width = paint.measureText(fitted) + padding * 2
+        val height = paint.textSize + padding * 1.6f
+        val rect = RectF(padding, source.height - height - padding, min(source.width - padding, padding + width), source.height - padding)
+        canvas.drawRoundRect(rect, 12f * scale, 12f * scale, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(preset.backgroundAlpha.coerceIn(0, 255), Color.red(preset.backgroundColor), Color.green(preset.backgroundColor), Color.blue(preset.backgroundColor))
+        })
+        canvas.drawText(fitted, rect.left + padding, rect.bottom - padding * .65f, paint)
+        return output
+    }
+
+    private fun drawLogoOrBrand(
+        canvas: Canvas,
+        context: Context?,
+        preset: WatermarkPreset,
+        metadata: PhotoMetadata,
+        bounds: RectF,
+        textPaint: TextPaint,
+    ) {
+        if (!preset.logoEnabled) return
+        val logo = if (context != null) runCatching {
+            when {
+                !preset.logoUri.isNullOrBlank() -> context.contentResolver.openInputStream(Uri.parse(preset.logoUri))?.use(BitmapFactory::decodeStream)
+                preset.useBrandLogo -> brandLogoResource(context, metadata.cameraBrand).takeIf { it != 0 }?.let { BitmapFactory.decodeResource(context.resources, it) }
+                else -> null
+            }
+        }.getOrNull() else null
+        if (logo != null) {
+            val scaledBounds = RectF(bounds).apply {
+                val factor = (preset.logoScale / 100f).coerceIn(.5f, 1.8f)
+                val cx = centerX()
+                val cy = centerY()
+                val halfWidth = width() * factor / 2f
+                val halfHeight = height() * factor / 2f
+                set(cx - halfWidth, cy - halfHeight, cx + halfWidth, cy + halfHeight)
+            }
+            val destination = fitCenterRect(logo.width, logo.height, scaledBounds)
+            canvas.drawBitmap(logo, null, destination, Paint(imagePaint).apply {
+                alpha = (255 * preset.logoAlpha.coerceIn(10, 100) / 100f).roundToInt()
+            })
+            logo.recycle()
+            return
+        }
+        val brand = metadata.cameraBrand.cleanDisplay()
+            ?.takeIf { WatermarkField.CAMERA_BRAND in preset.fields }
+            ?: return
+        val paint = TextPaint(textPaint).apply {
+            color = Color.rgb(38, 38, 38)
+            textAlign = Paint.Align.CENTER
+            textSize = min(textSize, bounds.height() * .34f)
+        }
+        canvas.drawText(ellipsize(brand, paint, bounds.width()), bounds.centerX(), bounds.centerY() - (paint.ascent() + paint.descent()) / 2f, paint)
+    }
+
+    private fun drawTwoLines(
+        canvas: Canvas,
+        first: String?,
+        second: String?,
+        left: Float,
+        right: Float,
+        top: Float,
+        bottom: Float,
+        firstPaint: TextPaint,
+        secondPaint: TextPaint,
+    ) {
+        if (right <= left || (first == null && second == null)) return
+        val available = right - left
+        val center = (top + bottom) / 2f
+        if (first != null && second != null) {
+            canvas.drawText(ellipsize(first, firstPaint, available), left, center - firstPaint.descent() - firstPaint.textSize * .12f, firstPaint)
+            canvas.drawText(ellipsize(second, secondPaint, available), left, center - secondPaint.ascent() + secondPaint.textSize * .12f, secondPaint)
+        } else {
+            val text = first ?: second ?: return
+            val paint = if (first != null) firstPaint else secondPaint
+            canvas.drawText(ellipsize(text, paint, available), left, center - (paint.ascent() + paint.descent()) / 2f, paint)
+        }
+    }
+
+    private fun drawDivider(canvas: Canvas, x: Float, top: Float, bottom: Float, scale: Float) {
+        canvas.drawLine(x, top + (bottom - top) * .22f, x, bottom - (bottom - top) * .22f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(205, 205, 205)
+            strokeWidth = max(1f, scale)
+        })
+    }
+
+    private fun fitCenterRect(sourceWidth: Int, sourceHeight: Int, bounds: RectF): RectF {
+        val factor = min(bounds.width() / sourceWidth, bounds.height() / sourceHeight)
+        val width = sourceWidth * factor
+        val height = sourceHeight * factor
+        return RectF(
+            bounds.centerX() - width / 2f,
+            bounds.centerY() - height / 2f,
+            bounds.centerX() + width / 2f,
+            bounds.centerY() + height / 2f,
+        )
+    }
+
+    private fun centerCropSource(sourceWidth: Int, sourceHeight: Int, targetWidth: Float, targetHeight: Float, zoom: Float): Rect {
+        val factor = max(targetWidth / sourceWidth, targetHeight / sourceHeight) * zoom
+        val visibleWidth = (targetWidth / factor).coerceAtMost(sourceWidth.toFloat())
+        val visibleHeight = (targetHeight / factor).coerceAtMost(sourceHeight.toFloat())
+        val left = ((sourceWidth - visibleWidth) / 2f).roundToInt().coerceAtLeast(0)
+        val top = ((sourceHeight - visibleHeight) / 2f).roundToInt().coerceAtLeast(0)
+        return Rect(left, top, min(sourceWidth, left + visibleWidth.roundToInt()), min(sourceHeight, top + visibleHeight.roundToInt()))
+    }
+
+    private fun ellipsize(text: String, paint: Paint, maxWidth: Float): String {
+        if (maxWidth <= 0f || paint.measureText(text) <= maxWidth) return text
+        val suffix = "…"
+        val count = paint.breakText(text, true, (maxWidth - paint.measureText(suffix)).coerceAtLeast(0f), null)
+        return text.take(count) + suffix
     }
 
     private fun watermarkTypeface(context: Context?, bold: Boolean): Typeface = context?.let {
-        runCatching { Typeface.createFromAsset(it.assets, "watermark_fonts/${if (bold) "AlibabaPuHuiTi-2-85-Bold.otf" else "AlibabaPuHuiTi-2-45-Light.otf"}") }.getOrNull()
+        runCatching {
+            Typeface.createFromAsset(it.assets, "watermark_fonts/${if (bold) "AlibabaPuHuiTi-2-85-Bold.otf" else "AlibabaPuHuiTi-2-45-Light.otf"}")
+        }.getOrNull()
     } ?: Typeface.create("sans-serif", if (bold) Typeface.BOLD else Typeface.NORMAL)
 
     private fun brandLogoResource(context: Context, make: String?): Int {
-        val key = when (make.orEmpty().lowercase(Locale.ROOT)) {
-            in listOf("nikon", "nikon corporation") -> "wm_nikon"
-            in listOf("canon", "canon inc.") -> "wm_canon"
-            in listOf("sony", "sony corporation") -> "wm_sony"
-            in listOf("fujifilm", "fuji") -> "wm_fujifilm"
-            in listOf("panasonic", "panasonic corporation") -> "wm_panasonic"
-            "leica" -> "wm_leica_logo"
-            "hasselblad" -> "wm_hasselblad"
-            "pentax" -> "wm_pentax"
-            "ricoh" -> "wm_ricoh"
-            "olympus" -> "wm_olympus_white_gold"
+        val key = make.orEmpty().lowercase(Locale.ROOT)
+        val resourceName = when {
+            "nikon" in key -> "wm_nikon"
+            "canon" in key -> "wm_canon"
+            "sony" in key -> "wm_sony"
+            "fujifilm" in key || key == "fuji" -> "wm_fujifilm"
+            "panasonic" in key || "lumix" in key -> "wm_panasonic"
+            "leica" in key -> "wm_leica_logo"
+            "hasselblad" in key -> "wm_hasselblad"
+            "pentax" in key -> "wm_pentax"
+            "ricoh" in key -> "wm_ricoh"
+            "olympus" in key || "om digital" in key -> "wm_olympus_blue_gold"
             else -> return 0
         }
-        return context.resources.getIdentifier(key, "drawable", context.packageName)
+        return context.resources.getIdentifier(resourceName, "drawable", context.packageName)
     }
 
-    private fun PhotoMetadata.lines(preset: WatermarkPreset): List<String> {
-        val lines = mutableListOf<String>()
-        if (WatermarkField.CAMERA_BRAND in preset.fields || WatermarkField.CAMERA_MODEL in preset.fields) {
-            listOfNotNull(if (WatermarkField.CAMERA_BRAND in preset.fields) cameraBrand else null, if (WatermarkField.CAMERA_MODEL in preset.fields) cameraModel else null)
-                .joinToString(" ").takeIf { it.isNotBlank() }?.let(lines::add)
-        }
-        if (WatermarkField.LENS_MODEL in preset.fields) lensModel?.let(lines::add)
-        val shooting = listOfNotNull(
-            if (WatermarkField.FOCAL_LENGTH in preset.fields) focalLength else null,
-            if (WatermarkField.EQUIVALENT_FOCAL_LENGTH in preset.fields) equivalentFocalLength?.let { "等效 $it" } else null,
-            if (WatermarkField.APERTURE in preset.fields) aperture else null,
-            if (WatermarkField.SHUTTER in preset.fields) shutterSpeed else null,
-            if (WatermarkField.ISO in preset.fields) iso?.let { "ISO $it" } else null,
-        )
-        if (shooting.isNotEmpty()) lines += shooting.joinToString(" · ")
-        if (WatermarkField.CAPTURE_DATE in preset.fields) capturedAt?.let { SimpleDateFormat("yyyy.MM.dd · HH:mm", Locale.getDefault()).format(it) }?.let(lines::add)
-        if (WatermarkField.CUSTOM_TEXT in preset.fields) preset.customText.trim().takeIf { it.isNotBlank() }?.let(lines::add)
-        if (WatermarkField.COPYRIGHT in preset.fields) preset.copyrightText.trim().takeIf { it.isNotBlank() }?.let { lines += "© $it" }
-        return lines
+    private fun withAlpha(color: Int, alpha: Int): Int = Color.argb(alpha.coerceIn(0, 255), Color.red(color), Color.green(color), Color.blue(color))
+
+    private fun PhotoMetadata.cameraLabel(preset: WatermarkPreset): String? {
+        val brand = cameraBrand.cleanDisplay().takeIf { WatermarkField.CAMERA_BRAND in preset.fields }
+        val model = cameraModel.cleanDisplay().takeIf { WatermarkField.CAMERA_MODEL in preset.fields }
+        if (brand != null && model != null && model.startsWith(brand, ignoreCase = true)) return model
+        return listOfNotNull(brand, model).joinToString(" ").ifBlank { null }
+    }
+
+    private fun PhotoMetadata.lensLabel(preset: WatermarkPreset): String? = lensModel.cleanDisplay()
+        .takeIf { WatermarkField.LENS_MODEL in preset.fields }
+
+    private fun PhotoMetadata.shootingLabel(preset: WatermarkPreset, separator: String): String? = listOfNotNull(
+        focalLength.cleanDisplay().takeIf { WatermarkField.FOCAL_LENGTH in preset.fields },
+        equivalentFocalLength.cleanDisplay()?.let { "等效 $it" }.takeIf { WatermarkField.EQUIVALENT_FOCAL_LENGTH in preset.fields },
+        aperture.cleanDisplay().takeIf { WatermarkField.APERTURE in preset.fields },
+        shutterSpeed.cleanDisplay().takeIf { WatermarkField.SHUTTER in preset.fields },
+        iso?.takeIf { it > 0 && WatermarkField.ISO in preset.fields }?.let { "ISO$it" },
+    ).joinToString(separator).ifBlank { null }
+
+    private fun PhotoMetadata.dateLabel(preset: WatermarkPreset): String? = capturedAt
+        ?.takeIf { WatermarkField.CAPTURE_DATE in preset.fields }
+        ?.let { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(it) }
+
+    private fun PhotoMetadata.captionLabel(preset: WatermarkPreset): String? = listOfNotNull(
+        preset.customText.cleanDisplay().takeIf { WatermarkField.CUSTOM_TEXT in preset.fields },
+        preset.copyrightText.cleanDisplay()?.let { "© $it" }.takeIf { WatermarkField.COPYRIGHT in preset.fields },
+    ).joinToString(" · ").ifBlank { null }
+
+    private fun PhotoMetadata.secondaryInfoLabel(preset: WatermarkPreset, firstLine: String?): String? {
+        val candidates = listOf(cameraLabel(preset), captionLabel(preset), dateLabel(preset))
+        return candidates.firstOrNull { it != null && it != firstLine }
+    }
+
+    private fun String?.cleanDisplay(): String? = this?.trim()?.takeIf {
+        it.isNotBlank() && !it.equals("unknown", true) && it != "0mm" && it != "ISO0" && it != "null"
     }
 }
