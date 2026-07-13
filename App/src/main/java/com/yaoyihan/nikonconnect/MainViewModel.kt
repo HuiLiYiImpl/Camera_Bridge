@@ -37,6 +37,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val downloads = MutableStateFlow(store.downloads())
     val luts = MutableStateFlow(store.luts())
     val recentLutIds = MutableStateFlow(store.recentLuts())
+    val watermarks = MutableStateFlow(store.watermarks())
     val notice = MutableStateFlow<String?>(null)
     val snackbar = MutableStateFlow<String?>(null)
     val pageTask = MutableStateFlow<PageTask?>(null)
@@ -84,6 +85,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val updated = (listOf(entry.id) + recentLutIds.value.filterNot { it == entry.id }).take(5)
         recentLutIds.value = updated
         store.saveRecentLuts(updated)
+    }
+
+    fun addWatermark(preset: WatermarkPreset) {
+        watermarks.value = watermarks.value + preset
+        store.saveWatermarks(watermarks.value)
+        showSnackbar("已创建水印预设")
+    }
+
+    fun updateWatermark(preset: WatermarkPreset) {
+        watermarks.value = watermarks.value.map { if (it.id == preset.id) preset else it }
+        store.saveWatermarks(watermarks.value)
+        showSnackbar("已保存水印预设")
+    }
+
+    fun removeWatermark(preset: WatermarkPreset) {
+        watermarks.value = watermarks.value.filterNot { it.id == preset.id }
+        store.saveWatermarks(watermarks.value)
+        showSnackbar("已删除水印预设")
     }
 
     fun retry() { lastFailedAsset?.let(::download) ?: connect(false) }
@@ -186,6 +205,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         runCatching {
             val bytes = client?.download(asset) { _, _ -> } ?: return@runCatching null
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }.getOrNull()
+    }
+
+    suspend fun loadOriginalPhoto(asset: PhotoAsset): LoadedPhoto? = withContext(Dispatchers.IO) {
+        runCatching {
+            val bytes = client?.download(asset) { _, _ -> } ?: return@runCatching null
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@runCatching null
+            val fallback = PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt)
+            LoadedPhoto(bitmap, ExifMetadataReader.fromBytes(bytes, fallback))
         }.getOrNull()
     }
 
@@ -313,11 +341,151 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         onFinished()
     }
 
+    fun exportEditedBitmap(
+        asset: PhotoAsset,
+        bitmap: Bitmap,
+        metadata: PhotoMetadata,
+        suffix: String,
+        quality: Int = 95,
+        inline: Boolean = false,
+        onFinished: (Result<DownloadRecord>) -> Unit = {},
+    ) = viewModelScope.launch {
+        isBusy.value = true
+        workflow.value = Workflow.DOWNLOADING
+        if (!inline) notice.value = "正在导出 ${asset.name}"
+        updateExportNotif(asset.name, 0, 0)
+        val result = runCatching { withContext(Dispatchers.IO) { saveEditedBitmap(asset, bitmap, metadata, suffix, quality) } }
+        result.onSuccess { record ->
+            store.addDownload(record)
+            downloads.value = store.downloads()
+            workflow.value = Workflow.CONNECTED
+            if (!inline) showTransient("已导出编辑图片")
+        }.onFailure {
+            workflow.value = Workflow.CONNECTED
+            if (!inline) showError(it.message ?: "导出编辑图片失败")
+        }
+        clearExportNotif()
+        isBusy.value = false
+        onFinished(result)
+    }
+
+    fun addWatermarkToPhotos(assets: List<PhotoAsset>, preset: WatermarkPreset, onFinished: () -> Unit = {}): Job = processRemoteEdits(assets, null, preset, onFinished)
+
+    fun applyLutAndWatermarkToPhotos(assets: List<PhotoAsset>, lut: CubeLut, preset: WatermarkPreset, onFinished: () -> Unit = {}): Job = processRemoteEdits(assets, lut, preset, onFinished)
+
+    fun addWatermarkToDownloads(records: List<DownloadRecord>, preset: WatermarkPreset, onFinished: () -> Unit = {}): Job = processLocalEdits(records, null, preset, onFinished)
+
+    fun applyLutAndWatermarkToDownloads(records: List<DownloadRecord>, lut: CubeLut, preset: WatermarkPreset, onFinished: () -> Unit = {}): Job = processLocalEdits(records, lut, preset, onFinished)
+
+    private fun processRemoteEdits(assets: List<PhotoAsset>, lut: CubeLut?, preset: WatermarkPreset, onFinished: () -> Unit): Job {
+        val retry: () -> Unit = { processRemoteEdits(assets, lut, preset, onFinished); Unit }
+        pageRetry = retry
+        return viewModelScope.launch {
+            val active = client ?: run { showPageError("添加水印失败：相机连接已断开"); return@launch }
+            if (assets.isEmpty()) return@launch
+            val title = if (lut == null) "添加水印" else "套 LUT + 水印"
+            val suffix = if (lut == null) "Watermark" else "${lut.name}_Watermark"
+            isBusy.value = true
+            workflow.value = Workflow.DOWNLOADING
+            showPageProgress("正在$title 0 / ${assets.size}")
+            var completed = 0
+            var skipped = 0
+            assets.forEachIndexed { index, asset ->
+                if (!asset.name.supportsLutInput()) {
+                    skipped++
+                } else runCatching {
+                    withContext(Dispatchers.IO) {
+                        val bytes = active.download(asset) { _, _ -> }
+                        val original = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: error("无法解码 ${asset.name}")
+                        var graded: Bitmap? = null
+                        var edited: Bitmap? = null
+                        try {
+                            val fallback = PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt)
+                            val metadata = ExifMetadataReader.fromBytes(bytes, fallback)
+                            graded = if (lut == null) original else CubeLuts.apply(original, lut)
+                            edited = WatermarkRenderer.render(graded, metadata, preset, getApplication())
+                            saveEditedBitmap(asset, edited, metadata, suffix, preset.quality)
+                        } finally {
+                            edited?.recycle()
+                            if (graded != null && graded !== original) graded?.recycle()
+                            original.recycle()
+                        }
+                    }
+                }.onSuccess { store.addDownload(it); completed++ }.onFailure { skipped++ }
+                showPageProgress("正在$title ${index + 1} / ${assets.size}")
+                updateExportNotif(asset.name, index + 1, assets.size)
+            }
+            downloads.value = store.downloads()
+            workflow.value = Workflow.CONNECTED
+            clearExportNotif()
+            showPageSuccess(if (skipped == 0) "已导出 $completed 张水印图片" else "已导出 $completed 张，跳过 $skipped 个不支持或失败的文件")
+            isBusy.value = false
+            onFinished()
+        }
+    }
+
+    private fun processLocalEdits(records: List<DownloadRecord>, lut: CubeLut?, preset: WatermarkPreset, onFinished: () -> Unit): Job {
+        val retry: () -> Unit = { processLocalEdits(records, lut, preset, onFinished); Unit }
+        pageRetry = retry
+        return viewModelScope.launch {
+            if (records.isEmpty()) return@launch
+            val title = if (lut == null) "添加水印" else "套 LUT + 水印"
+            val suffix = if (lut == null) "Watermark" else "${lut.name}_Watermark"
+            isBusy.value = true
+            workflow.value = Workflow.DOWNLOADING
+            showPageProgress("正在$title 0 / ${records.size}")
+            var completed = 0
+            var skipped = 0
+            records.forEachIndexed { index, record ->
+                if (!record.name.supportsLutInput()) {
+                    skipped++
+                } else runCatching {
+                    withContext(Dispatchers.IO) {
+                        val parsed = Uri.parse(record.uri)
+                        val bytes = getApplication<Application>().contentResolver.openInputStream(parsed)?.use { it.readBytes() }
+                            ?: error("无法读取 ${record.name}")
+                        val original = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: error("无法解码 ${record.name}")
+                        var graded: Bitmap? = null
+                        var edited: Bitmap? = null
+                        try {
+                            val metadata = ExifMetadataReader.fromBytes(bytes, PhotoMetadata(capturedAt = Date(record.completedAt)))
+                            graded = if (lut == null) original else CubeLuts.apply(original, lut)
+                            edited = WatermarkRenderer.render(graded, metadata, preset, getApplication())
+                            saveEditedBitmap(PhotoAsset(0u, record.name, record.size, 0x3801), edited, metadata, suffix, preset.quality)
+                        } finally {
+                            edited?.recycle()
+                            if (graded != null && graded !== original) graded?.recycle()
+                            original.recycle()
+                        }
+                    }
+                }.onSuccess { store.addDownload(it); completed++ }.onFailure { skipped++ }
+                showPageProgress("正在$title ${index + 1} / ${records.size}")
+                updateExportNotif(record.name, index + 1, records.size)
+            }
+            downloads.value = store.downloads()
+            workflow.value = Workflow.CONNECTED
+            clearExportNotif()
+            showPageSuccess(if (skipped == 0) "已导出 $completed 张水印图片" else "已导出 $completed 张，跳过 $skipped 个不支持或失败的文件")
+            isBusy.value = false
+            onFinished()
+        }
+    }
+
     suspend fun loadLocalOriginal(uri: String): Bitmap? = withContext(Dispatchers.IO) {
         runCatching {
             getApplication<Application>().contentResolver.openInputStream(android.net.Uri.parse(uri))?.use {
                 BitmapFactory.decodeStream(it)
             }
+        }.getOrNull()
+    }
+
+    suspend fun loadLocalPhoto(record: DownloadRecord): LoadedPhoto? = withContext(Dispatchers.IO) {
+        runCatching {
+            val parsed = Uri.parse(record.uri)
+            val bitmap = getApplication<Application>().contentResolver.openInputStream(parsed)?.use { BitmapFactory.decodeStream(it) }
+                ?: return@runCatching null
+            val fallback = PhotoMetadata(capturedAt = Date(record.completedAt))
+            LoadedPhoto(bitmap, ExifMetadataReader.fromUri(getApplication(), parsed, fallback))
         }.getOrNull()
     }
 
@@ -426,6 +594,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return saveToMediaStore(output, true) { stream ->
             require(bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)) { "无法编码 JPG" }
             output.size
+        }
+    }
+
+    private fun saveEditedBitmap(asset: PhotoAsset, bitmap: Bitmap, metadata: PhotoMetadata, suffix: String, quality: Int): DownloadRecord {
+        val safeSuffix = suffix.replace(Regex("[^A-Za-z0-9_-]"), "_")
+        val output = asset.copy(name = "${asset.name.substringBeforeLast('.')}_${safeSuffix}.jpg")
+        val temp = java.io.File.createTempFile("camera_bridge_", ".jpg", getApplication<Application>().cacheDir)
+        return try {
+            temp.outputStream().use { stream -> require(bitmap.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(80, 100), stream)) { "无法编码 JPG" } }
+            preserveExif(temp, metadata)
+            saveToMediaStore(output, true) { stream -> temp.inputStream().use { it.copyTo(stream) }; temp.length() }
+        } finally {
+            temp.delete()
+        }
+    }
+
+    private fun preserveExif(file: java.io.File, metadata: PhotoMetadata) {
+        runCatching {
+            val exif = android.media.ExifInterface(file.absolutePath)
+            metadata.cameraBrand?.let { exif.setAttribute("Make", it) }
+            metadata.cameraModel?.let { exif.setAttribute("Model", it) }
+            metadata.lensModel?.let { exif.setAttribute("LensModel", it) }
+            metadata.iso?.let { exif.setAttribute("ISOSpeedRatings", it.toString()) }
+            metadata.capturedAt?.let { date ->
+                exif.setAttribute("DateTimeOriginal", java.text.SimpleDateFormat("yyyy:MM:dd HH:mm:ss", java.util.Locale.US).format(date))
+            }
+            metadata.copyrightText?.let { exif.setAttribute("Copyright", it) }
+            exif.saveAttributes()
         }
     }
 

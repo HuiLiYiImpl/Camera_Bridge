@@ -1,0 +1,11 @@
+Camera Bridge watermark assets
+
+The bundled watermark logos, sample layout references, and Alibaba PuHuiTi
+fonts are sourced from:
+https://github.com/OrdinaryOrgan/PhotoWatermark
+
+Source project license: Apache License 2.0.
+Source project license text:
+https://github.com/OrdinaryOrgan/PhotoWatermark/blob/main/LICENSE
+
+Brand names and logos remain the property of their respective owners.

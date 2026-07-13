@@ -107,7 +107,58 @@ class AppStore(context: Context) {
 
     fun saveRecentLuts(ids: List<String>) = prefs.edit().putString("recent_luts", ids.joinToString(",")).apply()
 
+    fun watermarks(): List<WatermarkPreset> = runCatching {
+        if (!prefs.contains("watermarks")) return defaultWatermarkPresets()
+        val array = JSONArray(prefs.getString("watermarks", "[]"))
+        (0 until array.length()).map { i ->
+            array.getJSONObject(i).let { json ->
+                WatermarkPreset(
+                    id = json.getString("id"),
+                    name = json.getString("name"),
+                    layout = runCatching { WatermarkLayout.valueOf(json.optString("layout")) }.getOrDefault(WatermarkLayout.MINIMAL),
+                    fields = json.optString("fields").split(',').mapNotNull { runCatching { WatermarkField.valueOf(it) }.getOrNull() }.toSet(),
+                    fontSize = json.optInt("fontSize", 34),
+                    textColor = json.optInt("textColor", -1),
+                    backgroundColor = json.optInt("backgroundColor", -16777216),
+                    backgroundAlpha = json.optInt("backgroundAlpha", 68),
+                    margin = json.optInt("margin", 28),
+                    showBorder = json.optBoolean("showBorder", false),
+                    customText = json.optString("customText"),
+                    copyrightText = json.optString("copyrightText"),
+                    logoEnabled = json.optBoolean("logoEnabled", true),
+                    useBrandLogo = json.optBoolean("useBrandLogo", true),
+                    logoUri = json.optString("logoUri").takeIf { it.isNotBlank() },
+                    logoScale = json.optInt("logoScale", 100),
+                    logoAlpha = json.optInt("logoAlpha", 100),
+                    logoPosition = runCatching { WatermarkLogoPosition.valueOf(json.optString("logoPosition")) }.getOrDefault(WatermarkLogoPosition.TOP_RIGHT),
+                    quality = json.optInt("quality", 95),
+                )
+            }
+        }
+    }.getOrDefault(defaultWatermarkPresets())
+
+    fun saveWatermarks(entries: List<WatermarkPreset>) {
+        val array = JSONArray()
+        entries.forEach { entry ->
+            array.put(JSONObject().apply {
+                put("id", entry.id); put("name", entry.name); put("layout", entry.layout.name); put("fields", entry.fields.joinToString(",") { it.name })
+                put("fontSize", entry.fontSize); put("textColor", entry.textColor); put("backgroundColor", entry.backgroundColor); put("backgroundAlpha", entry.backgroundAlpha)
+                put("margin", entry.margin); put("showBorder", entry.showBorder); put("customText", entry.customText); put("copyrightText", entry.copyrightText)
+                put("logoEnabled", entry.logoEnabled); put("useBrandLogo", entry.useBrandLogo); put("logoUri", entry.logoUri ?: ""); put("logoScale", entry.logoScale); put("logoAlpha", entry.logoAlpha); put("logoPosition", entry.logoPosition.name); put("quality", entry.quality)
+            })
+        }
+        prefs.edit().putString("watermarks", array.toString()).apply()
+    }
+
 }
+
+private fun defaultWatermarkPresets() = listOf(
+    WatermarkPreset("minimal", "极简底部信息", WatermarkLayout.MINIMAL),
+    WatermarkPreset("left", "左下角摄影参数", WatermarkLayout.LEFT_PARAMS, setOf(WatermarkField.CAMERA_MODEL, WatermarkField.LENS_MODEL, WatermarkField.FOCAL_LENGTH, WatermarkField.APERTURE, WatermarkField.SHUTTER, WatermarkField.ISO)),
+    WatermarkPreset("right", "右下角摄影参数", WatermarkLayout.RIGHT_PARAMS),
+    WatermarkPreset("white", "白色底边框信息", WatermarkLayout.WHITE_BORDER, showBorder = true, backgroundColor = android.graphics.Color.WHITE, textColor = android.graphics.Color.BLACK, backgroundAlpha = 230),
+    WatermarkPreset("custom", "仅自定义文字", WatermarkLayout.CUSTOM, setOf(WatermarkField.CUSTOM_TEXT), logoEnabled = false, useBrandLogo = false),
+)
 
 fun Long.prettySize(): String = when {
     this >= 1_073_741_824 -> "%.1f GB".format(Locale.getDefault(), this / 1_073_741_824.0)
