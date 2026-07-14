@@ -48,4 +48,18 @@ internal object OrientedBitmaps {
         return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
             .also { if (it !== bitmap) bitmap.recycle() }
     }
+
+    fun rotate(bitmap: Bitmap, degrees: Int): Bitmap {
+        val normalized = ((degrees % 360) + 360) % 360
+        if (normalized == 0) return bitmap
+        return Bitmap.createBitmap(
+            bitmap,
+            0,
+            0,
+            bitmap.width,
+            bitmap.height,
+            Matrix().apply { setRotate(normalized.toFloat()) },
+            true,
+        )
+    }
 }

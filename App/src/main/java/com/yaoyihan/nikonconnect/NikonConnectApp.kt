@@ -649,6 +649,7 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
     val watermarks by vm.watermarks.collectAsState()
     var preview by remember { mutableStateOf<PhotoAsset?>(null) }
     var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var previewRotation by remember { mutableIntStateOf(0) }
     var previewLoading by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf(PhotoFilter.ALL) }
     val scope = rememberCoroutineScope()
@@ -695,7 +696,7 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
             grading = false
         }
     }
-    LaunchedEffect(gradedBitmap, previewBitmap, selectedWatermark, photoMetadata, watermarkRetry) {
+    LaunchedEffect(gradedBitmap, previewBitmap, selectedWatermark, photoMetadata, watermarkRetry, previewRotation) {
         val base = gradedBitmap ?: previewBitmap
         val preset = selectedWatermark
         if (base == null || preset == null) {
@@ -704,7 +705,15 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
         } else {
             inlineTask = InlineTask("正在生成水印…", "${preset.name} · 预览", running = true)
             watermarking = true
-            val result = runCatching { withContext(Dispatchers.Default) { WatermarkRenderer.render(base, photoMetadata ?: PhotoMetadata(capturedAt = preview?.capturedAt), preset, context) } }
+            watermarkedBitmap = null
+            val result = runCatching { withContext(Dispatchers.Default) {
+                val selected = OrientedBitmaps.rotate(base, previewRotation)
+                try {
+                    WatermarkRenderer.render(selected, photoMetadata ?: PhotoMetadata(capturedAt = preview?.capturedAt), preset, context)
+                } finally {
+                    if (selected !== base && !selected.isRecycled) selected.recycle()
+                }
+            } }
             result.onSuccess { watermarkedBitmap = it; inlineTask = InlineTask("✓ 已生成水印", "${preset.name} · 预览", running = false) }
                 .onFailure { watermarkedBitmap = null; inlineTask = InlineTask("生成水印失败：${it.message ?: "无法处理图片"}", "", running = false, failed = true); inlineRetry = { watermarkRetry++ } }
             watermarking = false
@@ -754,7 +763,7 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
             items(visiblePhotos, key = { it.handle.toString() }) { asset ->
                 PhotoCard(asset, vm.thumbnails[asset.handle], { vm.loadThumbnail(asset) }, asset.handle in selectedHandles) {
                     if (selectionMode) selectedHandles = if (asset.handle in selectedHandles) selectedHandles - asset.handle else selectedHandles + asset.handle
-                    else { previewLoadJob?.cancel(); vm.loadThumbnail(asset); previewBitmap = null; previewLoading = false; selectedLut = null; selectedLutEntry = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {}; watermarkRetry = 0; preview = asset }
+                    else { previewLoadJob?.cancel(); vm.loadThumbnail(asset); previewBitmap = null; previewRotation = 0; previewLoading = false; selectedLut = null; selectedLutEntry = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {}; watermarkRetry = 0; preview = asset }
                 }
             }
             if (hasMore && filter == PhotoFilter.ALL) item { Row(Modifier.fillMaxWidth().padding(20.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) { LaunchedEffect(photos.size) { vm.loadMorePhotos() }; CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(10.dp)); Text("正在加载更多", color = BridgeWhite.copy(alpha = .6f), style = MaterialTheme.typography.labelMedium) } }
@@ -790,14 +799,14 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
             val run = {
                 val suffix = buildList { selectedLut?.let { add(it.name) }; if (selectedWatermark != null) add("Watermark") }.joinToString("_").ifBlank { "Export" }
                 inlineTask = InlineTask("正在导出…", "${selectedWatermark?.name ?: selectedLutEntry?.name ?: "当前预览"}", running = true)
-                vm.exportEditedPhoto(asset, selectedLut, selectedWatermark, suffix, selectedWatermark?.quality ?: 95, inline = true) { result ->
+                vm.exportEditedPhoto(asset, selectedLut, selectedWatermark, suffix, selectedWatermark?.quality ?: 95, rotation = previewRotation, inline = true) { result ->
                     result.fold({ inlineTask = InlineTask("✓ 已导出", it.name, running = false) }, { inlineTask = InlineTask("导出失败：${it.message ?: "未知错误"}", "", running = false, failed = true) })
                 }
                 Unit
             }
             inlineRetry = run; run()
         }
-        PreviewDialog(asset.name, asset.size, vm.thumbnails[asset.handle], watermarkedBitmap ?: gradedBitmap ?: previewBitmap, previewLoading || grading || watermarking, { previewLoadJob?.cancel(); preview = null; previewBitmap = null; gradedBitmap = null; watermarkedBitmap = null; photoMetadata = null; selectedLut = null; selectedLutEntry = null; selectedWatermark = null; inlineTask = null; inlineRetry = {} }, {
+        PreviewDialog(asset.name, asset.size, vm.thumbnails[asset.handle], watermarkedBitmap ?: gradedBitmap ?: previewBitmap, previewLoading || grading || watermarking, { previewLoadJob?.cancel(); preview = null; previewBitmap = null; previewRotation = 0; gradedBitmap = null; watermarkedBitmap = null; photoMetadata = null; selectedLut = null; selectedLutEntry = null; selectedWatermark = null; inlineTask = null; inlineRetry = {} }, {
             startLoadOriginal()
         }, previewBitmap != null, luts, recentLutIds, { entry ->
             if (entry == null) { selectedLutEntry = null; selectedLut = null; inlineTask = null; inlineRetry = {} }
@@ -805,7 +814,7 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
                 vm.markLutUsed(entry)
                 scope.launch { selectedLut = runCatching { vm.readLut(entry) }.getOrNull(); selectedLutEntry = if (selectedLut != null) entry else null }
             }
-        }, selectedLutEntry?.name, download = startDownload, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry)
+        }, selectedLutEntry?.name, download = startDownload, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 })
     }
     if (showWatermarkEditor) WatermarkEditorDialog(editingWatermark, { showWatermarkEditor = false }, { preset -> if (editingWatermark == null) vm.addWatermark(preset) else vm.updateWatermark(preset); showWatermarkEditor = false })
     LutPickerSheet(showBatchLutPicker, luts, recentLutIds, { showBatchLutPicker = false }, { entry ->
@@ -983,8 +992,7 @@ private fun WatermarkTemplatePreview(layout: WatermarkLayout, modifier: Modifier
 }
 
 @Composable
-private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, watermarks: List<WatermarkPreset> = emptyList(), selectWatermark: ((WatermarkPreset?) -> Unit)? = null, watermarkName: String? = null, exportEdited: (() -> Unit)? = null, createWatermark: () -> Unit = {}, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}) {
-    var rotation by remember(name) { mutableIntStateOf(0) }
+private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, watermarks: List<WatermarkPreset> = emptyList(), selectWatermark: ((WatermarkPreset?) -> Unit)? = null, watermarkName: String? = null, exportEdited: (() -> Unit)? = null, createWatermark: () -> Unit = {}, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}, rotation: Int = 0, rotateLeft: () -> Unit = {}) {
     var lutMenu by remember(name) { mutableStateOf(false) }
     var watermarkMenu by remember(name) { mutableStateOf(false) }
     var editSheet by remember(name) { mutableStateOf(false) }
@@ -1027,7 +1035,7 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
                                 Text(name, color = BridgeWhite, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text("${size.prettySize()} · $format", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall)
                             }
-                            IconButton({ rotation = (rotation - 90 + 360) % 360 }, Modifier.size(40.dp)) { Icon(Icons.Default.RotateLeft, "\u9006\u65f6\u9488\u65cb\u8f6c", tint = BridgeWhite) }
+                            IconButton(rotateLeft, Modifier.size(40.dp)) { Icon(Icons.Default.RotateLeft, "\u9006\u65f6\u9488\u65cb\u8f6c", tint = BridgeWhite) }
                             if (download != null) Box {
                                 IconButton({ moreMenu = true }, Modifier.size(40.dp)) { Icon(Icons.Default.MoreVert, "\u66f4\u591a", tint = BridgeWhite) }
                                 DropdownMenu(moreMenu, { moreMenu = false }) {
@@ -1380,6 +1388,7 @@ private fun DownloadsScreen(vm: MainViewModel) {
     val pageTask by vm.pageTask.collectAsState()
     var preview by remember { mutableStateOf<DownloadRecord?>(null) }
     var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var previewRotation by remember { mutableIntStateOf(0) }
     var previewLoading by remember { mutableStateOf(false) }
     var gradedBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var grading by remember { mutableStateOf(false) }
@@ -1434,7 +1443,7 @@ private fun DownloadsScreen(vm: MainViewModel) {
             grading = false
         }
     }
-    LaunchedEffect(gradedBitmap, previewBitmap, selectedWatermark, photoMetadata, watermarkRetry) {
+    LaunchedEffect(gradedBitmap, previewBitmap, selectedWatermark, photoMetadata, watermarkRetry, previewRotation) {
         val base = gradedBitmap ?: previewBitmap
         val preset = selectedWatermark
         if (base == null || preset == null) {
@@ -1443,7 +1452,15 @@ private fun DownloadsScreen(vm: MainViewModel) {
         } else {
             inlineTask = InlineTask("正在生成水印…", "${preset.name} · 预览", running = true)
             watermarking = true
-            val result = runCatching { withContext(Dispatchers.Default) { WatermarkRenderer.render(base, photoMetadata ?: PhotoMetadata(), preset, context) } }
+            watermarkedBitmap = null
+            val result = runCatching { withContext(Dispatchers.Default) {
+                val selected = OrientedBitmaps.rotate(base, previewRotation)
+                try {
+                    WatermarkRenderer.render(selected, photoMetadata ?: PhotoMetadata(), preset, context)
+                } finally {
+                    if (selected !== base && !selected.isRecycled) selected.recycle()
+                }
+            } }
             result.onSuccess { watermarkedBitmap = it; inlineTask = InlineTask("✓ 已生成水印", "${preset.name} · 预览", running = false) }
                 .onFailure { watermarkedBitmap = null; inlineTask = InlineTask("生成水印失败：${it.message ?: "无法处理图片"}", "", running = false, failed = true); inlineRetry = { watermarkRetry++ } }
             watermarking = false
@@ -1489,7 +1506,7 @@ private fun DownloadsScreen(vm: MainViewModel) {
             items(visibleRows, key = { it.uri }) { row ->
                 DownloadCard(row, row.uri in selectedUris) {
                     if (selectionMode) selectedUris = if (row.uri in selectedUris) selectedUris - row.uri else selectedUris + row.uri
-                    else { previewLut = null; gradedBitmap = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {}; watermarkRetry = 0; preview = row }
+                    else { previewRotation = 0; previewLut = null; gradedBitmap = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {}; watermarkRetry = 0; preview = row }
                 }
             }
         }
@@ -1499,7 +1516,7 @@ private fun DownloadsScreen(vm: MainViewModel) {
             val run = {
                 val suffix = buildList { previewLut?.let { add(it.name) }; if (selectedWatermark != null) add("Watermark") }.joinToString("_").ifBlank { "Export" }
                 inlineTask = InlineTask("正在导出…", "${selectedWatermark?.name ?: previewLut?.name ?: "当前预览"}", running = true)
-                vm.exportEditedDownload(row, previewLut, selectedWatermark, suffix, selectedWatermark?.quality ?: 95, inline = true) { result ->
+                vm.exportEditedDownload(row, previewLut, selectedWatermark, suffix, selectedWatermark?.quality ?: 95, rotation = previewRotation, inline = true) { result ->
                     result.fold({ inlineTask = InlineTask("✓ 已导出", it.name, running = false) }, { inlineTask = InlineTask("导出失败：${it.message ?: "未知错误"}", "", running = false, failed = true) })
                 }
                 Unit
@@ -1507,7 +1524,7 @@ private fun DownloadsScreen(vm: MainViewModel) {
             inlineRetry = run
             run()
         }
-        PreviewDialog(row.name, row.size, null, watermarkedBitmap ?: gradedBitmap ?: previewBitmap, previewLoading || grading || watermarking, { preview = null; previewBitmap = null; previewLut = null; gradedBitmap = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {} }, { originalReload++ }, previewBitmap != null, luts, recentLutIds, { entry -> previewLut = entry; entry?.let(vm::markLutUsed) }, previewLut?.name, download = null, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry)
+        PreviewDialog(row.name, row.size, null, watermarkedBitmap ?: gradedBitmap ?: previewBitmap, previewLoading || grading || watermarking, { preview = null; previewBitmap = null; previewRotation = 0; previewLut = null; gradedBitmap = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {} }, { originalReload++ }, previewBitmap != null, luts, recentLutIds, { entry -> previewLut = entry; entry?.let(vm::markLutUsed) }, previewLut?.name, download = null, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 })
     }
     if (showWatermarkEditor) WatermarkEditorDialog(editingWatermark, { showWatermarkEditor = false }, { preset -> if (editingWatermark == null) vm.addWatermark(preset) else vm.updateWatermark(preset); showWatermarkEditor = false })
     LutPickerSheet(showBatchLutPicker, luts, recentLutIds, { showBatchLutPicker = false }, { entry ->

@@ -740,6 +740,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         watermark: WatermarkPreset?,
         suffix: String,
         quality: Int = 95,
+        rotation: Int = 0,
         inline: Boolean = false,
         onFinished: (Result<DownloadRecord>) -> Unit = {},
     ): Job = launchEditedExport(asset.name, session.value?.transport, inline, onFinished) {
@@ -752,6 +753,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             watermark = watermark,
             suffix = suffix,
             quality = quality,
+            rotation = rotation,
             fallback = PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt),
         )
     }
@@ -762,6 +764,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         watermark: WatermarkPreset?,
         suffix: String,
         quality: Int = 95,
+        rotation: Int = 0,
         inline: Boolean = false,
         onFinished: (Result<DownloadRecord>) -> Unit = {},
     ): Job = launchEditedExport(record.name, null, inline, onFinished) {
@@ -774,6 +777,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             watermark = watermark,
             suffix = suffix,
             quality = quality,
+            rotation = rotation,
             fallback = PhotoMetadata(capturedAt = Date(record.completedAt)),
         )
     }
@@ -815,18 +819,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         suffix: String,
         quality: Int,
         fallback: PhotoMetadata,
+        rotation: Int = 0,
     ): DownloadRecord {
         val original = OrientedBitmaps.decode(bytes) ?: error("无法解码 ${asset.name}")
         var graded: Bitmap? = null
+        var rotated: Bitmap? = null
         var watermarked: Bitmap? = null
         return try {
             val metadata = ExifMetadataReader.fromBytes(bytes, fallback)
             val working = if (lut == null) original else CubeLuts.apply(original, lut).also { graded = it }
             if (working !== original) original.recycle()
-            val output = if (watermark == null) working else WatermarkRenderer.render(working, metadata, watermark, getApplication()).also { watermarked = it }
+            val selected = OrientedBitmaps.rotate(working, rotation).also { if (it !== working) rotated = it }
+            if (selected !== working && !working.isRecycled) working.recycle()
+            val output = if (watermark == null) selected else WatermarkRenderer.render(selected, metadata, watermark, getApplication()).also { watermarked = it }
             saveEditedBitmap(asset, output, metadata, suffix, quality)
         } finally {
             watermarked?.takeIf { !it.isRecycled }?.recycle()
+            rotated?.takeIf { !it.isRecycled }?.recycle()
             graded?.takeIf { !it.isRecycled }?.recycle()
             if (!original.isRecycled) original.recycle()
         }
