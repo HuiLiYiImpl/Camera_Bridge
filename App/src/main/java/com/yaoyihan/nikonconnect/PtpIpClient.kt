@@ -83,30 +83,32 @@ class PtpIpClient(
      * 小文件（≤ [FULL_OBJECT_THRESHOLD]）优先整文件下载，失败回退到分块；
      * 大文件用 [AdaptiveChunkController] 自适应调整 chunk 大小（1MB~8MB）。
      */
-    override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit): Long {
+    override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit, isCancelled: () -> Boolean): Long {
         // 小文件：尝试一次性 GET_OBJECT 整文件下载，省去分块往返
         if (asset.size in 1..FULL_OBJECT_THRESHOLD) {
-            runCatching { requestToStream(GET_OBJECT, next(), asset.handle, output, progress, asset.size, 0L) }
-                .onSuccess { return it }
+            try { return requestToStream(GET_OBJECT, next(), asset.handle, output, progress, asset.size, 0L, isCancelled) }
+            catch (cancelled: DownloadCancelledException) { throw cancelled }
+            catch (_: Exception) { }
             // 整文件失败则回退到分块下载（offset 从 0 开始）
             reconnect()
         }
-        return downloadInChunks(asset, output, progress)
+        return downloadInChunks(asset, output, progress, isCancelled)
     }
 
     /** 分块下载：动态 chunk + 失败重试 + 自动重连。 */
-    private fun downloadInChunks(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit): Long {
+    private fun downloadInChunks(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit, isCancelled: () -> Boolean): Long {
         val controller = AdaptiveChunkController(DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
         var offset = 0L
         var retries = 0
         while (offset < asset.size) {
             val count = controller.requestLength(asset.size - offset)
             try {
-                requestToStream(GET_PARTIAL_OBJECT, next(), asset.handle, offset.toUInt(), count.toUInt(), output, progress, asset.size, offset)
+                requestToStream(GET_PARTIAL_OBJECT, next(), asset.handle, offset.toUInt(), count.toUInt(), output, progress, asset.size, offset, isCancelled)
                 offset += count
                 controller.registerSuccess()
                 retries = 0
             } catch (e: Exception) {
+                if (e is DownloadCancelledException) throw e
                 if (++retries > MAX_CHUNK_RETRIES) throw e
                 controller.registerFailure()
                 if (isDeviceBusy(e)) { Thread.sleep(retries * DEVICE_BUSY_BACKOFF_MS) }
@@ -221,26 +223,27 @@ class PtpIpClient(
     }
 
     /** 流式下载：数据包直接写入 [output]，不经过 ArrayList 装箱，避免 GC 压力。 */
-    @Synchronized private fun requestToStream(operation: Int, id: UInt, output: OutputStream, progress: (Long, Long) -> Unit, total: Long, baseOffset: Long, vararg parameters: UInt): Long {
+    @Synchronized private fun requestToStream(operation: Int, id: UInt, output: OutputStream, progress: (Long, Long) -> Unit, total: Long, baseOffset: Long, isCancelled: () -> Boolean, vararg parameters: UInt): Long {
         command.send(operationPacket(operation, id, parameters)); var written = 0L; var expected = 0L
+        var draining = false
         while (true) {
             val packet = command.read()
             when (packet.type) {
-                START_DATA -> { val r = Reader(packet.payload); r.u32(); expected = r.u64().toLong(); progress(baseOffset, total) }
-                DATA, END_DATA -> { val r = Reader(packet.payload); r.u32(); val part = r.remaining(); output.write(part); written += part.size; progress(baseOffset + written, total) }
-                OPERATION_RESPONSE -> { val r = Reader(packet.payload); require(r.u16() == RESPONSE_OK) { "相机返回了错误" }; return written }
+                START_DATA -> { val r = Reader(packet.payload); r.u32(); expected = r.u64().toLong(); if (!isCancelled()) progress(baseOffset, total) else draining = true }
+                DATA, END_DATA -> { val r = Reader(packet.payload); r.u32(); val part = r.remaining(); if (isCancelled()) draining = true; if (!draining) { output.write(part); written += part.size; progress(baseOffset + written, total) } }
+                OPERATION_RESPONSE -> { val r = Reader(packet.payload); require(r.u16() == RESPONSE_OK) { "相机返回了错误" }; if (draining || isCancelled()) throw DownloadCancelledException(); return written }
                 else -> error("收到意外的 PTP/IP 数据包：${packet.type}")
             }
         }
     }
 
     /** GET_OBJECT 整文件下载（无 offset/count 参数，只有 handle）。 */
-    private fun requestToStream(operation: Int, id: UInt, handle: UInt, output: OutputStream, progress: (Long, Long) -> Unit, total: Long, baseOffset: Long): Long =
-        requestToStream(operation, id, output, progress, total, baseOffset, handle)
+    private fun requestToStream(operation: Int, id: UInt, handle: UInt, output: OutputStream, progress: (Long, Long) -> Unit, total: Long, baseOffset: Long, isCancelled: () -> Boolean = { false }): Long =
+        requestToStream(operation, id, output, progress, total, baseOffset, isCancelled, handle)
 
     /** GET_PARTIAL_OBJECT 分块下载（handle + offset + count）。 */
-    private fun requestToStream(operation: Int, id: UInt, handle: UInt, offset: UInt, count: UInt, output: OutputStream, progress: (Long, Long) -> Unit, total: Long, baseOffset: Long): Long =
-        requestToStream(operation, id, output, progress, total, baseOffset, handle, offset, count)
+    private fun requestToStream(operation: Int, id: UInt, handle: UInt, offset: UInt, count: UInt, output: OutputStream, progress: (Long, Long) -> Unit, total: Long, baseOffset: Long, isCancelled: () -> Boolean): Long =
+        requestToStream(operation, id, output, progress, total, baseOffset, isCancelled, handle, offset, count)
 
     private fun next() = transaction++
     override fun close() { runCatching { if (::command.isInitialized) requestResponse(CLOSE_SESSION, next()) }; runCatching { command.close() }; runCatching { event.close() } }

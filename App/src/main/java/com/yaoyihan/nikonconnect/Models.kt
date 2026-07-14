@@ -66,8 +66,73 @@ data class PhotoAsset(
 }
 
 data class DownloadRecord(val name: String, val size: Long, val uri: String, val completedAt: Long)
+
+enum class MediaKind { IMAGE, RAW_IMAGE, VIDEO, UNKNOWN }
+
+private val VideoExtensions = setOf("mp4", "mov", "m4v", "3gp")
+private val RawImageExtensions = setOf("nef", "nrw", "cr2", "arw", "dng", "raf")
+private val ImageExtensions = setOf("jpg", "jpeg", "png", "webp", "heic", "heif")
+
+fun mediaKindFor(mime: String?, name: String): MediaKind {
+    val extension = name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+    return when {
+        mime?.startsWith("video/", ignoreCase = true) == true -> MediaKind.VIDEO
+        mime?.startsWith("image/", ignoreCase = true) == true -> if (extension in RawImageExtensions) MediaKind.RAW_IMAGE else MediaKind.IMAGE
+        extension in VideoExtensions -> MediaKind.VIDEO
+        extension in RawImageExtensions -> MediaKind.RAW_IMAGE
+        extension in ImageExtensions -> MediaKind.IMAGE
+        else -> MediaKind.UNKNOWN
+    }
+}
+
+fun Context.mediaKind(record: DownloadRecord): MediaKind =
+    mediaKindFor(contentResolver.getType(Uri.parse(record.uri)), record.name)
+
+fun String.isVideoName() = mediaKindFor(null, this) == MediaKind.VIDEO
+enum class DownloadTaskStatus { QUEUED, DOWNLOADING, CANCELLING, FAILED }
+
+data class DownloadTask(
+    val id: String,
+    val asset: PhotoAsset,
+    val downloadedBytes: Long = 0,
+    val totalBytes: Long = asset.size.coerceAtLeast(0),
+    val bytesPerSecond: Long? = null,
+    val remainingSeconds: Long? = null,
+    val status: DownloadTaskStatus = DownloadTaskStatus.QUEUED,
+    val createdAt: Long = System.currentTimeMillis(),
+    val errorMessage: String? = null,
+)
+
+enum class EnqueueDownloadResult { CREATED, ALREADY_EXISTS }
+
+fun PhotoAsset.downloadSourceKey(session: CameraSession?): String =
+    "${session?.name.orEmpty()}|${handle}|$name|$size"
+
+fun downloadProgress(done: Long, callbackTotal: Long, assetSize: Long): Pair<Long, Float> {
+    val total = (if (callbackTotal > 0) callbackTotal else assetSize).coerceAtLeast(0)
+    val downloaded = done.coerceIn(0, total)
+    val progress = if (total > 0) (downloaded.toDouble() / total).toFloat().coerceIn(0f, 1f) else 0f
+    return total to progress
+}
+
+fun formatRemainingTime(seconds: Long?): String = seconds?.takeIf { it >= 0 }?.let {
+    if (it >= 3600) "%d:%02d:%02d".format(it / 3600, (it % 3600) / 60, it % 60)
+    else "%02d:%02d".format(it / 60, it % 60)
+} ?: "计算中"
+
 enum class LutCategory(val title: String) { PORTRAIT("人像"), FILM("胶片"), CINEMA("电影"), LANDSCAPE("风光"), OTHER("未分类") }
-data class LutEntry(val id: String, val name: String, val category: LutCategory = LutCategory.OTHER)
+data class LutEntry(
+    val id: String,
+    val name: String,
+    val category: LutCategory = LutCategory.OTHER,
+    val format: String = "CUBE",
+    val dimension: Int = 0,
+    val sourceName: String = name,
+    val inputColorSpace: String = "sRGB",
+    val favorite: Boolean = false,
+    val lastUsedAt: Long = 0,
+    val importedAt: Long = System.currentTimeMillis(),
+)
 
 private val LutInputExtensions = setOf("jpg", "jpeg", "png", "nef", "nrw", "cr2", "arw", "dng", "raf")
 fun String.supportsLutInput(): Boolean = substringAfterLast('.', "").lowercase(Locale.ROOT) in LutInputExtensions
@@ -134,13 +199,13 @@ class AppStore(context: Context) {
     fun luts(): List<LutEntry> = runCatching {
         val array = JSONArray(prefs.getString("luts", "[]"))
         (0 until array.length()).map { i ->
-            array.getJSONObject(i).let { LutEntry(it.getString("id"), it.getString("name"), runCatching { LutCategory.valueOf(it.optString("category")) }.getOrDefault(LutCategory.OTHER)) }
+            array.getJSONObject(i).let { LutEntry(it.getString("id"), it.getString("name"), runCatching { LutCategory.valueOf(it.optString("category")) }.getOrDefault(LutCategory.OTHER), it.optString("format", "CUBE"), it.optInt("dimension", 0), it.optString("sourceName", it.getString("name")), it.optString("inputColorSpace", "sRGB"), it.optBoolean("favorite", false), it.optLong("lastUsedAt", 0), it.optLong("importedAt", System.currentTimeMillis())) }
         }
     }.getOrDefault(emptyList())
 
     fun saveLuts(entries: List<LutEntry>) {
         val array = JSONArray()
-        entries.forEach { array.put(JSONObject().put("id", it.id).put("name", it.name).put("category", it.category.name)) }
+        entries.forEach { array.put(JSONObject().put("id", it.id).put("name", it.name).put("category", it.category.name).put("format", it.format).put("dimension", it.dimension).put("sourceName", it.sourceName).put("inputColorSpace", it.inputColorSpace).put("favorite", it.favorite).put("lastUsedAt", it.lastUsedAt).put("importedAt", it.importedAt)) }
         prefs.edit().putString("luts", array.toString()).apply()
     }
 

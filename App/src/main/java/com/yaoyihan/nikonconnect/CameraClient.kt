@@ -1,6 +1,7 @@
 package com.yaoyihan.nikonconnect
 
 import java.io.OutputStream
+import kotlin.coroutines.cancellation.CancellationException
 
 enum class ConnectionTransport(val title: String) {
     WIFI("Wi‑Fi"),
@@ -52,7 +53,9 @@ interface CameraClient : AutoCloseable {
     fun thumbnail(asset: PhotoAsset): ByteArray?
     fun imageHeader(asset: PhotoAsset): ByteArray?
     fun download(asset: PhotoAsset, progress: (Long, Long) -> Unit): ByteArray
-    fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit): Long
+    fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit, isCancelled: () -> Boolean = { false }): Long
 }
+
+class DownloadCancelledException : CancellationException("下载已取消")
 
 internal const val IMAGE_HEADER_SIZE = 256 * 1024

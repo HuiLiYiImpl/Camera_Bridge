@@ -89,7 +89,11 @@ data class PhotoMetadata(
     val copyrightText: String? = null,
 )
 
-data class LoadedPhoto(val bitmap: Bitmap, val metadata: PhotoMetadata)
+data class LoadedPhoto(
+    val bitmap: Bitmap,
+    val metadata: PhotoMetadata,
+    val sourceBytes: ByteArray,
+)
 
 object ExifMetadataReader {
     fun fromBytes(bytes: ByteArray, fallback: PhotoMetadata = PhotoMetadata()): PhotoMetadata = runCatching {

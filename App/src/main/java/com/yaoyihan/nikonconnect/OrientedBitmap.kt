@@ -28,7 +28,10 @@ internal fun resolveExifOrientation(thumbnailOrientation: Int?, originalOrientat
 
 internal object OrientedBitmaps {
     fun decode(bytes: ByteArray, orientation: Int = orientation(bytes)): Bitmap? =
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { orient(it, orientation) }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply {
+            inMutable = true
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        })?.let { orient(it, orientation) }
 
     fun orientation(bytes: ByteArray): Int = orientationOrNull(bytes) ?: ExifInterface.ORIENTATION_NORMAL
 

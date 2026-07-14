@@ -6,10 +6,13 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.mtp.MtpDevice
 import android.mtp.MtpConstants
+import android.os.ParcelFileDescriptor
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.OutputStream
 import java.util.Date
+import kotlin.concurrent.fixedRateTimer
 
 /** Android's native MTP bridge. It keeps USB protocol details out of the UI and export layers. */
 class UsbMtpClient(
@@ -29,6 +32,9 @@ class UsbMtpClient(
     override val transport = ConnectionTransport.USB
 
     override fun connect() = synchronized(ioLock) {
+        listOfNotNull(appContext.cacheDir, appContext.externalCacheDir).forEach { dir ->
+            dir.listFiles { file -> file.name.startsWith("camera_bridge_mtp_") && file.name.endsWith(".part") }?.forEach { it.delete() }
+        }
         val opened = usbManager.openDevice(usbDevice) ?: error("无法打开 USB 相机，请确认已授予 USB 访问权限")
         connection = opened
         mtp = MtpDevice(usbDevice)
@@ -87,14 +93,33 @@ class UsbMtpClient(
         return output.toByteArray()
     }
 
-    override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit): Long = synchronized(ioLock) {
+    override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit, isCancelled: () -> Boolean): Long = synchronized(ioLock) {
+        // MediaStore exposes a FileOutputStream, so MTP can stream large videos straight
+        // into their final destination without allocating the entire object in memory.
+        if (output is FileOutputStream) {
+            val progressTimer = fixedRateTimer("mtp-download-progress", daemon = true, initialDelay = 250L, period = 250L) {
+                runCatching { output.channel.size() }.getOrDefault(0L).takeIf { it > 0L }?.let { progress(it, asset.size) }
+            }
+            val imported = try {
+                ParcelFileDescriptor.dup(output.fd).use { mtp.importFile(asset.handle.toInt(), it) }
+            } finally {
+                progressTimer.cancel()
+            }
+            require(imported) { "USB 相机未完成文件传输" }
+            if (isCancelled()) throw DownloadCancelledException()
+            val copied = output.channel.size().takeIf { it > 0 } ?: asset.size.coerceAtLeast(0L)
+            require(copied > 0L) { "USB 相机未返回文件内容" }
+            progress(copied, copied)
+            return@synchronized copied
+        }
         // Native import is compatible with cameras that reject GetPartialObject64 (including Nikon Z f over MTP).
-        val temp = File.createTempFile("camera_bridge_mtp_", ".part", appContext.cacheDir).apply { delete() }
+        val temp = File.createTempFile("camera_bridge_mtp_", ".part", appContext.externalCacheDir ?: appContext.cacheDir).apply { delete() }
         try {
             if (!mtp.importFile(asset.handle.toInt(), temp.absolutePath)) {
                 val size = asset.size.takeIf { it in 1..Int.MAX_VALUE.toLong() }?.toInt()
                     ?: error("USB 文件过大，无法读取")
                 val bytes = mtp.getObject(asset.handle.toInt(), size) ?: error("USB 相机未返回文件内容")
+                if (isCancelled()) throw DownloadCancelledException()
                 output.write(bytes)
                 progress(bytes.size.toLong(), bytes.size.toLong())
                 return@synchronized bytes.size.toLong()
@@ -106,6 +131,7 @@ class UsbMtpClient(
                 while (true) {
                     val read = input.read(buffer)
                     if (read < 0) break
+                    if (isCancelled()) throw DownloadCancelledException()
                     output.write(buffer, 0, read)
                     copied += read
                     progress(copied, total)
