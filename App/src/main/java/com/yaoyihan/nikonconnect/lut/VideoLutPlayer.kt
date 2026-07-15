@@ -8,6 +8,7 @@ import android.net.Uri
 import android.opengl.GLES11Ext
 import android.opengl.GLES30
 import android.opengl.GLSurfaceView
+import android.util.Log
 import android.view.Surface
 import com.yaoyihan.nikonconnect.CubeLut
 import java.nio.ByteBuffer
@@ -41,7 +42,7 @@ precision highp float;
 in vec2 vTexCoord;
 uniform samplerExternalOES uVideo;
 uniform mat4 uTextureMatrix;
-uniform sampler3D uLut;
+uniform highp sampler3D uLut;
 uniform float uIntensity;
 uniform float uLutSize;
 uniform vec3 uDomainMin;
@@ -59,6 +60,7 @@ void main() {
     fragmentColor = vec4(mix(original.rgb, graded, clamp(uIntensity, 0.0, 1.0)), original.a);
 }
 """
+private const val VideoLutLogTag = "VideoLutGlView"
 
 class VideoLutGlView(context: Context) : GLSurfaceView(context) {
     var onPrepared: (Long) -> Unit = {}
@@ -139,10 +141,18 @@ class VideoLutGlView(context: Context) : GLSurfaceView(context) {
                     onPlayingChanged(true)
                 }
                 setOnCompletionListener { onPlayingChanged(false) }
-                setOnErrorListener { _, _, _ -> onError(); true }
+                setOnErrorListener { _, what, extra ->
+                    Log.e(VideoLutLogTag, "MediaPlayer error what=$what extra=$extra")
+                    onError()
+                    true
+                }
                 prepareAsync()
             }
-        }.getOrElse { onError(); null }
+        }.getOrElse { error ->
+            Log.e(VideoLutLogTag, "MediaPlayer prepare failed", error)
+            onError()
+            null
+        }
     }
 
     override fun onDetachedFromWindow() {
@@ -190,7 +200,13 @@ class VideoLutGlView(context: Context) : GLSurfaceView(context) {
         }
 
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-            program = linkProgram(compile(GLES30.GL_VERTEX_SHADER, VideoVertexShader), compile(GLES30.GL_FRAGMENT_SHADER, VideoFragmentShader))
+            program = runCatching {
+                linkProgram(compile(GLES30.GL_VERTEX_SHADER, VideoVertexShader), compile(GLES30.GL_FRAGMENT_SHADER, VideoFragmentShader))
+            }.getOrElse { error ->
+                Log.e(VideoLutLogTag, "OpenGL initialization failed", error)
+                post { onError() }
+                return
+            }
             positionHandle = GLES30.glGetAttribLocation(program, "aPosition")
             scaleHandle = GLES30.glGetUniformLocation(program, "uScale")
             rotationHandle = GLES30.glGetUniformLocation(program, "uRotation")
@@ -295,7 +311,7 @@ class VideoLutGlView(context: Context) : GLSurfaceView(context) {
 
         private fun genTexture() = IntArray(1).also { GLES30.glGenTextures(1, it, 0) }[0]
         private fun compile(type: Int, source: String): Int = GLES30.glCreateShader(type).also { shader ->
-            GLES30.glShaderSource(shader, source)
+            GLES30.glShaderSource(shader, source.trimStart())
             GLES30.glCompileShader(shader)
             val status = IntArray(1)
             GLES30.glGetShaderiv(shader, GLES30.GL_COMPILE_STATUS, status, 0)

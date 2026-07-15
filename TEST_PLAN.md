@@ -4,14 +4,23 @@
 
 每项记录：测试编号、通过/失败、实际结果、截图或录屏、诊断编号。发生失败时先在“设置 → 诊断与日志”导出诊断包，再重试，避免覆盖现场。
 
+本轮公司环境的实际执行结果见 [TEST_RESULTS.md](TEST_RESULTS.md)。
+
 ## A. 公司无相机 / 远程测试
 
 ### A0 构建
 
-在 PowerShell 7 中执行：
+在 PowerShell 7 中执行（优先使用本机 JDK 17，找不到时再改候选路径）：
 
 ```powershell
-$env:JAVA_HOME='D:\code\androidStudio\jbr'
+$jdk = @(
+  'D:\java17',
+  'D:\code\androidStudio\jbr',
+  'C:\Program Files\Android\Android Studio\jbr'
+) | Where-Object { Test-Path (Join-Path $_ 'bin\java.exe') } | Select-Object -First 1
+if (-not $jdk) { throw '未找到 JDK 17，请先设置 JAVA_HOME' }
+$env:JAVA_HOME = $jdk
+$env:Path = "$env:JAVA_HOME\bin;$env:Path"
 .\gradlew.bat :App:testDebugUnitTest :App:assembleDebug --no-daemon
 ```
 

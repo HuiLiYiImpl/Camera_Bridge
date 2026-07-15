@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
+import android.util.Log
 import com.yaoyihan.nikonconnect.CubeLut
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -35,7 +36,7 @@ private const val FragmentShader = """
 precision highp float;
 in vec2 vTexCoord;
 uniform sampler2D uImage;
-uniform sampler3D uLut;
+uniform highp sampler3D uLut;
 uniform float uIntensity;
 uniform float uLutSize;
 uniform vec3 uDomainMin;
@@ -53,6 +54,7 @@ void main() {
     fragmentColor = vec4(mix(original.rgb, graded, clamp(uIntensity, 0.0, 1.0)), original.a);
 }
 """
+private const val LutGpuLogTag = "LutGlView"
 
 class LutGlView(context: Context) : GLSurfaceView(context) {
     private val lutRenderer = Renderer()
@@ -106,7 +108,12 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
         }
 
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-            program = linkProgram(compile(GLES30.GL_VERTEX_SHADER, VertexShader), compile(GLES30.GL_FRAGMENT_SHADER, FragmentShader))
+            program = runCatching {
+                linkProgram(compile(GLES30.GL_VERTEX_SHADER, VertexShader), compile(GLES30.GL_FRAGMENT_SHADER, FragmentShader))
+            }.getOrElse { error ->
+                Log.e(LutGpuLogTag, "OpenGL initialization failed", error)
+                return
+            }
             position = GLES30.glGetAttribLocation(program, "aPosition")
             imageHandle = GLES30.glGetUniformLocation(program, "uImage")
             lutHandle = GLES30.glGetUniformLocation(program, "uLut")
@@ -130,6 +137,7 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
         override fun onDrawFrame(gl: GL10?) {
             GLES30.glClearColor(0f, 0f, 0f, 1f)
             GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+            if (program == 0) return
             val source = image ?: return
             GLES30.glUseProgram(program)
             if (uploadedImage !== source) {
@@ -198,7 +206,7 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
 
         private fun genTexture() = IntArray(1).also { GLES30.glGenTextures(1, it, 0) }[0]
         private fun genTexture3d() = genTexture()
-        private fun compile(type: Int, source: String): Int = GLES30.glCreateShader(type).also { shader -> GLES30.glShaderSource(shader, source); GLES30.glCompileShader(shader); checkStatus(shader, GLES30.GL_COMPILE_STATUS, "Shader 编译失败") }
+        private fun compile(type: Int, source: String): Int = GLES30.glCreateShader(type).also { shader -> GLES30.glShaderSource(shader, source.trimStart()); GLES30.glCompileShader(shader); checkStatus(shader, GLES30.GL_COMPILE_STATUS, "Shader 编译失败") }
         private fun linkProgram(vertex: Int, fragment: Int): Int = GLES30.glCreateProgram().also { p -> GLES30.glAttachShader(p, vertex); GLES30.glAttachShader(p, fragment); GLES30.glLinkProgram(p); val result = IntArray(1); GLES30.glGetProgramiv(p, GLES30.GL_LINK_STATUS, result, 0); if (result[0] == 0) error("Shader 链接失败") }
         private fun checkStatus(handle: Int, status: Int, message: String) {
             val result = IntArray(1)
