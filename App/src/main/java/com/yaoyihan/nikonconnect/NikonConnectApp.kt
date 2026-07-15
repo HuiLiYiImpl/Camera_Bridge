@@ -167,9 +167,9 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
     var tab by remember { mutableStateOf(Tab.CAMERA) }
     var lightingOpen by remember { mutableStateOf(false) }
     var playbackScene by remember { mutableStateOf<LightScene?>(null) }
-    val landing = tab == Tab.CAMERA && session == null
+    val connectionCenter = tab == Tab.CAMERA && session == null
     LaunchedEffect(session) {
-        if (session == null) tab = Tab.CAMERA
+        if (session == null && tab == Tab.PHOTOS) tab = Tab.CAMERA
     }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_RESUME) vm.checkConnectionOnResume() }
@@ -187,10 +187,10 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                     containerColor = BridgeNight,
                     snackbarHost = { SnackbarHost(snackbarHostState) },
                     contentWindowInsets = WindowInsets(0, 0, 0, 0),
-                ) {
-                    Box(Modifier.fillMaxSize()) {
+                ) { contentPadding ->
+                    Box(Modifier.fillMaxSize().padding(contentPadding)) {
                         Column(Modifier.fillMaxSize().statusBarsPadding()) {
-                            if (!landing) AnimatedActivityPill(
+                            if (!connectionCenter) AnimatedActivityPill(
                                 notice,
                                 busy,
                                 if (workflow == Workflow.ERROR) vm::retry else null,
@@ -209,7 +209,12 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                                 }
                             }
                         }
-                        if (!landing) BridgeNavigation(vm, tab, { tab = it }, Modifier.align(Alignment.BottomCenter))
+                        BridgeNavigation(vm, tab, { requested ->
+                            if (requested == Tab.PHOTOS && session == null) {
+                                tab = Tab.CAMERA
+                                android.widget.Toast.makeText(context, "请先连接相机", android.widget.Toast.LENGTH_SHORT).show()
+                            } else tab = requested
+                        }, Modifier.align(Alignment.BottomCenter))
                     }
                 }
             }
@@ -400,7 +405,7 @@ private fun ConnectedCameraScreen(
             }
         }
         item {
-            Button(openPhotos, Modifier.fillMaxWidth().height(56.dp), enabled = !busy && photoCount > 0, shape = RoundedCornerShape(18.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) {
+            Button(openPhotos, Modifier.fillMaxWidth().height(56.dp), enabled = !busy, shape = RoundedCornerShape(18.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) {
                 Icon(Icons.Default.PhotoLibrary, null); Spacer(Modifier.width(8.dp)); Text("进入相册", fontWeight = FontWeight.Bold)
             }
         }
@@ -471,7 +476,7 @@ private fun ConnectionCenter(
     exportDiagnostic: () -> Unit,
     copyDiagnostic: () -> Unit,
 ) {
-    Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight, BridgeDeep))).padding(horizontal = 24.dp, vertical = 18.dp)) {
+    Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight, BridgeDeep))).padding(start = 24.dp, end = 24.dp, top = 18.dp, bottom = 96.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("CAMERA_BRIDGE", color = BridgeWhite, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
@@ -819,6 +824,14 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
         PageTaskBar(pageTask, vm::retryPageTask)
         FilterBar(filter) { filter = it }
         if (photos.isEmpty()) BridgeEmptyState(Icons.Default.PhotoLibrary, "\u6682\u65e0\u7167\u7247", "\u8fde\u63a5\u76f8\u673a\u5e76\u8bfb\u53d6\u76f8\u518c")
+        else if (visiblePhotos.isEmpty() && hasMore) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            LaunchedEffect(photos.size, filter) { vm.loadMorePhotos() }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp, color = BridgeEmber)
+                Spacer(Modifier.height(10.dp))
+                Text("正在后续分页中查找${filter.title}文件", color = BridgeWhite.copy(alpha = .68f), style = MaterialTheme.typography.bodySmall)
+            }
+        }
         else if (visiblePhotos.isEmpty()) BridgeEmptyState(Icons.Default.FilterAlt, "\u6b64\u5206\u7c7b\u6682\u65e0\u6587\u4ef6", "\u8bd5\u8bd5\u5176\u4ed6\u5206\u7c7b")
         else LazyVerticalStaggeredGrid(StaggeredGridCells.Adaptive(148.dp), Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 8.dp, end = 8.dp, bottom = 126.dp), verticalItemSpacing = 6.dp, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             items(visiblePhotos, key = { it.handle.toString() }) { asset ->
@@ -827,8 +840,8 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
                     else { previewLoadJob?.cancel(); vm.loadThumbnail(asset); previewBitmap = null; previewSourceBytes = null; previewRotation = 0; previewLoading = false; selectedLut = null; selectedLutEntry = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {}; watermarkRetry = 0; preview = asset }
                 }
             }
-            if (hasMore && filter == PhotoFilter.ALL) item { Row(Modifier.fillMaxWidth().padding(20.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) { LaunchedEffect(photos.size) { vm.loadMorePhotos() }; CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(10.dp)); Text("正在加载更多", color = BridgeWhite.copy(alpha = .6f), style = MaterialTheme.typography.labelMedium) } }
-            if (!hasMore && filter == PhotoFilter.ALL && photos.isNotEmpty()) item { Text("已全部加载", Modifier.fillMaxWidth().padding(18.dp), color = BridgeWhite.copy(alpha = .45f), style = MaterialTheme.typography.labelSmall, textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
+            if (hasMore) item { Row(Modifier.fillMaxWidth().padding(20.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) { LaunchedEffect(photos.size, filter) { vm.loadMorePhotos() }; CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(10.dp)); Text("正在加载更多", color = BridgeWhite.copy(alpha = .6f), style = MaterialTheme.typography.labelMedium) } }
+            if (!hasMore && photos.isNotEmpty()) item { Text("已全部加载", Modifier.fillMaxWidth().padding(18.dp), color = BridgeWhite.copy(alpha = .45f), style = MaterialTheme.typography.labelSmall, textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
         }
     }
     preview?.let { asset ->
@@ -877,7 +890,7 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
                 selectedLutIntensity = 1f
                 scope.launch { selectedLut = runCatching { vm.readLut(entry) }.getOrNull(); selectedLutEntry = if (selectedLut != null) entry else null }
             }
-        }, selectedLutEntry?.name, download = startDownload, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 }, gpuSource = previewBitmap, gpuLut = selectedLut, gpuIntensity = selectedLutIntensity, setGpuIntensity = { selectedLutIntensity = it }, selectedLutEntry = selectedLutEntry)
+        }, selectedLutEntry?.name, download = startDownload, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 }, gpuSource = previewBitmap, gpuLut = selectedLut, gpuIntensity = selectedLutIntensity, setGpuIntensity = { selectedLutIntensity = it }, selectedLutEntry = selectedLutEntry, downloadOnly = asset.name.isVideoName())
     }
     if (showWatermarkEditor) WatermarkEditorDialog(editingWatermark, { showWatermarkEditor = false }, { preset -> if (editingWatermark == null) vm.addWatermark(preset) else vm.updateWatermark(preset); showWatermarkEditor = false })
     LutPickerSheet(showBatchLutPicker, luts, recentLutIds, { showBatchLutPicker = false }, { entry ->
@@ -906,13 +919,13 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
         val selected = photos.filter { it.handle in selectedHandles }
         val rawCount = selected.count { it.type == "RAW" }
         val videoCount = selected.count { it.type in setOf("MOV", "MP4") }
-        val suffix = buildString { if (rawCount > 0) append(" RAW 将导出为 JPG。"); if (videoCount > 0) append(" 视频将自动跳过。") }
+        val suffix = buildString { if (rawCount > 0) append(" RAW 将导出为 JPG。"); if (videoCount > 0) append(" 视频需先下载，再到下载页逐个处理。") }
         AlertDialog(onDismissRequest = { showBatchConfirm = false }, title = { Text("批量套用 LUT", color = BridgeWhite) }, text = { Column { Text("将为 ${selected.size} 张图片应用「${batchLutEntry!!.name}」并导出新图片。$suffix", color = BridgeWhite.copy(alpha = .8f)); if (batchLutLoading) { Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(8.dp)); Text("正在读取 LUT…", color = BridgeWhite.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall) } } } }, confirmButton = { TextButton({ batchLut?.let { lut -> showBatchConfirm = false; batchLutLoading = false; vm.downloadAllWithLut(selected, lut) { selectionMode = false; selectedHandles = emptySet() } } }, enabled = !batchLutLoading && batchLut != null) { Text("开始导出", color = if (batchLutLoading) BridgeWhite.copy(alpha = .35f) else BridgeEmber) } }, dismissButton = { TextButton({ showBatchConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = BridgeSurface, titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
     }
     if (showBatchWatermarkConfirm && batchWatermark != null) {
         val selected = photos.filter { it.handle in selectedHandles }
         val videoCount = selected.count { it.type in setOf("MOV", "MP4") }
-        val suffix = if (videoCount > 0) "视频将自动跳过。" else ""
+        val suffix = if (videoCount > 0) "视频需先下载，再到下载页逐个处理。" else ""
         val combined = batchLutWatermarkMode && batchLut != null
         AlertDialog(onDismissRequest = { showBatchWatermarkConfirm = false }, title = { Text(if (combined) "批量导出编辑图" else "批量添加水印", color = BridgeWhite) }, text = { Text(if (combined) "将为 ${selected.size} 张图片先应用「${batchLutEntry?.name}」，再添加「${batchWatermark!!.name}」水印并导出新文件。原图不会被覆盖。$suffix" else "将为 ${selected.size} 张图片添加「${batchWatermark!!.name}」水印并导出新文件。原图不会被覆盖。$suffix", color = BridgeWhite.copy(alpha = .8f)) }, confirmButton = { TextButton({ showBatchWatermarkConfirm = false; if (combined) vm.applyLutAndWatermarkToPhotos(selected, batchLut!!, batchWatermark!!) { selectionMode = false; selectedHandles = emptySet(); batchLutWatermarkMode = false } else vm.addWatermarkToPhotos(selected, batchWatermark!!) { selectionMode = false; selectedHandles = emptySet() } }) { Text("开始导出", color = BridgeEmber) } }, dismissButton = { TextButton({ showBatchWatermarkConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = BridgeSurface, titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
     }
@@ -1055,7 +1068,7 @@ private fun WatermarkTemplatePreview(layout: WatermarkLayout, modifier: Modifier
 }
 
 @Composable
-private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, watermarks: List<WatermarkPreset> = emptyList(), selectWatermark: ((WatermarkPreset?) -> Unit)? = null, watermarkName: String? = null, exportEdited: (() -> Unit)? = null, createWatermark: () -> Unit = {}, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}, rotation: Int = 0, rotateLeft: () -> Unit = {}, gpuSource: Bitmap? = null, gpuLut: CubeLut? = null, gpuIntensity: Float = 1f, setGpuIntensity: (Float) -> Unit = {}, selectedLutEntry: LutEntry? = null) {
+private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, watermarks: List<WatermarkPreset> = emptyList(), selectWatermark: ((WatermarkPreset?) -> Unit)? = null, watermarkName: String? = null, exportEdited: (() -> Unit)? = null, createWatermark: () -> Unit = {}, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}, rotation: Int = 0, rotateLeft: () -> Unit = {}, gpuSource: Bitmap? = null, gpuLut: CubeLut? = null, gpuIntensity: Float = 1f, setGpuIntensity: (Float) -> Unit = {}, selectedLutEntry: LutEntry? = null, downloadOnly: Boolean = false) {
     val context = LocalContext.current
     var lutMenu by remember(name) { mutableStateOf(false) }
     var watermarkMenu by remember(name) { mutableStateOf(false) }
@@ -1101,8 +1114,8 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
                                 Text(name, color = BridgeWhite, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 Text("${size.prettySize()} · $format", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall)
                             }
-                            IconButton(rotateLeft, Modifier.size(40.dp)) { Icon(Icons.Default.RotateLeft, "\u9006\u65f6\u9488\u65cb\u8f6c", tint = BridgeWhite) }
-                            if (download != null) Box {
+                            if (!downloadOnly) IconButton(rotateLeft, Modifier.size(40.dp)) { Icon(Icons.Default.RotateLeft, "\u9006\u65f6\u9488\u65cb\u8f6c", tint = BridgeWhite) }
+                            if (download != null && !downloadOnly) Box {
                                 IconButton({ moreMenu = true }, Modifier.size(40.dp)) { Icon(Icons.Default.MoreVert, "\u66f4\u591a", tint = BridgeWhite) }
                                 DropdownMenu(moreMenu, { moreMenu = false }) {
                                     DropdownMenuItem({ Text("\u4e0b\u8f7d\u539f\u59cb\u6587\u4ef6") }, { moreMenu = false; download() })
@@ -1114,7 +1127,7 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
                     if (!editSheet) InlineStatusCard(inlineTask, dismissInline, retryInline)
                 }
 
-                 if (luts.isNotEmpty() && selectLut != null) LutSidePanel(luts, selectedLutEntry ?: luts.firstOrNull { it.name == lutName }, gpuIntensity, lutPanelExpanded, selectLut, setGpuIntensity, { lutPanelExpanded = !lutPanelExpanded }, Modifier.align(Alignment.CenterEnd).statusBarsPadding().navigationBarsPadding().padding(end = 12.dp, top = 84.dp, bottom = 132.dp))
+                 if (!downloadOnly && luts.isNotEmpty() && selectLut != null) LutSidePanel(luts, selectedLutEntry ?: luts.firstOrNull { it.name == lutName }, gpuIntensity, lutPanelExpanded, selectLut, setGpuIntensity, { lutPanelExpanded = !lutPanelExpanded }, Modifier.align(Alignment.CenterEnd).statusBarsPadding().navigationBarsPadding().padding(end = 12.dp, top = 84.dp, bottom = 132.dp))
 
                  if (lutName != null || watermarkName != null) Row(
                     Modifier.align(Alignment.BottomStart).padding(start = 16.dp, bottom = 156.dp),
@@ -1136,7 +1149,15 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
                             border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f)),
                             shadowElevation = 8.dp,
                         ) {
-                            if (!originalLoaded) {
+                            if (downloadOnly) {
+                                Button(
+                                    { download?.invoke() },
+                                    Modifier.fillMaxWidth().height(56.dp).padding(4.dp),
+                                    enabled = download != null && !taskRunning,
+                                    shape = RoundedCornerShape(18.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber.copy(alpha = .9f), contentColor = BridgeNight),
+                                ) { Icon(Icons.Default.Download, null); Spacer(Modifier.width(7.dp)); Text("下载后播放和编辑", fontWeight = FontWeight.Bold) }
+                            } else if (!originalLoaded) {
                                 Button(
                                     { loadOriginal?.invoke() },
                                     Modifier.fillMaxWidth().height(56.dp).padding(4.dp),
@@ -1484,6 +1505,7 @@ private fun DownloadsScreen(vm: MainViewModel) {
     var showWatermarkEditor by remember { mutableStateOf(false) }
     var editingWatermark by remember { mutableStateOf<WatermarkPreset?>(null) }
     val visibleRows = rows.filter { it.matches(filter) }
+    val visibleTasks = tasks.filter { it.asset.matches(filter) }
     LaunchedEffect(preview?.uri, originalReload) {
         val uri = preview?.uri ?: return@LaunchedEffect
         if (context.mediaKind(preview!!) == MediaKind.VIDEO) return@LaunchedEffect
@@ -1561,9 +1583,9 @@ private fun DownloadsScreen(vm: MainViewModel) {
         PageTaskBar(pageTask, vm::retryPageTask)
         FilterBar(filter) { filter = it; selectedUris = emptySet() }
         if (tasks.isEmpty() && rows.isEmpty()) BridgeEmptyState(Icons.Default.CloudDownload, "\u6682\u65e0\u4e0b\u8f7d\u8bb0\u5f55", "\u5728\u76f8\u518c\u4e2d\u9009\u62e9\u7167\u7247\u5373\u53ef\u4fdd\u5b58\u5230\u624b\u673a")
-        else if (rows.isNotEmpty() && visibleRows.isEmpty()) BridgeEmptyState(Icons.Default.FilterAlt, "\u6b64\u5206\u7c7b\u6682\u65e0\u6587\u4ef6", "\u8bd5\u8bd5\u5176\u4ed6\u5206\u7c7b")
+        else if (visibleTasks.isEmpty() && visibleRows.isEmpty()) BridgeEmptyState(Icons.Default.FilterAlt, "\u6b64\u5206\u7c7b\u6682\u65e0\u6587\u4ef6", "\u8bd5\u8bd5\u5176\u4ed6\u5206\u7c7b")
         else LazyVerticalStaggeredGrid(StaggeredGridCells.Adaptive(148.dp), Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 126.dp), verticalItemSpacing = 10.dp, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            items(tasks, key = { "task-${it.id}" }) { task -> DownloadTaskCard(task, vm.thumbnails[task.asset.handle], vm::retryDownloadTask, vm::cancelDownloadTask) }
+            items(visibleTasks, key = { "task-${it.id}" }) { task -> DownloadTaskCard(task, vm.thumbnails[task.asset.handle], vm::retryDownloadTask, vm::cancelDownloadTask) }
             items(visibleRows, key = { it.uri }) { row ->
                 DownloadCard(row, row.uri in selectedUris) {
                     if (selectionMode) selectedUris = if (row.uri in selectedUris) selectedUris - row.uri else selectedUris + row.uri
@@ -1617,14 +1639,14 @@ private fun DownloadsScreen(vm: MainViewModel) {
         val rawCount = selected.count { it.name.substringAfterLast('.', "").lowercase() in setOf("nef", "nrw", "cr2", "arw", "dng", "raf") }
         val videoCount = selected.count { context.mediaKind(it) == MediaKind.VIDEO }
         val suffix = buildString { if (rawCount > 0) append(" RAW 将导出为 JPG。") }
-        AlertDialog(onDismissRequest = { showBatchConfirm = false }, title = { Text("批量套用 LUT", color = BridgeWhite) }, text = { Column { Text("将处理 ${selected.size - videoCount} 张图片，自动跳过 ${videoCount} 个视频。$suffix", color = BridgeWhite.copy(alpha = .8f)); if (batchLutLoading) { Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(8.dp)); Text("正在读取 LUT…", color = BridgeWhite.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall) } } } }, confirmButton = { TextButton({ batchLut?.let { lut -> showBatchConfirm = false; batchLutLoading = false; vm.applyLutToDownloads(selected, lut) { selectionMode = false; selectedUris = emptySet() } } }, enabled = !batchLutLoading && batchLut != null && selected.any { context.mediaKind(it) != MediaKind.VIDEO }) { Text("开始导出", color = if (batchLutLoading) BridgeWhite.copy(alpha = .35f) else BridgeEmber) } }, dismissButton = { TextButton({ showBatchConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = BridgeSurface, titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
+        AlertDialog(onDismissRequest = { showBatchConfirm = false }, title = { Text("批量套用 LUT", color = BridgeWhite) }, text = { Column { Text("本次处理 ${selected.size - videoCount} 张图片。${if (videoCount > 0) " $videoCount 个视频请在播放页逐个导出。" else ""}$suffix", color = BridgeWhite.copy(alpha = .8f)); if (batchLutLoading) { Spacer(Modifier.height(12.dp)); Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = BridgeEmber); Spacer(Modifier.width(8.dp)); Text("正在读取 LUT…", color = BridgeWhite.copy(alpha = .65f), style = MaterialTheme.typography.bodySmall) } } } }, confirmButton = { TextButton({ batchLut?.let { lut -> showBatchConfirm = false; batchLutLoading = false; vm.applyLutToDownloads(selected, lut) { selectionMode = false; selectedUris = emptySet() } } }, enabled = !batchLutLoading && batchLut != null && selected.any { context.mediaKind(it) != MediaKind.VIDEO }) { Text("开始导出", color = if (batchLutLoading) BridgeWhite.copy(alpha = .35f) else BridgeEmber) } }, dismissButton = { TextButton({ showBatchConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = BridgeSurface, titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
     }
     if (showBatchWatermarkConfirm && batchWatermark != null) {
         val selected = rows.filter { it.uri in selectedUris }
         val videoCount = selected.count { context.mediaKind(it) == MediaKind.VIDEO }
-        val suffix = "将处理 ${selected.size - videoCount} 张图片，自动跳过 ${videoCount} 个视频。"
+        val suffix = "将处理 ${selected.size - videoCount} 张图片。${if (videoCount > 0) " $videoCount 个视频不会加入批量任务。" else ""}"
         val combined = batchLutWatermarkMode && batchLut != null
-        AlertDialog(onDismissRequest = { showBatchWatermarkConfirm = false }, title = { Text(if (combined) "批量导出编辑图" else "批量添加水印", color = BridgeWhite) }, text = { Text(if (selected.size == videoCount) "所选文件均为视频，视频暂不支持 LUT 和水印。" else "$suffix 原图不会被覆盖。", color = BridgeWhite.copy(alpha = .8f)) }, confirmButton = { TextButton({ showBatchWatermarkConfirm = false; if (combined) vm.applyLutAndWatermarkToDownloads(selected, batchLut!!, batchWatermark!!) { selectionMode = false; selectedUris = emptySet(); batchLutWatermarkMode = false } else vm.addWatermarkToDownloads(selected, batchWatermark!!) { selectionMode = false; selectedUris = emptySet() } }, enabled = selected.size > videoCount) { Text("开始导出", color = BridgeEmber) } }, dismissButton = { TextButton({ showBatchWatermarkConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = BridgeSurface, titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
+        AlertDialog(onDismissRequest = { showBatchWatermarkConfirm = false }, title = { Text(if (combined) "批量导出编辑图" else "批量添加水印", color = BridgeWhite) }, text = { Text(if (selected.size == videoCount) "批量操作仅处理图片；视频 LUT 请逐个打开处理，视频水印暂不支持。" else "$suffix 原图不会被覆盖。", color = BridgeWhite.copy(alpha = .8f)) }, confirmButton = { TextButton({ showBatchWatermarkConfirm = false; if (combined) vm.applyLutAndWatermarkToDownloads(selected, batchLut!!, batchWatermark!!) { selectionMode = false; selectedUris = emptySet(); batchLutWatermarkMode = false } else vm.addWatermarkToDownloads(selected, batchWatermark!!) { selectionMode = false; selectedUris = emptySet() } }, enabled = selected.size > videoCount) { Text("开始导出", color = BridgeEmber) } }, dismissButton = { TextButton({ showBatchWatermarkConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = BridgeSurface, titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
     }
     if (showDeleteConfirm) {
         AlertDialog(
@@ -1987,7 +2009,7 @@ private fun SettingsScreen(vm: MainViewModel) {
             }
             item {
                 Text("关于", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge); Spacer(Modifier.height(8.dp))
-                Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = BridgeWhite.copy(alpha = .06f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) { Column(Modifier.padding(16.dp)) { Text("Camera Bridge", color = BridgeWhite, fontWeight = FontWeight.Bold); Text("版本 1.0.2 · Wi‑Fi / USB 相机导入", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) } }
+                Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = BridgeWhite.copy(alpha = .06f), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) { Column(Modifier.padding(16.dp)) { Text("Camera Bridge", color = BridgeWhite, fontWeight = FontWeight.Bold); Text("版本 ${BuildConfig.VERSION_NAME} · Wi‑Fi / USB 相机导入", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.bodySmall) } }
             }
         }
     }
@@ -2053,8 +2075,12 @@ private fun PreferenceSwitch(title: String, subtitle: String, checked: Boolean, 
 @Composable private fun DownloadCard(row: DownloadRecord, selected: Boolean, click: () -> Unit) {
     val context = LocalContext.current
     val kind = remember(row.uri) { context.mediaKind(row) }
-    val bitmap by produceState<Bitmap?>(null, row.uri, kind) { value = withContext(Dispatchers.IO) { loadDownloadThumbnail(context, row.uri, kind) } }
-    val duration by produceState<Long?>(null, row.uri, kind) { value = if (kind == MediaKind.VIDEO) withContext(Dispatchers.IO) { loadVideoDuration(context, row.uri) } else null }
+    var bitmap by remember(row.uri, kind) { mutableStateOf<Bitmap?>(null) }
+    var duration by remember(row.uri, kind) { mutableStateOf<Long?>(null) }
+    LaunchedEffect(row.uri, kind) {
+        bitmap = withContext(Dispatchers.IO) { loadDownloadThumbnail(context, row.uri, kind) }
+        duration = if (kind == MediaKind.VIDEO) withContext(Dispatchers.IO) { loadVideoDuration(context, row.uri) } else null
+    }
     val ratio = when (row.name.hashCode().and(3)) { 0 -> .72f; 1 -> 1.16f; 2 -> .86f; else -> .98f }
     Card(Modifier.fillMaxWidth().clickable { click() }, shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = if (selected) androidx.compose.foundation.BorderStroke(2.dp, BridgeEmber) else androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
         Box(Modifier.aspectRatio(ratio)) {
@@ -2072,29 +2098,47 @@ private fun PreferenceSwitch(title: String, subtitle: String, checked: Boolean, 
 }
 @Composable private fun DownloadTaskCard(task: DownloadTask, thumbnail: Bitmap?, retry: (String) -> Unit, cancel: (String) -> Unit) {
     val total = task.totalBytes.coerceAtLeast(0)
-    val done = task.downloadedBytes.coerceIn(0, total)
+    val done = normalizedDownloadBytes(task.downloadedBytes, total)
+    val remaining = (total - done).coerceAtLeast(0)
     val progress = if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else 0f
     val failed = task.status == DownloadTaskStatus.FAILED
     val cancelling = task.status == DownloadTaskStatus.CANCELLING
+    val percent = (progress * 100).roundToInt()
+    val stateLabel = when {
+        failed -> "下载失败"
+        cancelling -> "正在取消"
+        task.status == DownloadTaskStatus.QUEUED -> "等待下载"
+        else -> task.bytesPerSecond?.takeIf { it > 0 }?.let { "${it.prettySize()}/s" } ?: "正在下载"
+    }
     var confirmCancel by remember(task.id) { mutableStateOf(false) }
     Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
-        Box(Modifier.aspectRatio(.82f)) {
+        Box(Modifier.aspectRatio(.78f)) {
             thumbnail?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
                 ?: Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Download, null, tint = BridgeEmber) }
-            Box(Modifier.fillMaxSize().background(BridgeNight.copy(alpha = if (failed) .48f else .32f)))
-            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator(progress = progress, Modifier.size(106.dp), strokeWidth = 7.dp, color = if (failed) Color(0xFFE57373) else BridgeEmber, trackColor = BridgeWhite.copy(alpha = .18f))
-                Column(Modifier.offset(y = (-86).dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    if (failed) Text("下载失败", color = BridgeWhite, fontWeight = FontWeight.Bold)
-                    else if (cancelling) Text("正在取消…", color = BridgeWhite, fontWeight = FontWeight.Bold)
-                    else if (task.status == DownloadTaskStatus.QUEUED) { Text("等待下载", color = BridgeWhite, fontWeight = FontWeight.Bold); Text("文件大小 ${total.prettySize()}", color = BridgeWhite.copy(alpha = .75f), style = MaterialTheme.typography.labelSmall) }
-                    else { Text("已下载 ${done.prettySize()}", color = BridgeWhite, style = MaterialTheme.typography.labelSmall); Text("剩余 ${(total - done).coerceAtLeast(0).prettySize()}", color = BridgeWhite, style = MaterialTheme.typography.labelSmall); Text("预计 ${formatRemainingTime(task.remainingSeconds)}", color = BridgeWhite, style = MaterialTheme.typography.labelSmall) }
-                }
-
+            Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeNight.copy(alpha = .28f), BridgeNight.copy(alpha = .42f), BridgeNight.copy(alpha = .96f)))))
+            Surface(Modifier.align(Alignment.TopStart).padding(9.dp), shape = RoundedCornerShape(12.dp), color = if (failed) Color(0xFFE57373).copy(alpha = .9f) else BridgeNight.copy(alpha = .78f)) {
+                Text(stateLabel, Modifier.padding(horizontal = 8.dp, vertical = 5.dp), color = BridgeWhite, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
             }
-            if (failed) Button({ retry(task.id) }, Modifier.align(Alignment.Center).offset(y = 58.dp).height(34.dp), contentPadding = PaddingValues(horizontal = 14.dp), colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) { Text("重试", fontWeight = FontWeight.Bold) }
-            else if (!cancelling) TextButton({ confirmCancel = true }, Modifier.align(Alignment.Center).offset(y = 58.dp), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Text("取消下载", color = BridgeWhite, style = MaterialTheme.typography.labelSmall) }
-            Surface(Modifier.align(Alignment.BottomStart).fillMaxWidth(), color = BridgeNight.copy(alpha = .72f)) { Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) { Text(task.asset.name, Modifier.weight(1f), color = BridgeWhite, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium); Text(total.prettySize(), color = BridgeWhite.copy(alpha = .78f), style = MaterialTheme.typography.labelSmall) } }
+            if (!cancelling) Surface(Modifier.align(Alignment.TopEnd).padding(6.dp).size(40.dp), shape = CircleShape, color = BridgeNight.copy(alpha = .78f)) {
+                IconButton(if (failed) ({ retry(task.id) }) else ({ confirmCancel = true })) {
+                    Icon(if (failed) Icons.Default.Refresh else Icons.Default.Close, if (failed) "重试下载" else "取消下载", tint = BridgeWhite, modifier = Modifier.size(18.dp))
+                }
+            }
+            Box(Modifier.fillMaxSize().padding(bottom = 72.dp), contentAlignment = Alignment.Center) {
+                Box(contentAlignment = Alignment.Center) {
+                    if (total <= 0 && task.status == DownloadTaskStatus.DOWNLOADING) CircularProgressIndicator(modifier = Modifier.size(76.dp), strokeWidth = 6.dp, color = BridgeEmber, trackColor = BridgeWhite.copy(alpha = .2f))
+                    else CircularProgressIndicator(progress = { progress }, modifier = Modifier.size(76.dp), strokeWidth = 6.dp, color = if (failed) Color(0xFFE57373) else BridgeEmber, trackColor = BridgeWhite.copy(alpha = .2f))
+                    if (cancelling) CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp, color = BridgeWhite)
+                    else if (failed) Icon(Icons.Default.ErrorOutline, null, tint = BridgeWhite, modifier = Modifier.size(27.dp))
+                    else Text(if (task.status == DownloadTaskStatus.QUEUED) "等待" else "$percent%", color = BridgeWhite, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                }
+            }
+            Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(horizontal = 10.dp, vertical = 9.dp)) {
+                Text(task.asset.name, color = BridgeWhite, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                Text(if (task.status == DownloadTaskStatus.QUEUED) if (total > 0) "文件大小 ${total.prettySize()}" else "文件大小未知" else if (total > 0) "${done.prettySize()} / ${total.prettySize()}" else "已传 ${done.prettySize()} · 总大小未知", color = BridgeWhite.copy(alpha = .78f), style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                if (!failed && task.status != DownloadTaskStatus.QUEUED) Text(if (total > 0) "剩余 ${remaining.prettySize()} · ${formatRemainingTime(task.remainingSeconds)}" else "正在计算剩余大小与时间", color = BridgeWhite.copy(alpha = .58f), style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                else if (failed) Text(task.errorMessage ?: "点击右上角重试", color = Color(0xFFFFB2B2), style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
     }
     if (confirmCancel) AlertDialog(
@@ -2110,22 +2154,32 @@ private fun PreferenceSwitch(title: String, subtitle: String, checked: Boolean, 
 @Composable
 private fun PhotoDownloadOverlay(task: DownloadTask, cancel: (String) -> Unit) {
     val total = task.totalBytes.coerceAtLeast(0)
-    val done = task.downloadedBytes.coerceIn(0, total)
+    val done = normalizedDownloadBytes(task.downloadedBytes, total)
+    val remaining = (total - done).coerceAtLeast(0)
     val progress = if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else 0f
     val failed = task.status == DownloadTaskStatus.FAILED
     val cancelling = task.status == DownloadTaskStatus.CANCELLING
+    val percent = (progress * 100).roundToInt()
     var confirmCancel by remember(task.id) { mutableStateOf(false) }
-    Box(Modifier.fillMaxSize().background(BridgeNight.copy(alpha = if (failed) .48f else .32f)), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator(progress = progress, Modifier.size(96.dp), strokeWidth = 6.dp, color = if (failed) Color(0xFFE57373) else BridgeEmber, trackColor = BridgeWhite.copy(alpha = .18f))
-            Column(Modifier.offset(y = (-78).dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                if (failed) Text("下载失败", color = BridgeWhite, fontWeight = FontWeight.Bold)
-                else if (cancelling) Text("正在取消…", color = BridgeWhite, fontWeight = FontWeight.Bold)
-                else if (task.status == DownloadTaskStatus.QUEUED) { Text("等待下载", color = BridgeWhite, fontWeight = FontWeight.Bold); Text("大小 ${total.prettySize()}", color = BridgeWhite.copy(alpha = .78f), style = MaterialTheme.typography.labelSmall) }
-                else { Text("已下载 ${done.prettySize()}", color = BridgeWhite, style = MaterialTheme.typography.labelSmall); Text("剩余 ${(total - done).coerceAtLeast(0).prettySize()}", color = BridgeWhite, style = MaterialTheme.typography.labelSmall); Text("预计 ${formatRemainingTime(task.remainingSeconds)}", color = BridgeWhite, style = MaterialTheme.typography.labelSmall) }
+    Box(Modifier.fillMaxSize().background(BridgeNight.copy(alpha = if (failed) .68f else .52f))) {
+        if (!failed && !cancelling) Surface(Modifier.align(Alignment.TopEnd).padding(6.dp).size(40.dp), shape = CircleShape, color = BridgeNight.copy(alpha = .76f)) {
+            IconButton({ confirmCancel = true }) { Icon(Icons.Default.Close, "取消下载", tint = BridgeWhite, modifier = Modifier.size(17.dp)) }
+        }
+        Column(Modifier.align(Alignment.Center).padding(horizontal = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(contentAlignment = Alignment.Center) {
+                if (total <= 0 && task.status == DownloadTaskStatus.DOWNLOADING) CircularProgressIndicator(modifier = Modifier.size(70.dp), strokeWidth = 5.dp, color = BridgeEmber, trackColor = BridgeWhite.copy(alpha = .2f))
+                else CircularProgressIndicator(progress = { progress }, modifier = Modifier.size(70.dp), strokeWidth = 5.dp, color = if (failed) Color(0xFFE57373) else BridgeEmber, trackColor = BridgeWhite.copy(alpha = .2f))
+                when {
+                    cancelling -> CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = BridgeWhite)
+                    failed -> Icon(Icons.Default.ErrorOutline, null, tint = BridgeWhite, modifier = Modifier.size(25.dp))
+                    task.status == DownloadTaskStatus.QUEUED -> Text("等待", color = BridgeWhite, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+                    else -> Text("$percent%", color = BridgeWhite, fontWeight = FontWeight.Bold)
                 }
-                if (!failed && !cancelling) TextButton({ confirmCancel = true }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) { Text("取消下载", color = BridgeWhite, style = MaterialTheme.typography.labelSmall) }
             }
+            Spacer(Modifier.height(7.dp))
+            Text(when { failed -> "下载失败 · 前往下载页重试"; cancelling -> "正在取消"; task.status == DownloadTaskStatus.QUEUED -> if (total > 0) total.prettySize() else "等待下载"; total > 0 -> "${done.prettySize()} / ${total.prettySize()}"; else -> "已传 ${done.prettySize()}" }, color = BridgeWhite, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+            if (!failed && task.status == DownloadTaskStatus.DOWNLOADING && total > 0) Text("剩余 ${remaining.prettySize()} · ${formatRemainingTime(task.remainingSeconds)}", color = BridgeWhite.copy(alpha = .72f), style = MaterialTheme.typography.labelSmall, maxLines = 1)
+        }
     }
     if (confirmCancel) AlertDialog(
         onDismissRequest = { confirmCancel = false },
@@ -2259,7 +2313,7 @@ private fun VideoPreviewDialog(vm: MainViewModel, row: DownloadRecord, luts: Lis
                 Icon(Icons.Default.ErrorOutline, null, tint = BridgeEmber, modifier = Modifier.size(42.dp))
                 Spacer(Modifier.height(12.dp))
                 Text("当前设备无法播放此视频", color = BridgeWhite)
-                TextButton({ try { context.startActivity(Intent(Intent.ACTION_VIEW).apply { data = Uri.parse(row.uri); type = context.contentResolver.getType(Uri.parse(row.uri)) ?: "video/*"; addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }) } catch (_: Exception) { android.widget.Toast.makeText(context, "未找到可播放此视频的应用", android.widget.Toast.LENGTH_SHORT).show() } }) { Text("使用其他应用打开", color = BridgeEmber) }
+                TextButton({ try { val uri = Uri.parse(row.uri); context.startActivity(Intent(Intent.ACTION_VIEW).apply { setDataAndType(uri, context.contentResolver.getType(uri) ?: "video/*"); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }) } catch (_: Exception) { android.widget.Toast.makeText(context, "未找到可播放此视频的应用", android.widget.Toast.LENGTH_SHORT).show() } }) { Text("使用其他应用打开", color = BridgeEmber) }
             }
 
             AnimatedVisibility(controlsVisible || exporting, Modifier.align(Alignment.TopCenter), enter = fadeIn(), exit = fadeOut()) {

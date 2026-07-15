@@ -2,9 +2,9 @@
 
 package com.yaoyihan.nikonconnect.lighting
 
-import android.app.Activity
 import android.graphics.Color as AndroidColor
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -122,7 +122,7 @@ fun LightCanvasScreen(onBack: () -> Unit, onPlay: (LightScene) -> Unit) {
     var hint by remember { mutableStateOf<String?>(null) }
     var showLayoutConfirm by remember { mutableStateOf(false) }
     var pendingLayout by remember { mutableStateOf<LightNode?>(null) }
-    val activity = context as? Activity
+    val activity = LocalActivity.current
     val controller = remember(activity) { activity?.let(::ScreenLightController) }
     val selectedLeaf = scene.rootNode.findLeaf(selectedId)
 
@@ -583,7 +583,7 @@ private fun DrawScope.drawEditorOverlay(layout: LightLayout, selectedId: String?
 
 @Composable
 fun LightPlaybackScreen(scene: LightScene, onExit: () -> Unit) {
-    val activity = LocalContext.current as? Activity
+    val activity = LocalActivity.current
     val controller = remember(activity) { activity?.let(::ScreenLightController) }
     var showHint by remember { mutableStateOf(true) }
     LaunchedEffect(Unit) { delay(2300); showHint = false }

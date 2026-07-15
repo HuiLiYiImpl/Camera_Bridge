@@ -105,15 +105,27 @@ data class DownloadTask(
 
 enum class EnqueueDownloadResult { CREATED, ALREADY_EXISTS }
 
+private fun CameraSession?.downloadSourceId(): String = this?.let {
+    "${it.transport.name}:${it.details.serialNumber?.takeIf(String::isNotBlank) ?: it.name}"
+}.orEmpty()
+
 fun PhotoAsset.downloadSourceKey(session: CameraSession?): String =
-    "${session?.name.orEmpty()}|${handle}|$name|$size"
+    "${session.downloadSourceId()}|${handle}|$name|$size"
+
+fun DownloadTask.belongsTo(session: CameraSession?): Boolean = id.startsWith("${session.downloadSourceId()}|")
 
 fun downloadProgress(done: Long, callbackTotal: Long, assetSize: Long): Pair<Long, Float> {
     val total = (if (callbackTotal > 0) callbackTotal else assetSize).coerceAtLeast(0)
-    val downloaded = done.coerceIn(0, total)
+    val downloaded = normalizedDownloadBytes(done, total)
     val progress = if (total > 0) (downloaded.toDouble() / total).toFloat().coerceIn(0f, 1f) else 0f
     return total to progress
 }
+
+fun normalizedDownloadBytes(done: Long, total: Long): Long =
+    if (total > 0) done.coerceIn(0, total) else done.coerceAtLeast(0)
+
+fun isUserDownloadCancellation(error: Throwable, requested: Boolean): Boolean =
+    requested || error is DownloadCancelledException
 
 fun formatRemainingTime(seconds: Long?): String = seconds?.takeIf { it >= 0 }?.let {
     if (it >= 3600) "%d:%02d:%02d".format(it / 3600, (it % 3600) / 60, it % 60)
@@ -194,6 +206,14 @@ class AppStore(context: Context) {
         val array = JSONArray()
         rows.forEach { array.put(JSONObject().put("name", it.name).put("size", it.size).put("uri", it.uri).put("time", it.completedAt)) }
         prefs.edit().putString("downloads", array.toString()).apply()
+    }
+
+    fun setDownloadWorkerActive(active: Boolean) {
+        prefs.edit().putBoolean("download_worker_active", active).commit()
+    }
+
+    fun consumeInterruptedDownload(): Boolean = prefs.getBoolean("download_worker_active", false).also { interrupted ->
+        if (interrupted) prefs.edit().putBoolean("download_worker_active", false).apply()
     }
 
     fun luts(): List<LutEntry> = runCatching {

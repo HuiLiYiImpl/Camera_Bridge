@@ -6,6 +6,7 @@ import android.content.BroadcastReceiver
 import android.content.ContentValues
 import android.content.Context
 import android.content.IntentFilter
+import android.content.ContentUris
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.hardware.usb.UsbConstants
@@ -20,6 +21,7 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Environment
 import android.os.SystemClock
+import android.os.StatFs
 import android.provider.MediaStore
 import android.media.MediaMetadataRetriever
 import androidx.compose.runtime.mutableStateMapOf
@@ -119,6 +121,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     init {
         registerUsbReceiver()
         logDiagnostic("APP_STARTED", "APP_READY", message = "Camera Bridge started")
+        if (store.consumeInterruptedDownload()) pageTask.value = PageTask("上次下载因应用关闭而中断，请重新连接原相机后创建任务", running = false, failed = true)
+        viewModelScope.launch(Dispatchers.IO) { cleanupInterruptedFiles() }
         detectUsbCamera()
     }
 
@@ -297,9 +301,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleUsbDisconnect() {
+        val disconnectedClient = client
+        client = null
+        usbConnectJob?.cancel()
         if (session.value?.transport == ConnectionTransport.USB) {
             photoLoadJob?.cancel()
-            client?.close(); client = null
             logDiagnostic("MTP_SESSION_LOST", "MTP_SESSION_LOST", ConnectionTransport.USB, level = "ERROR", result = "DISCONNECTED", message = "MTP session lost", device = usbDevice, permissionGranted = false)
             diagnostics.recordUsbConnectionState(false, diagnosticUsbSnapshot(usbDevice, false, false))
             session.value = null
@@ -308,6 +314,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         usbDevice = null
         usbState.value = UsbConnectionState(message = "USB 相机已断开，请重新连接数据线")
+        // MTP close waits for any native import holding UsbMtpClient's I/O lock; never block
+        // the main-thread USB broadcast while a large transfer drains.
+        if (disconnectedClient != null) viewModelScope.launch(Dispatchers.IO) { disconnectedClient.close() }
     }
 
     private fun registerUsbReceiver() {
@@ -317,8 +326,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
         val app = getApplication<Application>()
-        if (Build.VERSION.SDK_INT >= 33) app.registerReceiver(usbReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        else @Suppress("DEPRECATION") { app.registerReceiver(usbReceiver, filter) }
+        ContextCompat.registerReceiver(app, usbReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
     }
 
     private fun usbPermissionIntent(): PendingIntent {
@@ -383,7 +391,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun checkConnectionOnResume() = viewModelScope.launch {
-        val current = session.value ?: return@launch
+        val current = session.value ?: run {
+            detectUsbCamera()
+            return@launch
+        }
         val network = cameraNetwork()
         val active = client
         val connected = active != null && withContext(Dispatchers.IO) {
@@ -823,6 +834,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
     fun exportEditedVideo(
         record: DownloadRecord,
         lut: CubeLut?,
@@ -835,14 +847,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         require(getApplication<Application>().mediaKind(record) == MediaKind.VIDEO) { "只能导出视频文件" }
         isBusy.value = true
         workflow.value = Workflow.DOWNLOADING
-        val temp = java.io.File.createTempFile("camera_bridge_video_", ".mp4", getApplication<Application>().cacheDir)
-        logDiagnostic("VIDEO_EXPORT_STARTED", "VIDEO_EXPORT", message = "Hardware export started: ${record.name}")
-        updateVideoExportNotif(record.name, 0)
+        val app = getApplication<Application>()
+        val tempDirectory = app.externalCacheDir ?: app.cacheDir
+        var temp: java.io.File? = null
         val result = runCatching {
+            requireVideoExportSpace(tempDirectory, record.size.coerceAtLeast(256L * 1024 * 1024) + 256L * 1024 * 1024, "生成视频")
+            val outputFile = java.io.File.createTempFile("camera_bridge_video_", ".mp4", tempDirectory).also { temp = it }
+            logDiagnostic("VIDEO_EXPORT_STARTED", "VIDEO_EXPORT", message = "Hardware export started: ${record.name}")
+            updateVideoExportNotif(record.name, 0)
             VideoLutExporter.export(
                 context = getApplication(),
                 input = Uri.parse(record.uri),
-                output = temp,
+                output = outputFile,
                 lut = lut,
                 intensity = lutIntensity,
                 clockwiseQuarterTurns = clockwiseQuarterTurns,
@@ -850,9 +866,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 onProgress(progress)
                 updateVideoExportNotif(record.name, progress)
             }
-            withContext(Dispatchers.IO) { saveExportedVideo(record, temp, suffix) }
+            requireVideoExportSpace(Environment.getExternalStorageDirectory(), outputFile.length() + 128L * 1024 * 1024, "保存到相册")
+            withContext(Dispatchers.IO) { saveExportedVideo(record, outputFile, suffix) }
         }
-        temp.delete()
+        temp?.delete()
         result.onSuccess { output ->
             store.addDownload(output)
             downloads.value = store.downloads()
@@ -866,6 +883,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         clearExportNotif()
         isBusy.value = false
         onFinished(result)
+    }
+
+    private fun requireVideoExportSpace(directory: java.io.File, requiredBytes: Long, stage: String) {
+        val available = StatFs(directory.absolutePath).availableBytes
+        require(available >= requiredBytes) { "${stage}所需空间不足：至少需要 ${requiredBytes.prettySize()}，当前可用 ${available.prettySize()}" }
+    }
+
+    private fun cleanupInterruptedFiles() {
+        val app = getApplication<Application>()
+        listOfNotNull(app.cacheDir, app.externalCacheDir).distinctBy { it.absolutePath }.forEach { directory ->
+            directory.listFiles { file -> file.name.startsWith("camera_bridge_video_") && file.extension == "mp4" }
+                ?.forEach { it.delete() }
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val resolver = app.contentResolver
+        val pendingFolders = listOf(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_PICTURES}/Camera_Bridge/",
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_MOVIES}/Camera_Bridge/",
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_DOWNLOADS}/Camera_Bridge/",
+        )
+        pendingFolders.forEach { (collection, folder) ->
+            val ids = mutableListOf<Long>()
+            runCatching {
+                resolver.query(
+                    collection,
+                    arrayOf(MediaStore.MediaColumns._ID),
+                    "${MediaStore.MediaColumns.IS_PENDING}=1 AND ${MediaStore.MediaColumns.OWNER_PACKAGE_NAME}=? AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?",
+                    arrayOf(app.packageName, folder),
+                    null,
+                )?.use { cursor -> while (cursor.moveToNext()) ids += cursor.getLong(0) }
+            }
+            ids.forEach { id -> runCatching { resolver.delete(ContentUris.withAppendedId(collection, id), null, null) } }
+        }
     }
 
     private fun launchEditedExport(
@@ -1117,12 +1167,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun processDownloadQueue() {
+        store.setDownloadWorkerActive(true)
         isBusy.value = true
         workflow.value = Workflow.DOWNLOADING
         while (true) {
-            val task = synchronized(downloadLock) { _downloadTasks.value.firstOrNull { it.status == DownloadTaskStatus.QUEUED } } ?: break
-            _downloadTasks.update { tasks -> tasks.map { if (it.id == task.id) it.copy(status = DownloadTaskStatus.DOWNLOADING) else it } }
+            val task = synchronized(downloadLock) {
+                val queued = _downloadTasks.value.firstOrNull { it.status == DownloadTaskStatus.QUEUED } ?: return@synchronized null
+                _downloadTasks.value = _downloadTasks.value.map { if (it.id == queued.id) it.copy(status = DownloadTaskStatus.DOWNLOADING) else it }
+                queued
+            } ?: break
             val result = runCatching {
+                require(task.belongsTo(session.value)) { "请连接创建任务时的原相机后重试" }
                 val active = client ?: error("相机连接已断开")
                 withContext(Dispatchers.IO) {
                     var lastAt = SystemClock.elapsedRealtime()
@@ -1133,7 +1188,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         active.downloadTo(task.asset, stream, { done, callbackTotal ->
                             val now = SystemClock.elapsedRealtime()
                             val (total, _) = downloadProgress(done, callbackTotal, task.asset.size)
-                            val normalizedDone = done.coerceIn(0, total)
+                            val normalizedDone = normalizedDownloadBytes(done, total)
                             val elapsed = now - lastAt
                             if (elapsed > 0 && normalizedDone >= lastDone) {
                                 val speed = (normalizedDone - lastDone) * 1000.0 / elapsed
@@ -1169,22 +1224,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 clearDownloadNotif()
             }.onFailure { error ->
-                if (error is CancellationException) {
+                val cancelRequested = synchronized(downloadLock) { cancelledDownloadIds.remove(task.id) }
+                if (isUserDownloadCancellation(error, cancelRequested)) {
                     logDiagnostic("DOWNLOAD_CANCEL_DRAIN_COMPLETED", "DOWNLOAD", session.value?.transport, result = "DRAINED", message = "taskId=${task.id} ${task.asset.name}")
-                    synchronized(downloadLock) { cancelledDownloadIds.remove(task.id) }
                     _downloadTasks.update { it.filterNot { taskItem -> taskItem.id == task.id } }
                     logDiagnostic("DOWNLOAD_CANCELLED", "DOWNLOAD", session.value?.transport, result = "CANCELLED", message = "taskId=${task.id} ${task.asset.name}")
                     showSnackbar("已取消下载")
                     clearDownloadNotif()
+                } else if (error is CancellationException) {
+                    clearDownloadNotif()
+                    throw error
                 } else {
-                _downloadTasks.update { tasks -> tasks.map { if (it.id == task.id) it.copy(status = DownloadTaskStatus.FAILED, errorMessage = error.message ?: "未知错误") else it } }
-                showSnackbar("下载失败：${error.message ?: "未知错误"}")
-                clearDownloadNotif()
+                    _downloadTasks.update { tasks -> tasks.map { if (it.id == task.id) it.copy(status = DownloadTaskStatus.FAILED, errorMessage = error.message ?: "未知错误") else it } }
+                    showSnackbar("下载失败：${error.message ?: "未知错误"}")
+                    clearDownloadNotif()
                 }
             }
         }
+        store.setDownloadWorkerActive(false)
         isBusy.value = false
-        workflow.value = Workflow.CONNECTED
+        workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
     }
 
     fun downloadAll(assets: List<PhotoAsset>): Job = viewModelScope.launch {
@@ -1220,33 +1279,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val mime = when (extension) { "jpg", "jpeg" -> "image/jpeg"; "png" -> "image/png"; "mov" -> "video/quicktime"; "mp4" -> "video/mp4"; "m4v" -> "video/x-m4v"; "3gp" -> "video/3gpp"; else -> "application/octet-stream" }
         val isVideo = mime.startsWith("video/")
         val isImage = mime.startsWith("image/")
+        val scopedStorage = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
         val collection = when {
             exportToGallery && isImage -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
             exportToGallery && isVideo -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-            else -> MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            scopedStorage -> MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            else -> MediaStore.Files.getContentUri("external")
         }
         val folder = when {
             exportToGallery && isImage -> "${Environment.DIRECTORY_PICTURES}/Camera_Bridge"
             exportToGallery && isVideo -> "${Environment.DIRECTORY_MOVIES}/Camera_Bridge"
             else -> "${Environment.DIRECTORY_DOWNLOADS}/Camera_Bridge"
         }
-        val displayName = uniqueDisplayName(resolver, collection, folder, asset.name)
-        val values = ContentValues().apply { put(MediaStore.MediaColumns.DISPLAY_NAME, displayName); put(MediaStore.MediaColumns.MIME_TYPE, mime); put(MediaStore.MediaColumns.RELATIVE_PATH, folder); put(MediaStore.MediaColumns.IS_PENDING, 1) }
+        val displayName = uniqueDisplayName(resolver, collection, folder.takeIf { scopedStorage }, asset.name)
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+            put(MediaStore.MediaColumns.MIME_TYPE, mime)
+            if (scopedStorage) { put(MediaStore.MediaColumns.RELATIVE_PATH, folder); put(MediaStore.MediaColumns.IS_PENDING, 1) }
+        }
         val uri = requireNotNull(resolver.insert(collection, values)) { "无法创建保存文件" }
         var size = 0L
         try {
             resolver.openOutputStream(uri)?.use { size = write(it) } ?: error("无法写入系统相册")
             afterWrite?.invoke(uri)
             if (size <= 0L) size = resolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
-            values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING, 0); resolver.update(uri, values, null, null)
+            if (scopedStorage) { values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING, 0); resolver.update(uri, values, null, null) }
         } catch (e: Exception) { resolver.delete(uri, null, null); throw e }
         return DownloadRecord(displayName, size, uri.toString(), Date().time)
     }
 
-    private fun uniqueDisplayName(resolver: android.content.ContentResolver, collection: Uri, folder: String, requested: String): String {
+    private fun uniqueDisplayName(resolver: android.content.ContentResolver, collection: Uri, folder: String?, requested: String): String {
         val existing = buildSet {
             runCatching {
-                resolver.query(collection, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), "${MediaStore.MediaColumns.RELATIVE_PATH} = ?", arrayOf(folder), null)?.use { cursor ->
+                resolver.query(collection, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), folder?.let { "${MediaStore.MediaColumns.RELATIVE_PATH} = ?" }, folder?.let { arrayOf(it) }, null)?.use { cursor ->
                     val index = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
                     while (index >= 0 && cursor.moveToNext()) add(cursor.getString(index))
                 }
@@ -1329,12 +1394,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun updateDownloadNotif(name: String, done: Long, total: Long) {
         val app = getApplication<Application>()
-        val percent = if (total > 0) (done * 100 / total).toInt() else 0
+        val determinate = total > 0
+        val percent = if (determinate) (done * 100 / total).toInt().coerceIn(0, 100) else 0
         val notif = androidx.core.app.NotificationCompat.Builder(app, "camera_connection")
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("正在下载 $name")
-            .setContentText("${done.prettySize()} / ${total.prettySize()} · $percent%")
-            .setProgress(100, percent, false)
+            .setContentText(if (determinate) "${done.prettySize()} / ${total.prettySize()} · $percent%" else "已传 ${done.prettySize()} · 总大小未知")
+            .setProgress(100, percent, !determinate)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()

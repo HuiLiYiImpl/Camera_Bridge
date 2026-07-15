@@ -20,7 +20,8 @@ object LutBinaryCodec {
     }
 
     fun read(name: String, input: InputStream): CubeLut = DataInputStream(input).use { source ->
-        require(source.readNBytes(4).contentEquals(Magic)) { "LUT 内部文件头错误" }
+        val magic = ByteArray(Magic.size).also(source::readFully)
+        require(magic.contentEquals(Magic)) { "LUT 内部文件头错误" }
         require(source.readInt() == Version) { "不支持的 LUT 内部版本" }
         val size = source.readInt()
         require(size in 2..65) { "不支持的 LUT 尺寸" }

@@ -12,6 +12,7 @@ import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.InAppFragmentedMp4Muxer
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import com.yaoyihan.nikonconnect.CubeLut
@@ -70,6 +71,9 @@ object VideoLutExporter {
                 .setEffects(Effects(emptyList(), videoEffects))
                 .build()
             val transformer = Transformer.Builder(context.applicationContext)
+                // The regular MP4 muxer retains sample metadata for the whole file. Fragmenting
+                // bounds muxer memory to one short fragment, which keeps multi-GB exports stable.
+                .setMuxerFactory(InAppFragmentedMp4Muxer.Factory())
                 .addListener(listener)
                 .build()
             continuation.invokeOnCancellation {
