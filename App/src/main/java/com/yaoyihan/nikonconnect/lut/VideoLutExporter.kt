@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.Uri
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.audio.ToInt16PcmAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.ScaleAndRotateTransformation
 import androidx.media3.effect.SingleColorLut
@@ -68,12 +70,15 @@ object VideoLutExporter {
                 }
             }
             val edited = EditedMediaItem.Builder(MediaItem.fromUri(input))
-                .setEffects(Effects(emptyList(), videoEffects))
+                // Nikon Z f records 24-bit PCM (encoding 21); Transformer's audio graph
+                // requires item audio effects to output 16-bit PCM before AAC encoding.
+                .setEffects(Effects(listOf(ToInt16PcmAudioProcessor()), videoEffects))
                 .build()
             val transformer = Transformer.Builder(context.applicationContext)
                 // Android's MediaMuxer streams encoded samples and writes a standard MP4 index,
                 // avoiding both whole-file buffering and the zero-duration fragmented MP4 issue.
                 .setMuxerFactory(FrameworkMuxer.Factory())
+                .setAudioMimeType(MimeTypes.AUDIO_AAC)
                 .addListener(listener)
                 .build()
             continuation.invokeOnCancellation {

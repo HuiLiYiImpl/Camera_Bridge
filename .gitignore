@@ -11,3 +11,6 @@ analysis/
 
 # ZCode AI agent artifacts
 .zcode/
+
+# Screenshots & test output
+output/
