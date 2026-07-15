@@ -1330,7 +1330,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val output = asset.copy(name = "${asset.name.substringBeforeLast('.')}_${lutName.replace(Regex("[^A-Za-z0-9_-]"), "_")}.jpg")
         return saveToMediaStore(output, true) { stream ->
             require(bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)) { "无法编码 JPG" }
-            output.size
+            0L
         }
     }
 
@@ -1352,7 +1352,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             format = 0x300C,
         )
         return saveToMediaStore(output, true) { stream ->
-            file.inputStream().use { it.copyTo(stream) }
+            file.inputStream().use { it.copyTo(stream, 1024 * 1024) }
         }
     }
 

@@ -12,6 +12,7 @@
 - A4：用 1,197,017,687 字节（1.11 GiB）、60 秒、H.264 + AAC 的合成视频执行 LUT 导出成功；应用进程存活且日志无 OOM、Transformer、Muxer 或未处理异常。
 - A5（可自动化部分）：下载页空态在系统字体 100% 与 130% 下不越界，底部五项导航完整。
 - A6：修复后重复图片/视频 LUT 流程，期间新增崩溃为 0，应用错误扫描为空。
+- USB 冷启动静态与生命周期检查：编译后 APK 保留 `USB_DEVICE_ATTACHED`、设备过滤元数据、导出的 `singleTop` MainActivity；强制停止进程后携带 USB action 冷启动 MainActivity 成功，应用恢复到前台且无新增崩溃。真实设备匹配、系统选择框与 MTP 权限仍归 B1–B3。
 
 ## 导出文件核验
 
@@ -25,6 +26,7 @@
 2. `sampler3D` 未声明精度，API 36 严格编译器拒绝编译。图片和视频 Shader 现使用 `highp sampler3D`。
 3. GPU 初始化失败原本直接杀进程。现在记录明确错误并安全退出渲染初始化。
 4. 分片 MP4 虽可由 ffprobe 播放，但 Android MediaStore/MediaPlayer 将时长识别为 0。导出改为流式 `FrameworkMuxer`，生成标准 MP4 索引且不缓存整段视频字节。
+5. LUT 图片下载记录误用了原图大小，现由 MediaStore 回读实际导出大小；视频临时文件写入相册改用 1 MiB 缓冲，减少大文件最终保存阶段的系统调用。
 
 ## 仍需 Nikon Zf 真机完成
 
