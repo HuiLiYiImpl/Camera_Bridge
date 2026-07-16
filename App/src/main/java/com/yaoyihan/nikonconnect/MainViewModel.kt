@@ -23,6 +23,7 @@ import android.os.Environment
 import android.os.SystemClock
 import android.os.StatFs
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.media.MediaMetadataRetriever
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.lifecycle.AndroidViewModel
@@ -82,7 +83,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var pageRetry: (() -> Unit)? = null
     private var photoLoadJob: Job? = null
     private var usbConnectJob: Job? = null
-    private val pageSize = 30
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: android.content.Intent) {
             when (intent.action) {
@@ -349,7 +349,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateConfig(transform: (CameraConfig) -> CameraConfig) {
-        config.update(transform); store.save(config.value)
+        config.update {
+            transform(it).let { updated ->
+                updated.copy(
+                    initialPhotoBatchSize = updated.initialPhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
+                    loadMorePhotoBatchSize = updated.loadMorePhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
+                )
+            }
+        }
+        store.save(config.value)
     }
 
     fun markLutUsed(entry: LutEntry) {
@@ -388,6 +396,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             logDiagnostic("USB_RECONNECT_ATTEMPT", "USB_RECONNECT", ConnectionTransport.USB, result = "STARTED", message = "Retrying USB camera connection", device = usbDevice)
             connectUsb()
         } else connect(false)
+    }
+
+    fun dismissError() {
+        if (workflow.value != Workflow.ERROR) return
+        noticeClearJob?.cancel()
+        notice.value = null
+        workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
     }
 
     fun checkConnectionOnResume() = viewModelScope.launch {
@@ -482,13 +497,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (photoLoadJob?.isActive == true) return
         photoLoadJob = viewModelScope.launch {
             val active = client ?: run { showError("请先连接相机"); return@launch }
-            isBusy.value = true; workflow.value = Workflow.LOADING; hasLoadedPhotos.value = false; notice.value = "正在读取相册（首批 30 张）"
+            val batchSize = config.value.initialPhotoBatchSize
+            isBusy.value = true; workflow.value = Workflow.LOADING; hasLoadedPhotos.value = false; notice.value = "正在读取相册（首批 ${batchSize} 张）"
             val startedAt = System.currentTimeMillis()
             logDiagnostic("ASSET_LIST_STARTED", "ASSET_LIST", session.value?.transport, message = "Reading first asset page")
             runCatching {
                 withContext(Dispatchers.IO) {
                     active.refreshAssets()
-                    val result = active.assets(limit = pageSize)
+                    val result = active.assets(limit = batchSize)
                     val recent = result.firstOrNull { it.type !in setOf("MOV", "MP4") }?.let { asset ->
                         active.imageHeader(asset)?.let { header ->
                             asset to ExifMetadataReader.fromBytes(header, PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt))
@@ -536,7 +552,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val active = client ?: return@launch
         isBusy.value = true; notice.value = "正在加载更多"
         logDiagnostic("ASSET_LIST_STARTED", "ASSET_LIST", session.value?.transport, message = "Reading next asset page")
-        runCatching { withContext(Dispatchers.IO) { active.assets(photos.value.size, 15) } }
+        runCatching { withContext(Dispatchers.IO) { active.assets(photos.value.size, config.value.loadMorePhotoBatchSize) } }
             .onSuccess { page ->
                 val merged = photos.value + page
                 photos.value = merged
@@ -559,10 +575,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 withContext(Dispatchers.IO) {
                     val active = client ?: return@withContext null
                     val data = active.thumbnail(asset) ?: return@withContext null
-                    val orientation = resolveExifOrientation(
-                        OrientedBitmaps.orientationOrNull(data),
-                        active.imageHeader(asset)?.let(OrientedBitmaps::orientationOrNull),
-                    )
+                    val orientation = OrientedBitmaps.orientationOrNull(data)
+                        ?: active.imageHeader(asset)?.let(OrientedBitmaps::orientationOrNull)
+                        ?: android.media.ExifInterface.ORIENTATION_NORMAL
                     OrientedBitmaps.decode(data, orientation)
                 }
             }
@@ -613,12 +628,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ).also { if (it !== oriented) oriented.recycle() }
     }
 
-    fun importLut(uri: Uri) = viewModelScope.launch {
+    fun importLut(uri: Uri, onFinished: () -> Unit = {}) = viewModelScope.launch {
         runCatching {
             withContext(Dispatchers.IO) {
                 val app = getApplication<Application>()
-                val sourceName = uri.lastPathSegment ?: "LUT"
-                val bytes = app.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: error("无法读取 LUT 文件")
+                val resolver = app.contentResolver
+                val sourceName = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    cursor.takeIf { it.moveToFirst() }?.getString(0)
+                }?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "LUT"
+                val bytes = resolver.openInputStream(uri)?.use { it.readBytes() } ?: error("无法读取 LUT 文件")
                 val imported = LutImporters.parse(sourceName, bytes)
                 val lut = imported.lut
                 val id = "${System.currentTimeMillis()}_${lut.name.replace(Regex("[^A-Za-z0-9_-]"), "_")}.${imported.format.lowercase()}"
@@ -640,6 +658,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             store.saveLuts(luts.value)
             showSnackbar("已导入 LUT：${entry.name}")
         }.onFailure { showError(it.message ?: "导入 LUT 失败") }
+        onFinished()
     }
 
     suspend fun readLut(entry: LutEntry): CubeLut = withContext(Dispatchers.IO) {

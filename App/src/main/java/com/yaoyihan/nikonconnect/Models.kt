@@ -24,6 +24,9 @@ enum class AppColorTheme(val title: String, val subtitle: String) {
     DEEP_BLUE("深海蓝", "现代科技"),
 }
 
+const val MIN_PHOTO_BATCH_SIZE = 5
+const val MAX_PHOTO_BATCH_SIZE = 200
+
 data class CameraConfig(
     val host: String = "192.168.1.1",
     val port: Int = 15740,
@@ -39,6 +42,8 @@ data class CameraConfig(
     val fileNamingRule: String = "原文件名_编辑类型",
     val thumbnailCacheEnabled: Boolean = true,
     val colorTheme: AppColorTheme = AppColorTheme.DARKROOM_ORANGE,
+    val initialPhotoBatchSize: Int = 30,
+    val loadMorePhotoBatchSize: Int = 15,
 )
 
 data class CameraSession(
@@ -170,6 +175,8 @@ class AppStore(context: Context) {
         prefs.getString("file_naming_rule", "原文件名_编辑类型") ?: "原文件名_编辑类型",
         prefs.getBoolean("thumbnail_cache_enabled", true),
         prefs.getString("color_theme", AppColorTheme.DARKROOM_ORANGE.name)?.let { runCatching { AppColorTheme.valueOf(it) }.getOrDefault(AppColorTheme.DARKROOM_ORANGE) } ?: AppColorTheme.DARKROOM_ORANGE,
+        prefs.getInt("initial_photo_batch_size", 30).coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
+        prefs.getInt("load_more_photo_batch_size", 15).coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
     )
 
     fun save(config: CameraConfig) = prefs.edit()
@@ -185,7 +192,10 @@ class AppStore(context: Context) {
         .putInt("jpeg_quality", config.jpegQuality)
         .putString("file_naming_rule", config.fileNamingRule)
         .putBoolean("thumbnail_cache_enabled", config.thumbnailCacheEnabled)
-        .putString("color_theme", config.colorTheme.name).apply()
+        .putString("color_theme", config.colorTheme.name)
+        .putInt("initial_photo_batch_size", config.initialPhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE))
+        .putInt("load_more_photo_batch_size", config.loadMorePhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE))
+        .apply()
 
     fun downloads(): List<DownloadRecord> = runCatching {
         val array = JSONArray(prefs.getString("downloads", "[]"))

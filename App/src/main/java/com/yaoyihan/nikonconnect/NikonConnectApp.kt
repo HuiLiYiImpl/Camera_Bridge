@@ -185,7 +185,12 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                 lightingOpen -> LightCanvasScreen(onBack = { lightingOpen = false }, onPlay = { playbackScene = it })
                 else -> Scaffold(
                     containerColor = BridgeNight,
-                    snackbarHost = { SnackbarHost(snackbarHostState) },
+                    snackbarHost = {
+                        SnackbarHost(
+                            snackbarHostState,
+                            Modifier.navigationBarsPadding().padding(start = 16.dp, end = 16.dp, bottom = 92.dp),
+                        ) { data -> BridgeSnackbar(data.visuals.message) }
+                    },
                     contentWindowInsets = WindowInsets(0, 0, 0, 0),
                 ) { contentPadding ->
                     Box(Modifier.fillMaxSize().padding(contentPadding)) {
@@ -197,6 +202,7 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                                 diagnostic.takeIf { workflow == Workflow.ERROR },
                                 { vm.exportDiagnostics { it.onSuccess { uri -> shareDiagnostic(context, uri) } } },
                                 { copyDiagnostic(context, vm.diagnosticCopyText()) },
+                                vm::dismissError,
                             )
                             AnimatedContent(tab, label = "tab", modifier = Modifier.weight(1f)) { screen ->
                                 when (screen) {
@@ -218,6 +224,26 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun BridgeSnackbar(message: String) {
+    val failed = message.contains("失败") || message.contains("错误")
+    Surface(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = BridgeElevated,
+        border = androidx.compose.foundation.BorderStroke(1.dp, if (failed) Color(0xFFE57373).copy(alpha = .45f) else BridgeWhite.copy(alpha = .14f)),
+        shadowElevation = 12.dp,
+    ) {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Surface(Modifier.size(32.dp), shape = CircleShape, color = if (failed) Color(0xFFE57373).copy(alpha = .16f) else BridgeEmber.copy(alpha = .16f)) {
+                Icon(if (failed) Icons.Default.ErrorOutline else Icons.Default.Check, null, Modifier.padding(7.dp), tint = if (failed) Color(0xFFE57373) else BridgeEmber)
+            }
+            Spacer(Modifier.width(12.dp))
+            Text(message, Modifier.weight(1f), color = BridgeWhite, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
         }
     }
 }
@@ -278,7 +304,7 @@ private fun BridgeNavigation(vm: MainViewModel, selected: Tab, select: (Tab) -> 
 }
 
 @Composable
-private fun ActivityPill(text: String, busy: Boolean, modifier: Modifier, retry: (() -> Unit)? = null, diagnostic: DiagnosticState? = null, exportDiagnostic: (() -> Unit)? = null, copyDiagnostic: (() -> Unit)? = null) {
+private fun ActivityPill(text: String, busy: Boolean, modifier: Modifier, retry: (() -> Unit)? = null, diagnostic: DiagnosticState? = null, exportDiagnostic: (() -> Unit)? = null, copyDiagnostic: (() -> Unit)? = null, dismiss: (() -> Unit)? = null) {
     Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp), color = if (busy) BridgeEmber.copy(alpha = .16f) else if (retry != null) Color(0xFFE57373).copy(alpha = .12f) else BridgeWhite.copy(alpha = .08f), border = androidx.compose.foundation.BorderStroke(1.dp, if (retry != null) Color(0xFFE57373).copy(alpha = .3f) else BridgeWhite.copy(alpha = .1f))) {
         Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -286,6 +312,7 @@ private fun ActivityPill(text: String, busy: Boolean, modifier: Modifier, retry:
                 Spacer(Modifier.width(8.dp))
                 Text(text, Modifier.weight(1f), color = BridgeWhite, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 if (retry != null) { TextButton(retry, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)) { Text("重试", color = Color(0xFFE57373), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold) } }
+                if (diagnostic != null) dismiss?.let { IconButton(it, Modifier.size(32.dp)) { Icon(Icons.Default.Close, "关闭错误提示", tint = BridgeWhite.copy(alpha = .65f), modifier = Modifier.size(18.dp)) } }
             }
             diagnostic?.diagnosticId?.let { id ->
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -308,7 +335,7 @@ private fun CameraScreen(vm: MainViewModel, state: Workflow, busy: Boolean, noti
     var mode by remember { mutableStateOf(ConnectionMode.CENTER) }
     var confirmDisconnect by remember { mutableStateOf(false) }
     if (session == null) when (mode) {
-        ConnectionMode.CENTER -> ConnectionCenter(config, state, notice, diagnostic, openSettings, { mode = ConnectionMode.WIFI }, { mode = ConnectionMode.USB }, openLighting, { vm.exportDiagnostics { it.onSuccess { uri -> shareDiagnostic(context, uri) } } }, { copyDiagnostic(context, vm.diagnosticCopyText()) })
+        ConnectionMode.CENTER -> ConnectionCenter(config, state, notice, diagnostic, openSettings, { mode = ConnectionMode.WIFI }, { mode = ConnectionMode.USB }, openLighting, { vm.exportDiagnostics { it.onSuccess { uri -> shareDiagnostic(context, uri) } } }, { copyDiagnostic(context, vm.diagnosticCopyText()) }, vm::dismissError)
         ConnectionMode.WIFI -> WifiConnectionFlow(config.brand, state, busy, notice, { mode = ConnectionMode.CENTER }, { brand -> vm.updateConfig { it.copy(brand = brand) } }, { vm.openWifiSettings() }, { vm.connect(true) })
         ConnectionMode.USB -> UsbConnectionFlow(vm, busy, { mode = ConnectionMode.CENTER })
     }
@@ -475,6 +502,7 @@ private fun ConnectionCenter(
     openLighting: () -> Unit,
     exportDiagnostic: () -> Unit,
     copyDiagnostic: () -> Unit,
+    dismissError: () -> Unit,
 ) {
     Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeWine, BridgeNight, BridgeDeep))).padding(start = 24.dp, end = 24.dp, top = 18.dp, bottom = 96.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -489,7 +517,7 @@ private fun ConnectionCenter(
         Spacer(Modifier.height(8.dp))
         Text("通过无线或 USB 导入照片", color = BridgeWhite.copy(alpha = .65f), style = MaterialTheme.typography.bodyMedium)
         if (state == Workflow.ERROR && (notice != null || diagnostic.diagnosticId != null)) {
-            DiagnosticErrorCard(notice ?: diagnostic.lastError ?: "连接失败", diagnostic, exportDiagnostic, copyDiagnostic)
+            DiagnosticErrorCard(notice ?: diagnostic.lastError ?: "连接失败", diagnostic, exportDiagnostic, copyDiagnostic, dismissError)
         }
         Spacer(Modifier.height(24.dp))
         ConnectionMethodCard("Wi‑Fi 连接", "连接相机热点，浏览相机相册", Icons.Default.Wifi, true, openWifi)
@@ -514,11 +542,14 @@ private fun ConnectionCenter(
 }
 
 @Composable
-private fun DiagnosticErrorCard(message: String, diagnostic: DiagnosticState, export: () -> Unit, copy: () -> Unit) {
+private fun DiagnosticErrorCard(message: String, diagnostic: DiagnosticState, export: () -> Unit, copy: () -> Unit, dismiss: () -> Unit) {
     Spacer(Modifier.height(16.dp))
     Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), color = Color(0xFFE57373).copy(alpha = .12f), border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE57373).copy(alpha = .35f))) {
         Column(Modifier.padding(15.dp)) {
-            Text(if (diagnostic.flapping) "USB 连接不稳定" else "连接失败", color = Color(0xFFFFA0A0), fontWeight = FontWeight.Bold)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(if (diagnostic.flapping) "USB 连接不稳定" else "连接失败", Modifier.weight(1f), color = Color(0xFFFFA0A0), fontWeight = FontWeight.Bold)
+                IconButton(dismiss, Modifier.size(32.dp)) { Icon(Icons.Default.Close, "关闭错误提示", tint = BridgeWhite.copy(alpha = .65f), modifier = Modifier.size(18.dp)) }
+            }
             Spacer(Modifier.height(5.dp))
             Text(message, color = BridgeWhite.copy(alpha = .82f), style = MaterialTheme.typography.bodySmall)
             diagnostic.diagnosticId?.let { Text("诊断编号：$it", Modifier.padding(top = 6.dp), color = BridgeWhite.copy(alpha = .62f), style = MaterialTheme.typography.labelSmall) }
@@ -932,14 +963,14 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
 }
 
 @Composable
-private fun AnimatedActivityPill(text: String?, busy: Boolean, retry: (() -> Unit)?, diagnostic: DiagnosticState?, exportDiagnostic: () -> Unit, copyDiagnostic: () -> Unit) {
+private fun AnimatedActivityPill(text: String?, busy: Boolean, retry: (() -> Unit)?, diagnostic: DiagnosticState?, exportDiagnostic: () -> Unit, copyDiagnostic: () -> Unit, dismiss: () -> Unit) {
     var shownText by remember { mutableStateOf(text) }
     LaunchedEffect(text) {
         if (text != null) shownText = text
         else { delay(180); shownText = null }
     }
     AnimatedVisibility(visible = text != null, enter = fadeIn(tween(220)) + expandVertically(tween(220), expandFrom = Alignment.Top) + slideInVertically(tween(220)) { -it / 3 }, exit = fadeOut(tween(180)) + shrinkVertically(tween(180), shrinkTowards = Alignment.Top) + slideOutVertically(tween(180)) { -it / 3 }) {
-        shownText?.let { ActivityPill(it, busy, Modifier.padding(horizontal = 20.dp, vertical = 10.dp), retry, diagnostic, exportDiagnostic, copyDiagnostic) }
+        shownText?.let { ActivityPill(it, busy, Modifier.padding(horizontal = 20.dp, vertical = 10.dp), retry, diagnostic, exportDiagnostic, copyDiagnostic, dismiss) }
     }
 }
 
@@ -1127,7 +1158,7 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
                     if (!editSheet) InlineStatusCard(inlineTask, dismissInline, retryInline)
                 }
 
-                 if (!downloadOnly && luts.isNotEmpty() && selectLut != null) LutSidePanel(luts, selectedLutEntry ?: luts.firstOrNull { it.name == lutName }, gpuIntensity, lutPanelExpanded, selectLut, setGpuIntensity, { lutPanelExpanded = !lutPanelExpanded }, Modifier.align(Alignment.CenterEnd).statusBarsPadding().navigationBarsPadding().padding(end = 12.dp, top = 84.dp, bottom = 132.dp))
+                 if (!downloadOnly && originalLoaded && luts.isNotEmpty() && selectLut != null) LutSidePanel(luts, selectedLutEntry ?: luts.firstOrNull { it.name == lutName }, gpuIntensity, lutPanelExpanded, selectLut, setGpuIntensity, { lutPanelExpanded = !lutPanelExpanded }, Modifier.align(Alignment.CenterEnd).statusBarsPadding().navigationBarsPadding().padding(end = 12.dp, top = 84.dp, bottom = 132.dp))
 
                  if (lutName != null || watermarkName != null) Row(
                     Modifier.align(Alignment.BottomStart).padding(start = 16.dp, bottom = 156.dp),
@@ -1696,13 +1727,17 @@ private fun LutScreen(vm: MainViewModel, openWatermark: () -> Unit) {
     var deleteConfirm by remember { mutableStateOf<LutEntry?>(null) }
     var query by remember { mutableStateOf("") }
     var quickFilter by remember { mutableStateOf("全部") }
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> uris.forEach(vm::importLut) }
+    var importing by remember { mutableStateOf(0) }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        importing += uris.size
+        uris.forEach { uri -> vm.importLut(uri) { importing = (importing - 1).coerceAtLeast(0) } }
+    }
     val visible = luts.filter { (category == null || it.category == category) && (query.isBlank() || it.name.contains(query, true) || it.sourceName.contains(query, true)) && when (quickFilter) { "收藏" -> it.favorite; "最近" -> it.lastUsedAt > 0; else -> true } }
     Column(Modifier.fillMaxSize().background(BridgeNight)) {
         BridgePageLabel("LUT 库", "${luts.size} 个色彩预设 · CUBE / PNG / XMP") {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 TextButton(openWatermark) { Text("水印预设", color = BridgeWhite) }
-                TextButton({ picker.launch(arrayOf("*/*")) }) { Text("导入", color = BridgeEmber) }
+                TextButton({ picker.launch(arrayOf("*/*")) }, enabled = importing == 0) { Text(if (importing > 0) "导入中" else "导入", color = if (importing > 0) BridgeWhite.copy(alpha = .45f) else BridgeEmber) }
             }
         }
         OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp), singleLine = true, placeholder = { Text("搜索 LUT", color = BridgeWhite.copy(alpha = .45f)) }, leadingIcon = { Icon(Icons.Default.Search, null, tint = BridgeWhite.copy(alpha = .6f)) }, colors = bridgeFieldColors())
@@ -1729,6 +1764,25 @@ private fun LutScreen(vm: MainViewModel, openWatermark: () -> Unit) {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+    if (importing > 0) Dialog(onDismissRequest = {}, properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false)) {
+        Surface(
+            Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+            shape = RoundedCornerShape(24.dp),
+            color = BridgeElevated,
+            border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .14f)),
+            shadowElevation = 20.dp,
+        ) {
+            Row(Modifier.padding(22.dp), verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(Modifier.size(38.dp), color = BridgeEmber, strokeWidth = 3.dp)
+                Spacer(Modifier.width(16.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("正在导入 LUT", color = BridgeWhite, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(4.dp))
+                    Text(if (importing == 1) "正在解析并生成预览" else "还有 $importing 个文件正在处理", color = BridgeWhite.copy(alpha = .58f), style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
@@ -1965,6 +2019,9 @@ private fun SettingsScreen(vm: MainViewModel) {
                     PreferenceSwitch("USB 自动读取", "检测到授权的 USB 相机后读取相册", config.usbAutoRead) { vm.updateConfig { it.copy(usbAutoRead = !it.usbAutoRead) } }
                     PreferenceSwitch("后台保持 Wi‑Fi 连接", "仅 Wi‑Fi 连接时启用后台保活", config.keepWifiAlive) { vm.updateConfig { it.copy(keepWifiAlive = !it.keepWifiAlive) } }
                     HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = BridgeWhite.copy(alpha = .08f))
+                    PhotoBatchPreference("首次读取", "连接后先显示的文件数量", config.initialPhotoBatchSize) { size -> vm.updateConfig { it.copy(initialPhotoBatchSize = size) } }
+                    PhotoBatchPreference("后续读取", "滚动到底部每次追加的数量", config.loadMorePhotoBatchSize) { size -> vm.updateConfig { it.copy(loadMorePhotoBatchSize = size) } }
+                    HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = BridgeWhite.copy(alpha = .08f))
                     Column(Modifier.padding(16.dp)) {
                         Text("Wi‑Fi PTP/IP 参数", color = BridgeWhite.copy(alpha = .65f), style = MaterialTheme.typography.labelMedium)
                         Spacer(Modifier.height(8.dp))
@@ -2066,6 +2123,19 @@ private fun PreferenceSwitch(title: String, subtitle: String, checked: Boolean, 
     Row(Modifier.fillMaxWidth().clickable { toggle() }.padding(horizontal = 16.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) { Text(title, color = BridgeWhite); Text(subtitle, color = BridgeWhite.copy(alpha = .5f), style = MaterialTheme.typography.bodySmall) }
         Switch(checked, { toggle() }, colors = SwitchDefaults.colors(checkedThumbColor = BridgeNight, checkedTrackColor = BridgeEmber, uncheckedThumbColor = BridgeWhite.copy(alpha = .6f), uncheckedTrackColor = BridgeWhite.copy(alpha = .12f)))
+    }
+}
+
+@Composable
+private fun PhotoBatchPreference(title: String, subtitle: String, value: Int, update: (Int) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = BridgeWhite)
+            Text(subtitle, color = BridgeWhite.copy(alpha = .5f), style = MaterialTheme.typography.bodySmall)
+        }
+        IconButton({ update((value - 5).coerceAtLeast(MIN_PHOTO_BATCH_SIZE)) }, enabled = value > MIN_PHOTO_BATCH_SIZE, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.Remove, "减少", tint = BridgeWhite.copy(alpha = if (value > MIN_PHOTO_BATCH_SIZE) .8f else .3f), modifier = Modifier.size(18.dp)) }
+        Text("$value 张", Modifier.width(58.dp), color = BridgeEmber, textAlign = androidx.compose.ui.text.style.TextAlign.Center, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+        IconButton({ update((value + 5).coerceAtMost(MAX_PHOTO_BATCH_SIZE)) }, enabled = value < MAX_PHOTO_BATCH_SIZE, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.Add, "增加", tint = BridgeWhite.copy(alpha = if (value < MAX_PHOTO_BATCH_SIZE) .8f else .3f), modifier = Modifier.size(18.dp)) }
     }
 }
 

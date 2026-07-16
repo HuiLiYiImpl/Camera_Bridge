@@ -57,10 +57,10 @@ object LutImporters {
         require(!text.contains("<!DOCTYPE", true) && !text.contains("<!ENTITY", true)) { "XMP 禁止使用外部实体" }
         val factory = DocumentBuilderFactory.newInstance().apply {
             isNamespaceAware = true
-            setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
-            setFeature("http://xml.org/sax/features/external-general-entities", false)
-            setFeature("http://xml.org/sax/features/external-parameter-entities", false)
-            setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
+            runCatching { setFeature("http://apache.org/xml/features/disallow-doctype-decl", true) }
+            runCatching { setFeature("http://xml.org/sax/features/external-general-entities", false) }
+            runCatching { setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
+            runCatching { setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false) }
             setExpandEntityReferences(false)
         }
         val doc = factory.newDocumentBuilder().parse(ByteArrayInputStream(bytes))
@@ -88,12 +88,13 @@ object LutImporters {
         val size = buffer.int
         require(size in 2..65) { "不支持的 XMP LUT 尺寸" }
         val values = FloatArray(size * size * size * 3)
+        val identity = IntArray(size) { (it * 0xffff + (size shr 1)) / (size - 1) }
         for (r in 0 until size) for (g in 0 until size) for (b in 0 until size) {
             require(buffer.remaining() >= 6) { "XMP RGB Table 数据不完整" }
             val index = ((b * size + g) * size + r) * 3
-            values[index] = (buffer.short.toInt() and 0xffff) / 65535f
-            values[index + 1] = (buffer.short.toInt() and 0xffff) / 65535f
-            values[index + 2] = (buffer.short.toInt() and 0xffff) / 65535f
+            values[index] = ((buffer.short.toInt() + identity[r]) and 0xffff) / 65535f
+            values[index + 1] = ((buffer.short.toInt() + identity[g]) and 0xffff) / 65535f
+            values[index + 2] = ((buffer.short.toInt() + identity[b]) and 0xffff) / 65535f
         }
         return CubeLut("XMP LUT", size, values, floatArrayOf(0f, 0f, 0f), floatArrayOf(1f, 1f, 1f))
     }
@@ -113,6 +114,15 @@ object LutImporters {
         require(expected in 1..16 * 1024 * 1024) { "XMP 解压数据过大" }
         val inflater = Inflater().apply { setInput(data, 4, data.size - 4) }
         val output = ByteArray(expected)
-        try { val count = inflater.inflate(output); require(count == expected) { "XMP 解压数据长度错误" }; return output } finally { inflater.end() }
+        try {
+            var count = 0
+            while (count < expected && !inflater.finished()) {
+                val read = inflater.inflate(output, count, expected - count)
+                require(read > 0 || inflater.finished()) { "XMP 压缩数据损坏" }
+                count += read
+            }
+            require(count == expected && inflater.finished()) { "XMP 解压数据长度错误" }
+            return output
+        } finally { inflater.end() }
     }
 }

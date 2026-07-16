@@ -25,6 +25,8 @@ class UsbMtpClient(
     private var connection: UsbDeviceConnection? = null
     private lateinit var mtp: MtpDevice
     private var objectHandles: List<Int>? = null
+    private val cachedAssets = mutableListOf<PhotoAsset>()
+    private var scannedHandleCount = 0
     override var cameraName: String = usbDevice.productName ?: "USB 相机"
         private set
     override var cameraDetails: CameraDetails = CameraDetails(model = usbDevice.productName)
@@ -53,20 +55,29 @@ class UsbMtpClient(
         runCatching { usbManager.deviceList[usbDevice.deviceName] != null && mtp.getDeviceInfo() != null }.getOrDefault(false)
     }
 
-    override fun refreshAssets() = synchronized(ioLock) { objectHandles = null }
+    override fun refreshAssets() = synchronized(ioLock) {
+        objectHandles = null
+        cachedAssets.clear()
+        scannedHandleCount = 0
+    }
 
     override fun assets(offset: Int, limit: Int): List<PhotoAsset> = synchronized(ioLock) {
         val handles = objectHandles ?: loadObjectHandles().also { objectHandles = it }
-        return handles.drop(offset).take(limit).mapNotNull { handle ->
+        val target = offset + limit
+        while (cachedAssets.size < target && scannedHandleCount < handles.size) {
+            val handle = handles[scannedHandleCount++]
             runCatching {
                 val info = mtp.getObjectInfo(handle) ?: return@runCatching null
                 if (info.getFormat() == MtpConstants.FORMAT_ASSOCIATION) return@runCatching null
                 PhotoAsset(handle.toUInt(), info.getName().orEmpty().ifBlank { "IMG_$handle" }, info.getCompressedSizeLong(), info.getFormat(), Date(info.getDateCreated().takeIf { it > 0 } ?: System.currentTimeMillis()))
-            }.getOrNull()
+            }.getOrNull()?.let(cachedAssets::add)
         }
+        return cachedAssets.drop(offset).take(limit)
     }
 
-    override fun hasMoreAssets(offset: Int): Boolean = synchronized(ioLock) { offset < (objectHandles?.size ?: Int.MAX_VALUE) }
+    override fun hasMoreAssets(offset: Int): Boolean = synchronized(ioLock) {
+        offset < cachedAssets.size || scannedHandleCount < (objectHandles?.size ?: Int.MAX_VALUE)
+    }
 
     override fun thumbnail(asset: PhotoAsset): ByteArray? = synchronized(ioLock) {
         runCatching { mtp.getThumbnail(asset.handle.toInt()) }.getOrNull()
@@ -94,6 +105,24 @@ class UsbMtpClient(
     }
 
     override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit, isCancelled: () -> Boolean): Long = synchronized(ioLock) {
+        if (asset.size in 1..MAX_PARTIAL_OBJECT_SIZE) {
+            var copied = 0L
+            try {
+                return@synchronized copyMtpObjectInChunks(
+                    total = asset.size,
+                    output = output,
+                    progress = { done, total -> copied = done; progress(done, total) },
+                    isCancelled = isCancelled,
+                ) { offset, buffer, request ->
+                    mtp.getPartialObject(asset.handle.toInt(), offset, request.toLong(), buffer).toInt()
+                }
+            } catch (cancelled: DownloadCancelledException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (copied > 0L) throw error
+                // Some cameras do not implement GetPartialObject; use Android's native whole-file path.
+            }
+        }
         // MediaStore exposes a FileOutputStream, so MTP can stream large videos straight
         // into their final destination without allocating the entire object in memory.
         if (output is FileOutputStream) {
@@ -149,15 +178,38 @@ class UsbMtpClient(
         runCatching { connection?.close() }
         connection = null
         objectHandles = null
+        cachedAssets.clear()
+        scannedHandleCount = 0
     }
 
-    private fun loadObjectHandles(): List<Int> = buildList {
+    private fun loadObjectHandles(): List<Int> = buildList<Int> {
         mtp.getStorageIds()?.forEach { storageId ->
-            val handles = mtp.getObjectHandles(storageId, 0, 0)
-            handles?.forEach { handle ->
-                val info = mtp.getObjectInfo(handle)
-                if (info != null && info.getFormat() != MtpConstants.FORMAT_ASSOCIATION) add(handle)
-            }
+            mtp.getObjectHandles(storageId, 0, 0)?.let { addAll(it.toList()) }
         }
     }.distinct().asReversed()
+}
+
+private const val MTP_CHUNK_SIZE = 1024 * 1024
+private const val MAX_PARTIAL_OBJECT_SIZE = 0xffff_ffffL
+
+internal fun copyMtpObjectInChunks(
+    total: Long,
+    output: OutputStream,
+    progress: (Long, Long) -> Unit,
+    isCancelled: () -> Boolean,
+    readChunk: (offset: Long, buffer: ByteArray, request: Int) -> Int,
+): Long {
+    require(total > 0L) { "USB 文件大小无效" }
+    val buffer = ByteArray(minOf(total, MTP_CHUNK_SIZE.toLong()).toInt())
+    var copied = 0L
+    while (copied < total) {
+        if (isCancelled()) throw DownloadCancelledException()
+        val request = minOf(buffer.size.toLong(), total - copied).toInt()
+        val read = readChunk(copied, buffer, request)
+        require(read in 1..request) { "USB 分块读取中断" }
+        output.write(buffer, 0, read)
+        copied += read
+        progress(copied, total)
+    }
+    return copied
 }
