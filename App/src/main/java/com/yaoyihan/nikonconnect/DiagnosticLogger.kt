@@ -175,7 +175,7 @@ class DiagnosticLogger(private val context: Context) : AutoCloseable {
     fun exportPackage(snapshot: DiagnosticSnapshot): File {
         flush()
         val exportRoot = context.cacheDir.resolve("diagnostics").apply { mkdirs() }
-        val output = exportRoot.resolve("Camera_Bridge_Diagnostic_${timestampForFile()}.zip")
+        val output = exportRoot.resolve("Link_Diagnostic_${timestampForFile()}.zip")
         val eventText = runCatching { eventsFile.takeIf(File::exists)?.readText() ?: "" }.getOrDefault("")
         val errorText = synchronized(lock) { latestErrorJson } ?: runCatching { latestErrorFile.takeIf(File::exists)?.readText() }.getOrNull() ?: JSONObject().put("error", JSONObject.NULL).toString()
         val summary = JSONObject().apply {

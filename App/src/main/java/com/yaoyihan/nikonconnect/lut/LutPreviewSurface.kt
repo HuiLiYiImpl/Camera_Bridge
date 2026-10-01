@@ -1,8 +1,11 @@
+@file:OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
 package com.yaoyihan.nikonconnect.lut
 
 import android.graphics.Bitmap
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
@@ -12,11 +15,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.viewinterop.AndroidView
 import com.yaoyihan.nikonconnect.CubeLut
+import com.yaoyihan.nikonconnect.photoSwipe
 
 @Composable
 fun LutPreviewSurface(
@@ -25,6 +30,8 @@ fun LutPreviewSurface(
     modifier: Modifier = Modifier,
     intensity: Float = 1f,
     rotation: Int = 0,
+    previous: (() -> Unit)? = null,
+    next: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val view = remember { LutGlView(context) }
@@ -47,7 +54,12 @@ fun LutPreviewSurface(
     }
     AndroidView(
         factory = { view },
-        modifier = modifier.onSizeChanged { viewport = it }.transformable(state),
+        modifier = modifier.onSizeChanged { viewport = it }
+            .photoSwipe(bitmap, zoom == 1f, previous, next)
+            .pointerInput(bitmap, rotation) {
+                detectTapGestures(onDoubleTap = { zoom = if (zoom > 1f) 1f else 3f; offset = Offset.Zero })
+            }
+            .transformable(state, canPan = { zoom > 1f }),
         update = {
             it.setImage(bitmap)
             it.setLut(lut)

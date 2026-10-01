@@ -35,12 +35,8 @@ data class CameraConfig(
     val brand: CameraBrand = CameraBrand.NIKON,
     val lastCameraName: String = "",
     val lastTransport: ConnectionTransport = ConnectionTransport.WIFI,
-    val wifiAutoRestore: Boolean = true,
-    val usbAutoRead: Boolean = true,
-    val keepWifiAlive: Boolean = true,
     val jpegQuality: Int = 95,
     val fileNamingRule: String = "原文件名_编辑类型",
-    val thumbnailCacheEnabled: Boolean = true,
     val colorTheme: AppColorTheme = AppColorTheme.DARKROOM_ORANGE,
     val initialPhotoBatchSize: Int = 30,
     val loadMorePhotoBatchSize: Int = 15,
@@ -90,8 +86,11 @@ fun mediaKindFor(mime: String?, name: String): MediaKind {
     }
 }
 
-fun Context.mediaKind(record: DownloadRecord): MediaKind =
-    mediaKindFor(contentResolver.getType(Uri.parse(record.uri)), record.name)
+fun Context.mediaKind(record: DownloadRecord): MediaKind {
+    val fromName = mediaKindFor(null, record.name)
+    return if (fromName != MediaKind.UNKNOWN) fromName
+    else mediaKindFor(contentResolver.getType(Uri.parse(record.uri)), record.name)
+}
 
 fun String.isVideoName() = mediaKindFor(null, this) == MediaKind.VIDEO
 enum class DownloadTaskStatus { QUEUED, DOWNLOADING, CANCELLING, FAILED }
@@ -168,12 +167,8 @@ class AppStore(context: Context) {
         prefs.getString("camera_brand", CameraBrand.NIKON.name)?.let { runCatching { CameraBrand.valueOf(it) }.getOrDefault(CameraBrand.NIKON) } ?: CameraBrand.NIKON,
         prefs.getString("last_camera_name", "") ?: "",
         prefs.getString("last_transport", ConnectionTransport.WIFI.name)?.let { runCatching { ConnectionTransport.valueOf(it) }.getOrDefault(ConnectionTransport.WIFI) } ?: ConnectionTransport.WIFI,
-        prefs.getBoolean("wifi_auto_restore", true),
-        prefs.getBoolean("usb_auto_read", true),
-        prefs.getBoolean("keep_wifi_alive", true),
         prefs.getInt("jpeg_quality", 95),
         prefs.getString("file_naming_rule", "原文件名_编辑类型") ?: "原文件名_编辑类型",
-        prefs.getBoolean("thumbnail_cache_enabled", true),
         prefs.getString("color_theme", AppColorTheme.DARKROOM_ORANGE.name)?.let { runCatching { AppColorTheme.valueOf(it) }.getOrDefault(AppColorTheme.DARKROOM_ORANGE) } ?: AppColorTheme.DARKROOM_ORANGE,
         prefs.getInt("initial_photo_batch_size", 30).coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
         prefs.getInt("load_more_photo_batch_size", 15).coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
@@ -186,32 +181,32 @@ class AppStore(context: Context) {
         .putString("camera_brand", config.brand.name)
         .putString("last_camera_name", config.lastCameraName)
         .putString("last_transport", config.lastTransport.name)
-        .putBoolean("wifi_auto_restore", config.wifiAutoRestore)
-        .putBoolean("usb_auto_read", config.usbAutoRead)
-        .putBoolean("keep_wifi_alive", config.keepWifiAlive)
+        .remove("wifi_auto_restore")
+        .remove("usb_auto_read")
+        .remove("keep_wifi_alive")
         .putInt("jpeg_quality", config.jpegQuality)
         .putString("file_naming_rule", config.fileNamingRule)
-        .putBoolean("thumbnail_cache_enabled", config.thumbnailCacheEnabled)
+        .remove("thumbnail_cache_enabled")
         .putString("color_theme", config.colorTheme.name)
         .putInt("initial_photo_batch_size", config.initialPhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE))
         .putInt("load_more_photo_batch_size", config.loadMorePhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE))
         .apply()
 
-    fun downloads(): List<DownloadRecord> = runCatching {
+    @Synchronized fun downloads(): List<DownloadRecord> = runCatching {
         val array = JSONArray(prefs.getString("downloads", "[]"))
         (0 until array.length()).map { i ->
             array.getJSONObject(i).let { DownloadRecord(it.getString("name"), it.getLong("size"), it.getString("uri"), it.getLong("time")) }
         }.sortedByDescending { it.completedAt }
     }.getOrDefault(emptyList())
 
-    fun addDownload(record: DownloadRecord) {
-        val rows = downloads().toMutableList().apply { add(0, record) }.take(100)
+    @Synchronized fun addDownload(record: DownloadRecord) {
+        val rows = downloads().filterNot { it.uri == record.uri }.toMutableList().apply { add(0, record) }
         val array = JSONArray()
         rows.forEach { array.put(JSONObject().put("name", it.name).put("size", it.size).put("uri", it.uri).put("time", it.completedAt)) }
         prefs.edit().putString("downloads", array.toString()).apply()
     }
 
-    fun removeDownloads(uris: Set<String>) {
+    @Synchronized fun removeDownloads(uris: Set<String>) {
         val rows = downloads().filter { it.uri !in uris }
         val array = JSONArray()
         rows.forEach { array.put(JSONObject().put("name", it.name).put("size", it.size).put("uri", it.uri).put("time", it.completedAt)) }

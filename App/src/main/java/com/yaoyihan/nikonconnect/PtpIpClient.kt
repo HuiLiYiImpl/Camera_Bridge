@@ -17,16 +17,25 @@ class PtpIpClient(
     private val host: String,
     private val port: Int,
     private val socketFactory: SocketFactory = SocketFactory.getDefault(),
-) : CameraClient {
+) : CameraClient, RemoteCameraControl {
     private lateinit var command: Channel
     private lateinit var event: Channel
     private var transaction = 1u
     private var objectHandles: List<UInt>? = null
+    private var supportedOperations = emptySet<Int>()
+    private var cameraModeChanged = false
+    private var applicationModeChanged = false
+    private var captureEvents = java.util.concurrent.ConcurrentLinkedQueue<CaptureEvent>()
+    override val supportsRemoteCapture: Boolean
+        @Synchronized get() = NIKON_CAPTURE_TO_CARD in supportedOperations || INITIATE_CAPTURE in supportedOperations
     override var cameraName: String = "Nikon 相机"; private set
     override var cameraDetails: CameraDetails = CameraDetails(manufacturer = "Nikon"); private set
     override val transport = ConnectionTransport.WIFI
 
-    override fun connect() {
+    @Synchronized override fun connect() {
+        cameraModeChanged = false
+        applicationModeChanged = false
+        captureEvents = java.util.concurrent.ConcurrentLinkedQueue()
         command = Channel(host, port, socketFactory).also { it.open() }
         // Nikon's Android client identifies its PTP/IP session with this stable value.
         command.send(packet(INIT_COMMAND_REQUEST, NIKON_ANDROID_GUID + utf16z("Android Device") + le32(PROTOCOL_VERSION)))
@@ -43,14 +52,16 @@ class PtpIpClient(
         event.send(packet(INIT_EVENT_REQUEST, le32(connectionNumber)))
         require(event.read().type == INIT_EVENT_ACK) { "相机拒绝了事件通道连接" }
         val device = parseDeviceInfo(requestData(GET_DEVICE_INFO, 0u))
+        supportedOperations = device.supportedOperations
         cameraDetails = device.details
         cameraName = cameraDisplayName(cameraDetails, connectionName)
         requestResponse(OPEN_SESSION, 0u, 1u)
         transaction = 1u
         cameraDetails = readLiveCameraDetails(cameraDetails, device.supportedProperties)
+        startEventReader(event)
     }
 
-    override fun assets(offset: Int, limit: Int): List<PhotoAsset> {
+    @Synchronized override fun assets(offset: Int, limit: Int): List<PhotoAsset> {
         // Zf rejects GetStorageIDs over its SnapBridge PTP session; Nikon's client
         // queries all objects directly with the PTP “all storages” sentinel instead.
         val handles = objectHandles ?: Reader(requestData(GET_OBJECT_HANDLES, next(), UInt.MAX_VALUE, 0u, 0u)).u32Array().asReversed().also { objectHandles = it }
@@ -58,21 +69,21 @@ class PtpIpClient(
         return page.mapNotNull { handle -> runCatching { parseObject(handle, requestData(GET_OBJECT_INFO, next(), handle)) }.getOrNull() }
     }
 
-    override fun hasMoreAssets(offset: Int): Boolean = offset < (objectHandles?.size ?: Int.MAX_VALUE)
-    override fun refreshAssets() { objectHandles = null }
+    @Synchronized override fun hasMoreAssets(offset: Int): Boolean = offset < (objectHandles?.size ?: Int.MAX_VALUE)
+    @Synchronized override fun refreshAssets() { objectHandles = null }
 
-    override fun checkConnection(): Boolean {
+    @Synchronized override fun checkConnection(): Boolean {
         requestData(GET_DEVICE_INFO, next())
         return true
     }
 
-    override fun thumbnail(asset: PhotoAsset): ByteArray? = runCatching { requestData(GET_THUMB, next(), asset.handle) }.getOrNull()
-    override fun imageHeader(asset: PhotoAsset): ByteArray? = runCatching {
+    @Synchronized override fun thumbnail(asset: PhotoAsset): ByteArray? = runCatching { requestData(GET_THUMB, next(), asset.handle) }.getOrNull()
+    @Synchronized override fun imageHeader(asset: PhotoAsset): ByteArray? = runCatching {
         val length = minOf(asset.size.takeIf { it > 0 } ?: IMAGE_HEADER_SIZE.toLong(), IMAGE_HEADER_SIZE.toLong()).toUInt()
         requestData(GET_PARTIAL_OBJECT, next(), asset.handle, 0u, length)
     }.getOrNull()
 
-    override fun download(asset: PhotoAsset, progress: (Long, Long) -> Unit): ByteArray {
+    @Synchronized override fun download(asset: PhotoAsset, progress: (Long, Long) -> Unit): ByteArray {
         val output = java.io.ByteArrayOutputStream(asset.size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
         downloadTo(asset, output, progress)
         return output.toByteArray()
@@ -83,7 +94,7 @@ class PtpIpClient(
      * 小文件（≤ [FULL_OBJECT_THRESHOLD]）优先整文件下载，失败回退到分块；
      * 大文件用 [AdaptiveChunkController] 自适应调整 chunk 大小（1MB~8MB）。
      */
-    override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit, isCancelled: () -> Boolean): Long {
+    @Synchronized override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit, isCancelled: () -> Boolean): Long {
         // 小文件：尝试一次性 GET_OBJECT 整文件下载，省去分块往返
         if (asset.size in 1..FULL_OBJECT_THRESHOLD) {
             try { return requestToStream(GET_OBJECT, next(), asset.handle, output, progress, asset.size, 0L, isCancelled) }
@@ -142,7 +153,7 @@ class PtpIpClient(
     private fun parseDeviceInfo(data: ByteArray): ParsedDeviceInfo {
         val r = Reader(data)
         r.u16(); r.u32(); r.u16(); r.ptpString(); r.u16()
-        r.u16Array()
+        val operations = r.u16Array().toSet()
         r.u16Array()
         val supportedProperties = r.u16Array().toSet()
         r.u16Array()
@@ -155,6 +166,7 @@ class PtpIpClient(
                 serialNumber = r.ptpString().ifBlank { null },
             ),
             supportedProperties,
+            operations,
         )
     }
 
@@ -201,11 +213,116 @@ class PtpIpClient(
         return if (scaled % 1.0 == 0.0) scaled.toInt().toString() else "%.1f".format(Locale.US, scaled)
     }
 
-    private data class ParsedDeviceInfo(val details: CameraDetails, val supportedProperties: Set<Int>)
+    private data class ParsedDeviceInfo(val details: CameraDetails, val supportedProperties: Set<Int>, val supportedOperations: Set<Int>)
 
-    private fun requestResponse(operation: Int, id: UInt, vararg parameters: UInt) {
+    private data class CaptureEvent(val code: Int, val transaction: UInt, val at: Long)
+
+    /** One reader per event socket; close/reconnect unblocks and retires the old reader. */
+    private fun startEventReader(channel: Channel) {
+        channel.disableReadTimeout()
+        val queue = captureEvents
+        Thread({
+            try {
+                while (true) {
+                    val incoming = channel.read()
+                    if (incoming.type == PING) { channel.send(packet(PONG, ByteArray(0))); continue }
+                    if (incoming.type != EVENT || incoming.payload.size < 6) continue
+                    val reader = Reader(incoming.payload)
+                    val code = reader.u16()
+                    val id = reader.u32()
+                    if (code == OBJECT_ADDED || code == CAPTURE_COMPLETE) {
+                        queue.add(CaptureEvent(code, id, System.nanoTime()))
+                        while (queue.size > 64) queue.poll()
+                    }
+                }
+            } catch (_: Exception) {
+                // A disconnected/malformed event stream must not terminate the process.
+                // Object-list polling remains available on the command transport.
+            }
+        }, "Link-PTP-events").apply { isDaemon = true; start() }
+    }
+
+    /** No shutter retries: a lost reply may still mean the camera took the photograph. */
+    @Synchronized override fun capture(isCancelled: () -> Boolean, onSending: () -> Unit): RemoteCaptureResult {
+        require(supportsRemoteCapture) { "当前相机连接未提供遥控拍摄能力" }
+        fun checkCancelled() { if (isCancelled()) throw kotlin.coroutines.cancellation.CancellationException("拍摄已取消") }
+        checkCancelled()
+        if (!cameraModeChanged && NIKON_CHANGE_CAMERA_MODE in supportedOperations) {
+            try {
+                requestResponse(NIKON_CHANGE_CAMERA_MODE, next(), 1u)
+                cameraModeChanged = true
+            } catch (error: PtpResponseException) {
+                if (error.response != 0xA003) throw error
+            }
+        }
+        checkCancelled()
+        if (!applicationModeChanged && NIKON_CHANGE_APPLICATION_MODE in supportedOperations) {
+            requestResponse(NIKON_CHANGE_APPLICATION_MODE, next(), 1u)
+            applicationModeChanged = true
+        }
+        // Snapshot all card handles, not just the currently loaded gallery page.
+        val baseline = try {
+            Reader(requestData(GET_OBJECT_HANDLES, next(), UInt.MAX_VALUE, 0u, 0u)).u32Array().toSet()
+        } catch (_: PtpResponseException) { null }
+        checkCancelled()
+        captureEvents.clear()
+        val startedAt = System.nanoTime()
+        val captureId = next()
+        val operation = if (NIKON_CAPTURE_TO_CARD in supportedOperations) NIKON_CAPTURE_TO_CARD else INITIATE_CAPTURE
+        val parameters = if (operation == NIKON_CAPTURE_TO_CARD) uintArrayOf(0xfffffffeu, 0u) else uintArrayOf(0u, 0u)
+        // The UI stops offering cancellation before any shutter bytes are sent.
+        onSending()
+        try {
+            requestResponse(operation, captureId, *parameters)
+        } catch (error: PtpResponseException) {
+            throw error // Explicit rejection: safe to let the user retry manually.
+        } catch (_: Exception) {
+            return RemoteCaptureResult(false, "拍摄指令可能已发送，暂未确认结果，请查看相机；不会自动重拍")
+        }
+        val deadline = System.nanoTime() + 30_000_000_000L
+        var lastPoll = startedAt
+        while (System.nanoTime() < deadline) {
+            var received = captureEvents.poll()
+            while (received != null) {
+                if (received.at >= startedAt && (received.transaction == captureId || received.transaction == 0u || received.transaction == UInt.MAX_VALUE)) {
+                    if (received.code == CAPTURE_COMPLETE) {
+                        objectHandles = null
+                        return RemoteCaptureResult(true, "相机已确认拍摄完成，照片保存在相机中")
+                    }
+                }
+                received = captureEvents.poll()
+            }
+            // Some Nikon mobile sessions do not deliver CaptureComplete over PTP/IP.
+            if (baseline != null && System.nanoTime() - lastPoll >= 1_000_000_000L) {
+                lastPoll = System.nanoTime()
+                try {
+                    val handles = Reader(requestData(GET_OBJECT_HANDLES, next(), UInt.MAX_VALUE, 0u, 0u)).u32Array()
+                    if (handles.any { it !in baseline }) {
+                        objectHandles = null
+                        return RemoteCaptureResult(true, "相机中已出现新照片，照片保存在相机中")
+                    }
+                } catch (error: PtpResponseException) {
+                    if (error.response != 0x2019) break
+                } catch (_: Exception) { break }
+            }
+            Thread.sleep(100)
+        }
+        objectHandles = null
+        return RemoteCaptureResult(false, "相机已接受快门指令，暂未确认拍摄完成；长曝光请等待并查看相机")
+    }
+
+    private fun validateResponse(operation: Int, id: UInt, response: RawPacket) {
+        require(response.type == OPERATION_RESPONSE && response.payload.size >= 6) { "收到无效的 PTP 响应" }
+        val reader = Reader(response.payload)
+        val code = reader.u16()
+        val responseId = reader.u32()
+        require(responseId == id || operation == CLOSE_SESSION) { "相机事务编号不匹配，请重新连接" }
+        if (code != RESPONSE_OK) throw PtpResponseException(operation, code)
+    }
+
+    @Synchronized private fun requestResponse(operation: Int, id: UInt, vararg parameters: UInt) {
         command.send(operationPacket(operation, id, parameters)); val response = command.read()
-        require(response.type == OPERATION_RESPONSE && Reader(response.payload).u16() == RESPONSE_OK) { "相机未接受请求（0x${operation.toString(16)}）" }
+        validateResponse(operation, id, response)
     }
 
     @Synchronized private fun requestData(operation: Int, id: UInt, vararg parameters: UInt): ByteArray = requestData(operation, id, null, *parameters)
@@ -216,7 +333,7 @@ class PtpIpClient(
             when (packet.type) {
                 START_DATA -> { val r = Reader(packet.payload); r.u32(); expected = r.u64().toLong(); progress?.invoke(0, expected) }
                 DATA, END_DATA -> { val r = Reader(packet.payload); r.u32(); val part = r.remaining(); output.write(part); progress?.invoke(output.size().toLong(), expected) }
-                OPERATION_RESPONSE -> { val r = Reader(packet.payload); require(r.u16() == RESPONSE_OK) { "相机返回错误" }; return output.toByteArray() }
+                OPERATION_RESPONSE -> { validateResponse(operation, id, packet); return output.toByteArray() }
                 else -> error("意外的 PTP/IP 数据包：${packet.type}")
             }
         }
@@ -231,7 +348,7 @@ class PtpIpClient(
             when (packet.type) {
                 START_DATA -> { val r = Reader(packet.payload); r.u32(); expected = r.u64().toLong(); if (!isCancelled()) progress(baseOffset, total) else draining = true }
                 DATA, END_DATA -> { val r = Reader(packet.payload); r.u32(); val part = r.remaining(); if (isCancelled()) draining = true; if (!draining) { output.write(part); written += part.size; progress(baseOffset + written, total) } }
-                OPERATION_RESPONSE -> { val r = Reader(packet.payload); require(r.u16() == RESPONSE_OK) { "相机返回了错误" }; if (draining || isCancelled()) throw DownloadCancelledException(); return written }
+                OPERATION_RESPONSE -> { validateResponse(operation, id, packet); if (draining || isCancelled()) throw DownloadCancelledException(); return written }
                 else -> error("收到意外的 PTP/IP 数据包：${packet.type}")
             }
         }
@@ -246,7 +363,19 @@ class PtpIpClient(
         requestToStream(operation, id, output, progress, total, baseOffset, isCancelled, handle, offset, count)
 
     private fun next() = transaction++
-    override fun close() { runCatching { if (::command.isInitialized) requestResponse(CLOSE_SESSION, next()) }; runCatching { command.close() }; runCatching { event.close() } }
+    @Synchronized override fun close() {
+        if (::command.isInitialized) {
+            runCatching {
+                if (applicationModeChanged) requestResponse(NIKON_CHANGE_APPLICATION_MODE, next(), 0u)
+                if (cameraModeChanged) requestResponse(NIKON_CHANGE_CAMERA_MODE, next(), 0u)
+                requestResponse(CLOSE_SESSION, next())
+            }
+            runCatching { command.close() }
+        }
+        if (::event.isInitialized) runCatching { event.close() }
+        supportedOperations = emptySet()
+        captureEvents.clear()
+    }
 
     private class Channel(
         private val host: String,
@@ -263,7 +392,8 @@ class PtpIpClient(
             output = BufferedOutputStream(socket.getOutputStream(), STREAM_BUFFER_SIZE)
         }
         fun send(bytes: ByteArray) { output.write(bytes); output.flush() }
-        fun read(): RawPacket { val header = input.readFully(8); val b = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN); val length = b.int; require(length >= 8) { "无效 PTP/IP 包长度" }; return RawPacket(b.int, input.readFully(length - 8)) }
+        fun disableReadTimeout() { socket.soTimeout = 0 }
+        fun read(): RawPacket { val header = input.readFully(8); val b = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN); val length = b.int; require(length in 8..(32 * 1024 * 1024)) { "无效 PTP/IP 包长度" }; return RawPacket(b.int, input.readFully(length - 8)) }
         override fun close() { if (::socket.isInitialized) socket.close() }
     }
     private data class RawPacket(val type: Int, val payload: ByteArray)
@@ -314,6 +444,12 @@ class PtpIpClient(
         private const val OPERATION_REQUEST = 6; private const val OPERATION_RESPONSE = 7; private const val START_DATA = 9; private const val DATA = 10; private const val END_DATA = 12
         private const val GET_DEVICE_INFO = 0x1001; private const val OPEN_SESSION = 0x1002; private const val CLOSE_SESSION = 0x1003; private const val GET_STORAGE_IDS = 0x1004; private const val GET_OBJECT_HANDLES = 0x1007; private const val GET_OBJECT_INFO = 0x1008; private const val GET_OBJECT = 0x1009; private const val GET_THUMB = 0x100A; private const val GET_DEVICE_PROP_VALUE = 0x1015; private const val GET_PARTIAL_OBJECT = 0x101B
         private const val RESPONSE_OK = 0x2001
+        private const val INITIATE_CAPTURE = 0x100E
+        private const val NIKON_CHANGE_CAMERA_MODE = 0x90C2
+        private const val NIKON_CHANGE_APPLICATION_MODE = 0x9435
+        private const val NIKON_CAPTURE_TO_CARD = 0x9207
+        private const val EVENT = 8; private const val PING = 13; private const val PONG = 14
+        private const val OBJECT_ADDED = 0x4002; private const val CAPTURE_COMPLETE = 0x400D
         private const val BATTERY_LEVEL = 0x5001
         private const val NIKON_FOCAL_LENGTH_MIN = 0xD0E3
         private const val NIKON_FOCAL_LENGTH_MAX = 0xD0E4

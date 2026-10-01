@@ -40,7 +40,7 @@ class ConnectionKeepAliveService : Service() {
 
     private fun notification(): Notification = NotificationCompat.Builder(this, CHANNEL)
         .setSmallIcon(R.drawable.ic_notification)
-        .setContentTitle("尼康相机连接中")
+        .setContentTitle("Link · 相机连接中")
         .setContentText("保持相机 Wi‑Fi 连接")
         .setOngoing(true)
         .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT))

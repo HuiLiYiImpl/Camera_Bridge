@@ -87,6 +87,11 @@ data class PhotoMetadata(
     val orientation: Int? = null,
     val customText: String? = null,
     val copyrightText: String? = null,
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    val altitudeMeters: Double? = null,
+    val pixelWidth: Int? = null,
+    val pixelHeight: Int? = null,
 )
 
 data class LoadedPhoto(
@@ -100,9 +105,12 @@ object ExifMetadataReader {
         ExifInterface(ByteArrayInputStream(bytes)).toMetadata(fallback)
     }.getOrDefault(fallback)
 
-    fun fromUri(context: Context, uri: Uri, fallback: PhotoMetadata = PhotoMetadata()): PhotoMetadata = runCatching {
-        context.contentResolver.openInputStream(uri)?.use { ExifInterface(it).toMetadata(fallback) } ?: fallback
-    }.getOrDefault(fallback)
+    fun fromUri(context: Context, uri: Uri, fallback: PhotoMetadata = PhotoMetadata()): PhotoMetadata =
+        fromUriOrNull(context, uri, fallback) ?: fallback
+
+    fun fromUriOrNull(context: Context, uri: Uri, fallback: PhotoMetadata = PhotoMetadata()): PhotoMetadata? = runCatching {
+        context.contentResolver.openInputStream(uri)?.use { ExifInterface(it).toMetadata(fallback) }
+    }.getOrNull()
 
     private fun ExifInterface.toMetadata(fallback: PhotoMetadata): PhotoMetadata {
         val make = getAttribute(ExifInterface.TAG_MAKE).clean()
@@ -123,6 +131,12 @@ object ExifMetadataReader {
             ?: getAttribute(ExifInterface.TAG_DATETIME)?.parseExifDate()
         val orientation = getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED)
             .takeIf { it != ExifInterface.ORIENTATION_UNDEFINED }
+        val coordinates = FloatArray(2).takeIf { getLatLong(it) }
+        val altitude = getAltitude(Double.NaN).takeIf { it.isFinite() }
+        val pixelWidth = getAttributeInt(ExifInterface.TAG_PIXEL_X_DIMENSION, 0).takeIf { it > 0 }
+            ?: getAttributeInt(ExifInterface.TAG_IMAGE_WIDTH, 0).takeIf { it > 0 }
+        val pixelHeight = getAttributeInt(ExifInterface.TAG_PIXEL_Y_DIMENSION, 0).takeIf { it > 0 }
+            ?: getAttributeInt(ExifInterface.TAG_IMAGE_LENGTH, 0).takeIf { it > 0 }
         return PhotoMetadata(
             cameraBrand = make ?: fallback.cameraBrand,
             cameraModel = model ?: fallback.cameraModel,
@@ -136,10 +150,15 @@ object ExifMetadataReader {
             orientation = orientation ?: fallback.orientation,
             customText = fallback.customText,
             copyrightText = getAttribute(ExifInterface.TAG_COPYRIGHT).clean() ?: fallback.copyrightText,
+            latitude = coordinates?.get(0)?.toDouble() ?: fallback.latitude,
+            longitude = coordinates?.get(1)?.toDouble() ?: fallback.longitude,
+            altitudeMeters = altitude ?: fallback.altitudeMeters,
+            pixelWidth = pixelWidth ?: fallback.pixelWidth,
+            pixelHeight = pixelHeight ?: fallback.pixelHeight,
         )
     }
 
-    private fun String?.clean(): String? = this?.trim()?.takeIf {
+    private fun String?.clean(): String? = this?.substringBefore('\u0000')?.trim()?.takeIf {
         it.isNotBlank() && !it.equals("unknown", true) && it != "0mm" && it != "0"
     }
 

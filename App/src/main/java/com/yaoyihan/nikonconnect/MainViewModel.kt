@@ -16,8 +16,10 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.Environment
 import android.os.SystemClock
@@ -32,11 +34,17 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.Date
@@ -53,6 +61,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var client: CameraClient? = null
     private var usbDevice: UsbDevice? = null
     private var cameraNetworkBound = false
+    private var requestedCameraNetwork: Network? = null
+    private var requestedWifiCallback: ConnectivityManager.NetworkCallback? = null
     private var lastDiagnosticProgressAt = 0L
     val config = MutableStateFlow(store.config())
     val workflow = MutableStateFlow(Workflow.WAITING)
@@ -68,9 +78,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val snackbar = MutableStateFlow<String?>(null)
     val pageTask = MutableStateFlow<PageTask?>(null)
     val isBusy = MutableStateFlow(false)
+    val remoteCapture = MutableStateFlow(RemoteCaptureState())
+    val remoteSupported = MutableStateFlow(false)
+    private var remoteCaptureJob: Job? = null
+    private var remoteCancellation = java.util.concurrent.atomic.AtomicBoolean(false)
     val hasMorePhotos = MutableStateFlow(false)
     val hasLoadedPhotos = MutableStateFlow(false)
     val thumbnails = mutableStateMapOf<UInt, Bitmap?>()
+    private val cameraThumbnailCache = BitmapMemoryCache<UInt> { thumbnails.remove(it) }
+    private val localThumbnailCache = BitmapMemoryCache<String>()
+    private val thumbnailLoads = mutableSetOf<String>()
+    val thumbnailVersion = MutableStateFlow(0)
+    val isLoadingMorePhotos = MutableStateFlow(false)
+    private var loadMoreJob: Job? = null
+    private var metadataJob: Job? = null
+    private val editMutex = Mutex()
+    private var batchEditJob: Job? = null
+    private var photoGeneration = 0
+    private val queuedOriginals = mutableMapOf<String, ByteArray>()
     private val _downloadTasks = MutableStateFlow<List<DownloadTask>>(emptyList())
     val downloadTasks = _downloadTasks.asStateFlow()
     private val downloadLock = Any()
@@ -120,7 +145,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         registerUsbReceiver()
-        logDiagnostic("APP_STARTED", "APP_READY", message = "Camera Bridge started")
+        logDiagnostic("APP_STARTED", "APP_READY", message = "Link started")
         if (store.consumeInterruptedDownload()) pageTask.value = PageTask("上次下载因应用关闭而中断，请重新连接原相机后创建任务", running = false, failed = true)
         viewModelScope.launch(Dispatchers.IO) { cleanupInterruptedFiles() }
         detectUsbCamera()
@@ -198,6 +223,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         snackbarClearJob = viewModelScope.launch { delay(3_000); if (snackbar.value == message) snackbar.value = null }
     }
 
+    fun notify(message: String) = showSnackbar(message)
+
     private fun showPageProgress(message: String) {
         pageTaskClearJob?.cancel(); pageTask.value = PageTask(message, running = true); noticeClearJob?.cancel(); notice.value = null
     }
@@ -229,7 +256,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 message = if (hasPermission) "已检测到 USB 相机" else "已检测到 USB 相机，等待 USB 访问权限",
             )
         }
-        if (device != null && hasPermission && config.value.usbAutoRead && session.value == null) {
+        if (device != null && hasPermission && session.value == null) {
             connectUsbDevice(device)
         }
     }
@@ -260,6 +287,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun connectUsbDevice(device: UsbDevice) {
+        if (remoteCapture.value.inProgress) { showSnackbar("请等待拍摄完成，或先取消倒计时"); return }
         if (usbConnectJob?.isActive == true) return
         if (session.value?.transport == ConnectionTransport.USB && client != null) {
             loadPhotos()
@@ -278,6 +306,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             result.onSuccess { usb ->
+                remoteSupported.value = false
+                remoteCapture.value = RemoteCaptureState(message = "首版遥控支持 Wi-Fi，请切换连接方式")
                 usbDevice = device
                 logDiagnostic("MTP_OPEN_SUCCEEDED", "MTP_SESSION_OPEN", ConnectionTransport.USB, message = "MTP session opened", durationMs = System.currentTimeMillis() - startedAt, device = device, permissionGranted = true)
                 logDiagnostic("CAMERA_SESSION_STARTED", "CAMERA_SESSION", ConnectionTransport.USB, message = "USB camera session started", device = device, permissionGranted = true)
@@ -290,7 +320,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isBusy.value = false
                 loadPhotos()
             }.onFailure {
-                client?.close(); client = null
+                withContext(Dispatchers.IO) { client?.close(); client = null }
                 logDiagnostic("MTP_OPEN_FAILED", "MTP_SESSION_OPEN", ConnectionTransport.USB, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to open MTP session", durationMs = System.currentTimeMillis() - startedAt, error = it, device = device)
                 usbState.value = usbState.value.copy(ready = false, message = it.message ?: "无法连接 USB 相机")
                 workflow.value = Workflow.WAITING
@@ -306,10 +336,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         usbConnectJob?.cancel()
         if (session.value?.transport == ConnectionTransport.USB) {
             photoLoadJob?.cancel()
+            metadataJob?.cancel()
+            loadMoreJob?.cancel()
             logDiagnostic("MTP_SESSION_LOST", "MTP_SESSION_LOST", ConnectionTransport.USB, level = "ERROR", result = "DISCONNECTED", message = "MTP session lost", device = usbDevice, permissionGranted = false)
             diagnostics.recordUsbConnectionState(false, diagnosticUsbSnapshot(usbDevice, false, false))
             session.value = null
-            photos.value = emptyList(); thumbnails.clear(); hasMorePhotos.value = false; hasLoadedPhotos.value = false
+            photos.value = emptyList(); resetCameraThumbnails(); hasMorePhotos.value = false; hasLoadedPhotos.value = false
             showError("USB 相机已断开，请重新连接数据线", event = "MTP_SESSION_LOST", transport = ConnectionTransport.USB)
         }
         usbDevice = null
@@ -352,6 +384,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         config.update {
             transform(it).let { updated ->
                 updated.copy(
+                    jpegQuality = updated.jpegQuality.coerceIn(80, 100),
                     initialPhotoBatchSize = updated.initialPhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
                     loadMorePhotoBatchSize = updated.loadMorePhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
                 )
@@ -387,8 +420,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearThumbnailCache() {
+        cameraThumbnailCache.clear()
+        localThumbnailCache.clear()
         thumbnails.clear()
+        thumbnailVersion.update { it + 1 }
         showSnackbar("已清理缩略图缓存")
+    }
+
+    private fun resetCameraThumbnails() {
+        cameraThumbnailCache.clear()
+        thumbnails.clear()
+        thumbnailVersion.update { it + 1 }
+    }
+
+    suspend fun loadLocalThumbnail(record: DownloadRecord): Bitmap? = withContext(Dispatchers.IO) {
+        localThumbnailCache.get(record.uri)?.let { return@withContext it }
+        loadDownloadThumbnail(getApplication(), record.uri, getApplication<Application>().mediaKind(record))
+            ?.also { localThumbnailCache.put(record.uri, it) }
     }
 
     fun retry() {
@@ -406,10 +454,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun checkConnectionOnResume() = viewModelScope.launch {
+        if (remoteCapture.value.inProgress) return@launch
         val current = session.value ?: run {
             detectUsbCamera()
             return@launch
         }
+        if (_downloadTasks.value.any { it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING }) return@launch
         val network = cameraNetwork()
         val active = client
         val connected = active != null && withContext(Dispatchers.IO) {
@@ -427,14 +477,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 logDiagnostic("MTP_SESSION_LOST", "MTP_SESSION_LOST", ConnectionTransport.USB, level = "ERROR", result = "DISCONNECTED", message = "MTP session no longer responds", device = usbDevice)
                 diagnostics.recordUsbConnectionState(false, diagnosticUsbSnapshot(usbDevice, false, false))
             }
-            client?.close(); client = null
-            session.value = null; photos.value = emptyList(); thumbnails.clear(); hasMorePhotos.value = false; hasLoadedPhotos.value = false
+            withContext(Dispatchers.IO) { client?.close(); client = null }
+            session.value = null; photos.value = emptyList(); resetCameraThumbnails(); hasMorePhotos.value = false; hasLoadedPhotos.value = false
             val message = if (current.transport == ConnectionTransport.USB) "USB 相机已断开，请重新连接数据线" else "相机 Wi‑Fi 已断开，请重新连接"
             showError(message, event = if (current.transport == ConnectionTransport.USB) "MTP_SESSION_LOST" else "CAMERA_SESSION_LOST", transport = current.transport)
         }
     }
 
     fun connect(manual: Boolean = false) = viewModelScope.launch {
+        if (remoteCapture.value.inProgress) { showSnackbar("请等待拍摄完成，或先取消倒计时"); return@launch }
         val target = config.value
         val network = cameraNetwork()
         if (network == null) {
@@ -443,7 +494,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return@launch
         }
         logDiagnostic("WIFI_NETWORK_FOUND", "NETWORK_LOOKUP", ConnectionTransport.WIFI, message = "Wi-Fi network found")
-        val host = cameraGateway().ifBlank { target.host.trim() }
+        val host = cameraGateway(network).ifBlank { target.host.trim() }
         if (target.host.isBlank() || target.port !in 1..65535) { showError("请填写有效的相机地址和端口"); return@launch }
         isBusy.value = true; workflow.value = Workflow.CONNECTING; notice.value = "正在连接 ${target.host}:${target.port}"
         logDiagnostic("CAMERA_DISCOVERY_STARTED", "CAMERA_DISCOVERY", ConnectionTransport.WIFI, message = "Starting camera discovery")
@@ -453,10 +504,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 client?.close(); PtpIpClient(host, target.port, network.socketFactory).also { it.connect(); client = it }
             }
         }.onSuccess { ptp ->
+            remoteSupported.value = ptp.supportsRemoteCapture
+            remoteCapture.value = RemoteCaptureState(message = if (ptp.supportsRemoteCapture) "相机已连接，可以遥控拍摄" else "当前相机连接未提供遥控拍摄能力")
             logDiagnostic("CAMERA_DISCOVERED", "CAMERA_DISCOVERY", ConnectionTransport.WIFI, message = "Camera discovered: ${ptp.cameraName}")
             logDiagnostic("CAMERA_SESSION_STARTED", "CAMERA_SESSION", ConnectionTransport.WIFI, message = "Wi-Fi camera session started")
             session.value = CameraSession(ptp.cameraName, host, target.port, ConnectionTransport.WIFI, ptp.cameraDetails)
-            if (config.value.keepWifiAlive) keepConnectionAlive(true)
+            keepConnectionAlive(true)
             updateConfig { it.copy(lastCameraName = ptp.cameraName, lastTransport = ConnectionTransport.WIFI) }
             workflow.value = Workflow.CONNECTED; notice.value = "已连接 ${ptp.cameraName} · Wi‑Fi"
             currentSsid()?.let { ssid -> if (ssid.isNotBlank()) updateConfig { c -> c.copy(lastSsid = ssid) } }
@@ -464,6 +517,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             loadPhotos()
         }.onFailure {
             bindCameraNetwork(null)
+            if (requestedCameraNetwork != null) releaseRequestedWifi()
             workflow.value = Workflow.WAITING
             val timeout = it is SocketTimeoutException || it.message.orEmpty().contains("timeout", ignoreCase = true) || it.message.orEmpty().contains("timed out", ignoreCase = true)
             logDiagnostic(if (timeout) "CAMERA_PROTOCOL_TIMEOUT" else "CAMERA_SESSION_LOST", "CAMERA_SESSION", ConnectionTransport.WIFI, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to establish camera session", error = it)
@@ -477,55 +531,241 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         app.startActivity(android.content.Intent(android.provider.Settings.ACTION_WIFI_SETTINGS).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
+    fun connectRecentWifi(ssid: String, password: String) {
+        if (remoteCapture.value.inProgress) { showSnackbar("请等待拍摄完成，或先取消倒计时"); return }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            openWifiSettings()
+            return
+        }
+        if (_downloadTasks.value.any { it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING }) return
+        if (isBusy.value) return
+        val app = getApplication<Application>()
+        val connectivity = app.getSystemService(ConnectivityManager::class.java)
+        releaseRequestedWifi()
+        val request = runCatching {
+            val specifier = WifiNetworkSpecifier.Builder().setSsid(ssid).apply {
+                if (password.isNotEmpty()) setWpa2Passphrase(password)
+            }.build()
+            NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .setNetworkSpecifier(specifier)
+                .build()
+        }.getOrElse {
+            showError("相机 Wi‑Fi 信息无效，请检查热点名称和密码", transport = ConnectionTransport.WIFI)
+            return
+        }
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val activeCallback = this
+                viewModelScope.launch {
+                    if (requestedWifiCallback !== activeCallback) return@launch
+                    requestedCameraNetwork = network
+                    isBusy.value = false
+                    connect(false)
+                }
+            }
+
+            override fun onUnavailable() {
+                val activeCallback = this
+                viewModelScope.launch {
+                    if (requestedWifiCallback !== activeCallback) return@launch
+                    releaseRequestedWifi()
+                    isBusy.value = false
+                    workflow.value = Workflow.WAITING
+                    notice.value = null
+                    showSnackbar("暂时没找到 $ssid，请确认相机热点已开启后重试")
+                }
+            }
+
+            override fun onLost(network: Network) {
+                val activeCallback = this
+                viewModelScope.launch {
+                    if (requestedWifiCallback !== activeCallback || requestedCameraNetwork != network) return@launch
+                    releaseRequestedWifi()
+                    if (session.value?.transport == ConnectionTransport.WIFI) checkConnectionOnResume()
+                }
+            }
+        }
+        requestedWifiCallback = callback
+        isBusy.value = true
+        workflow.value = Workflow.CONNECTING
+        notice.value = "正在切换到相机 Wi‑Fi：$ssid"
+        runCatching { connectivity.requestNetwork(request, callback, 60_000) }.onFailure {
+            releaseRequestedWifi()
+            isBusy.value = false
+            showError("无法发起 Wi‑Fi 连接：${it.message ?: "请检查附近设备权限"}", transport = ConnectionTransport.WIFI)
+        }
+    }
+
+    private fun releaseRequestedWifi() {
+        requestedWifiCallback?.let { callback ->
+            runCatching { getApplication<Application>().getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(callback) }
+        }
+        requestedWifiCallback = null
+        requestedCameraNetwork = null
+    }
+
     fun disconnect() = viewModelScope.launch(Dispatchers.IO) {
+        cancelPendingRemoteCapture()
+        remoteSupported.value = false
+        val closing = client
+        client = null
         val transport = session.value?.transport
+        _downloadTasks.value.filter { it.status == DownloadTaskStatus.QUEUED || it.status == DownloadTaskStatus.DOWNLOADING }
+            .forEach { cancelDownloadTask(it.id) }
         photoLoadJob?.cancel()
+        metadataJob?.cancel()
+        loadMoreJob?.cancel()
         if (transport == ConnectionTransport.USB) {
             logDiagnostic("MTP_SESSION_LOST", "DISCONNECT_REQUESTED", ConnectionTransport.USB, result = "USER_DISCONNECTED", message = "USB session closed by user", device = usbDevice)
             diagnostics.recordUsbConnectionState(false, diagnosticUsbSnapshot(usbDevice, false, false))
         }
-        if (transport == ConnectionTransport.WIFI) { keepConnectionAlive(false); bindCameraNetwork(null) }
-        client?.close(); client = null; hasMorePhotos.value = false; hasLoadedPhotos.value = false
+        if (transport == ConnectionTransport.WIFI) { keepConnectionAlive(false); bindCameraNetwork(null); releaseRequestedWifi() }
+        closing?.close(); hasMorePhotos.value = false; hasLoadedPhotos.value = false
         withContext(Dispatchers.Main) {
-            session.value = null; photos.value = emptyList(); thumbnails.clear(); workflow.value = Workflow.WAITING
+            session.value = null; photos.value = emptyList(); resetCameraThumbnails(); workflow.value = Workflow.WAITING
             notice.value = if (transport == ConnectionTransport.USB) "USB 相机已断开" else "连接已断开"
             if (transport == ConnectionTransport.USB) usbState.value = usbState.value.copy(ready = false, message = "USB 相机未连接")
         }
     }
 
+    fun startRemoteCapture(delaySeconds: Int) {
+        if (remoteCaptureJob?.isActive == true || remoteCapture.value.inProgress) return
+        val active = client
+        val remote = active as? RemoteCameraControl
+        if (session.value?.transport != ConnectionTransport.WIFI || remote == null) {
+            showSnackbar("请先连接相机 Wi-Fi")
+            return
+        }
+        if (!remoteSupported.value) { showSnackbar("当前连接未提供遥控拍摄能力"); return }
+        if (isBusy.value || _downloadTasks.value.any { it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING || it.status == DownloadTaskStatus.QUEUED }) {
+            showSnackbar("请等待相册读取或下载完成后再拍摄")
+            return
+        }
+        val seconds = delaySeconds.takeIf { it in listOf(0, 2, 5, 10) } ?: 0
+        val cancellation = java.util.concurrent.atomic.AtomicBoolean(false)
+        remoteCancellation = cancellation
+        metadataJob?.cancel()
+        loadMoreJob?.cancel()
+        remoteCapture.value = RemoteCaptureState(
+            if (seconds > 0) RemoteCapturePhase.COUNTDOWN else RemoteCapturePhase.PREPARING,
+            seconds, if (seconds > 0) "倒计时结束后拍摄" else "正在准备拍摄",
+        )
+        remoteCaptureJob = viewModelScope.launch {
+            try {
+                for (remaining in seconds downTo 1) {
+                    remoteCapture.value = RemoteCaptureState(RemoteCapturePhase.COUNTDOWN, remaining, "倒计时结束后拍摄")
+                    delay(1000)
+                    if (cancellation.get() || client !== active) throw CancellationException("拍摄已取消")
+                }
+                remoteCapture.value = RemoteCaptureState(RemoteCapturePhase.PREPARING, message = "正在准备拍摄")
+                logDiagnostic("REMOTE_CAPTURE_STARTED", "REMOTE_CAPTURE", ConnectionTransport.WIFI, message = "Starting remote shutter; delay=$seconds")
+                val result = withContext(Dispatchers.IO) {
+                    remote.capture(
+                        isCancelled = { cancellation.get() || client !== active },
+                        onSending = {
+                            synchronized(cancellation) {
+                                if (cancellation.get() || client !== active) throw CancellationException("拍摄已取消")
+                                remoteCapture.value = RemoteCaptureState(RemoteCapturePhase.WAITING, message = "快门指令发送中，正在等待相机确认")
+                            }
+                        },
+                    )
+                }
+                if (client !== active) return@launch
+                remoteCapture.value = RemoteCaptureState(if (result.confirmed) RemoteCapturePhase.CONFIRMED else RemoteCapturePhase.UNKNOWN, message = result.message)
+                logDiagnostic(if (result.confirmed) "REMOTE_CAPTURE_CONFIRMED" else "REMOTE_CAPTURE_UNCONFIRMED", "REMOTE_CAPTURE", ConnectionTransport.WIFI,
+                    level = if (result.confirmed) "INFO" else "WARN", result = if (result.confirmed) "SUCCESS" else "UNKNOWN", message = result.message)
+                if (result.confirmed) loadPhotos()
+            } catch (cancelled: CancellationException) {
+                remoteCapture.value = RemoteCaptureState(message = "已取消待发送的拍摄")
+                throw cancelled
+            } catch (error: Exception) {
+                if (client === active) {
+                    remoteCapture.value = RemoteCaptureState(RemoteCapturePhase.FAILED, message = error.message ?: "遥控拍摄失败，请检查相机状态")
+                    logDiagnostic("REMOTE_CAPTURE_FAILED", "REMOTE_CAPTURE", ConnectionTransport.WIFI, level = "ERROR", result = "FAILED", message = error.message ?: "Remote shutter failed", error = error)
+                }
+            } finally {
+                if (remoteCapture.value.inProgress) remoteCapture.value = RemoteCaptureState(message = "连接已改变，请重新连接后拍摄")
+            }
+        }
+    }
+
+    /** Once WAITING starts, cancellation cannot promise to stop a physical exposure. */
+    fun cancelPendingRemoteCapture() {
+        val cancellation = remoteCancellation
+        synchronized(cancellation) {
+            when (remoteCapture.value.phase) {
+                RemoteCapturePhase.COUNTDOWN -> { cancellation.set(true); remoteCaptureJob?.cancel() }
+                RemoteCapturePhase.PREPARING -> cancellation.set(true)
+                else -> Unit
+            }
+        }
+    }
+
     fun loadPhotos() {
+        if (remoteCapture.value.inProgress) { showSnackbar("拍摄完成后可刷新相册"); return }
         if (photoLoadJob?.isActive == true) return
+        if (_downloadTasks.value.any { it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING }) {
+            showSnackbar("正在传输文件，完成后可刷新相册")
+            return
+        }
+        metadataJob?.cancel()
+        loadMoreJob?.cancel()
+        val generation = ++photoGeneration
+        resetCameraThumbnails()
         photoLoadJob = viewModelScope.launch {
             val active = client ?: run { showError("请先连接相机"); return@launch }
             val batchSize = config.value.initialPhotoBatchSize
             isBusy.value = true; workflow.value = Workflow.LOADING; hasLoadedPhotos.value = false; notice.value = "正在读取相册（首批 ${batchSize} 张）"
             val startedAt = System.currentTimeMillis()
             logDiagnostic("ASSET_LIST_STARTED", "ASSET_LIST", session.value?.transport, message = "Reading first asset page")
+            try {
             runCatching {
                 withContext(Dispatchers.IO) {
                     active.refreshAssets()
                     val result = active.assets(limit = batchSize)
-                    val recent = result.firstOrNull { it.type !in setOf("MOV", "MP4") }?.let { asset ->
-                        active.imageHeader(asset)?.let { header ->
-                            asset to ExifMetadataReader.fromBytes(header, PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt))
-                        }
-                    }
-                    result to recent
+                    result to active.hasMoreAssets(result.size)
                 }
             }
-                .onSuccess { (result, recent) ->
+                .onSuccess { (result, hasMore) ->
+                    if (client !== active || generation != photoGeneration) return@onSuccess
                     photos.value = result
-                    recent?.let { (asset, metadata) -> updateSessionFromPhoto(asset, metadata) }
-                    hasMorePhotos.value = active.hasMoreAssets(photos.value.size)
+                    hasMorePhotos.value = hasMore
                     hasLoadedPhotos.value = true
                     workflow.value = Workflow.CONNECTED; notice.value = "${session.value?.name ?: "相机"} · ${session.value?.transport?.title ?: "Wi‑Fi"} · 已读取 ${result.size} 张"
                     if (session.value?.transport == ConnectionTransport.USB) logDiagnostic("MTP_STORAGE_DISCOVERED", "MTP_STORAGE", ConnectionTransport.USB, message = "MTP storage discovered", device = usbDevice)
                     logDiagnostic("ASSET_LIST_SUCCEEDED", "ASSET_LIST", session.value?.transport, message = "Read ${result.size} assets", durationMs = System.currentTimeMillis() - startedAt)
+                    enrichCameraMetadata(active, result, generation)
                 }.onFailure {
+                    if (it is CancellationException) throw it
                     logDiagnostic("ASSET_LIST_FAILED", "ASSET_LIST", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to read asset list", durationMs = System.currentTimeMillis() - startedAt, error = it)
                     showError(it.message ?: "读取相册失败", event = "ASSET_LIST_FAILED", transport = session.value?.transport)
                 }
-            isBusy.value = false
+            } finally { isBusy.value = false }
+        }
+    }
+
+    private fun enrichCameraMetadata(active: CameraClient, assets: List<PhotoAsset>, generation: Int) {
+        metadataJob = viewModelScope.launch {
+            val stills = assets.filter { !it.name.isVideoName() }
+            val candidates = stills.filter { it.name.endsWith(".jpg", true) || it.name.endsWith(".jpeg", true) }.take(10) +
+                stills.filterNot { it.name.endsWith(".jpg", true) || it.name.endsWith(".jpeg", true) }.take(4)
+            var fallback: Pair<PhotoAsset, PhotoMetadata>? = null
+            for (asset in candidates) {
+                _downloadTasks.first { tasks -> tasks.none { it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING } }
+                if (client !== active || generation != photoGeneration) return@launch
+                val metadata = withContext(Dispatchers.IO) {
+                    runCatching { active.imageHeader(asset)?.let { ExifMetadataReader.fromBytes(it, PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt)) } }.getOrNull()
+                } ?: continue
+                if (client !== active || generation != photoGeneration) return@launch
+                if (fallback == null) fallback = asset to metadata
+                if (metadata.lensModel != null) {
+                    updateSessionFromPhoto(asset, metadata)
+                    return@launch
+                }
+            }
+            fallback?.let { (asset, metadata) -> updateSessionFromPhoto(asset, metadata) }
         }
     }
 
@@ -547,33 +787,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun loadMorePhotos() = viewModelScope.launch {
-        if (isBusy.value || !hasMorePhotos.value) return@launch
-        val active = client ?: return@launch
-        isBusy.value = true; notice.value = "正在加载更多"
-        logDiagnostic("ASSET_LIST_STARTED", "ASSET_LIST", session.value?.transport, message = "Reading next asset page")
-        runCatching { withContext(Dispatchers.IO) { active.assets(photos.value.size, config.value.loadMorePhotoBatchSize) } }
-            .onSuccess { page ->
-                val merged = photos.value + page
-                photos.value = merged
-                hasMorePhotos.value = active.hasMoreAssets(merged.size)
-                notice.value = if (hasMorePhotos.value) "已读取 ${merged.size} 张" else "已全部加载"
-                logDiagnostic("ASSET_LIST_SUCCEEDED", "ASSET_LIST", session.value?.transport, message = "Read ${page.size} more assets")
+    fun loadMorePhotos() {
+        if (loadMoreJob?.isActive == true || !hasMorePhotos.value || photoLoadJob?.isActive == true) return
+        val generation = photoGeneration
+        loadMoreJob = viewModelScope.launch {
+            val active = client ?: return@launch
+            isLoadingMorePhotos.value = true
+            try {
+                _downloadTasks.first { tasks -> tasks.none { it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING } }
+                if (client !== active || generation != photoGeneration) return@launch
+                val offset = photos.value.size
+                logDiagnostic("ASSET_LIST_STARTED", "ASSET_LIST", session.value?.transport, message = "Reading next asset page")
+                runCatching { withContext(Dispatchers.IO) {
+                    val page = active.assets(offset, config.value.loadMorePhotoBatchSize)
+                    page to active.hasMoreAssets(offset + page.size)
+                } }.onSuccess { (page, hasMore) ->
+                    if (client !== active || generation != photoGeneration) return@onSuccess
+                    photos.value = photos.value + page
+                    hasMorePhotos.value = hasMore
+                    notice.value = if (hasMore) "已读取 ${photos.value.size} 张" else "已全部加载"
+                }.onFailure {
+                    if (it is CancellationException) throw it
+                    showError(it.message ?: "继续读取照片失败", event = "ASSET_LIST_FAILED", transport = session.value?.transport)
+                }
+            } finally {
+                isLoadingMorePhotos.value = false
             }
-            .onFailure {
-                logDiagnostic("ASSET_LIST_FAILED", "ASSET_LIST", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to read more assets", error = it)
-                showError(it.message ?: "继续读取照片失败", event = "ASSET_LIST_FAILED", transport = session.value?.transport)
-            }
-        isBusy.value = false
+        }
     }
 
     fun loadThumbnail(asset: PhotoAsset) {
-        if (thumbnails.containsKey(asset.handle)) return
-        thumbnails[asset.handle] = null
+        if (cameraThumbnailCache.get(asset.handle) != null) return
+        val generation = photoGeneration
+        val loadKey = "$generation:${asset.handle}"
+        if (!thumbnailLoads.add(loadKey)) return
+        val camera = client
         viewModelScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
-                    val active = client ?: return@withContext null
+                    val active = camera ?: return@withContext null
                     val data = active.thumbnail(asset) ?: return@withContext null
                     val orientation = OrientedBitmaps.orientationOrNull(data)
                         ?: active.imageHeader(asset)?.let(OrientedBitmaps::orientationOrNull)
@@ -582,12 +834,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             result.onSuccess { bitmap ->
-                thumbnails[asset.handle] = bitmap
+                if (bitmap != null && client === camera && generation == photoGeneration) keepSharperThumbnail(asset.handle, bitmap)
                 if (bitmap == null) logDiagnostic("THUMBNAIL_LOAD_FAILED", "THUMBNAIL", session.value?.transport, level = "WARN", result = "FAILED", message = "Unable to decode thumbnail ${asset.name}")
             }.onFailure {
-                thumbnails[asset.handle] = null
                 logDiagnostic("THUMBNAIL_LOAD_FAILED", "THUMBNAIL", session.value?.transport, level = "WARN", result = "FAILED", message = it.message ?: "Unable to load thumbnail ${asset.name}", error = it)
             }
+            thumbnailLoads.remove(loadKey)
         }
     }
 
@@ -598,13 +850,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }.onFailure { logDiagnostic("ORIGINAL_LOAD_FAILED", "ORIGINAL_PREVIEW", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to load original ${asset.name}", error = it) }.getOrNull()
     }
 
+    private suspend fun readCameraOriginal(active: CameraClient, asset: PhotoAsset): ByteArray {
+        val context = currentCoroutineContext()
+        val output = java.io.ByteArrayOutputStream(asset.size.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+        active.downloadTo(asset, output, { _, _ -> }, isCancelled = { !context.isActive })
+        context.ensureActive()
+        return output.toByteArray()
+    }
+
     suspend fun loadOriginalPhoto(asset: PhotoAsset): LoadedPhoto? = withContext(Dispatchers.IO) {
         runCatching {
-            val bytes = client?.download(asset) { _, _ -> } ?: return@runCatching null
+            val camera = client ?: return@runCatching null
+            val bytes = readCameraOriginal(camera, asset)
             val bitmap = decodePreviewBitmap(bytes) ?: return@runCatching null
+            val thumbnail = scaledThumbnail(bitmap)
+            withContext(Dispatchers.Main) { if (client === camera) keepSharperThumbnail(asset.handle, thumbnail) }
             val fallback = PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt)
             LoadedPhoto(bitmap, ExifMetadataReader.fromBytes(bytes, fallback), bytes)
-        }.onFailure { logDiagnostic("ORIGINAL_LOAD_FAILED", "ORIGINAL_PREVIEW", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to load original ${asset.name}", error = it) }.getOrNull()
+        }.onFailure { if (it is CancellationException) throw it; logDiagnostic("ORIGINAL_LOAD_FAILED", "ORIGINAL_PREVIEW", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to load original ${asset.name}", error = it) }.getOrNull()
     }
 
     private fun decodePreviewBitmap(bytes: ByteArray, maxEdge: Int = 2560): Bitmap? {
@@ -636,7 +899,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val sourceName = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
                     cursor.takeIf { it.moveToFirst() }?.getString(0)
                 }?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment?.substringAfterLast('/') ?: "LUT"
-                val bytes = resolver.openInputStream(uri)?.use { it.readBytes() } ?: error("无法读取 LUT 文件")
+                val bytes = resolver.openInputStream(uri)?.use { it.readBytes() } ?: error("无法读取预设文件")
                 val imported = LutImporters.parse(sourceName, bytes)
                 val lut = imported.lut
                 val id = "${System.currentTimeMillis()}_${lut.name.replace(Regex("[^A-Za-z0-9_-]"), "_")}.${imported.format.lowercase()}"
@@ -656,9 +919,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }.onSuccess { (entry, _) ->
             luts.value = luts.value + entry
             store.saveLuts(luts.value)
-            showSnackbar("已导入 LUT：${entry.name}")
-        }.onFailure { showError(it.message ?: "导入 LUT 失败") }
+            showSnackbar("已导入预设：${entry.name}")
+        }.onFailure { showError(it.message ?: "导入预设失败") }
         onFinished()
+    }
+
+    private fun scaledThumbnail(bitmap: Bitmap, maxEdge: Int = 960): Bitmap {
+        val longest = maxOf(bitmap.width, bitmap.height)
+        if (longest <= maxEdge) return bitmap
+        val factor = maxEdge.toFloat() / longest
+        return Bitmap.createScaledBitmap(bitmap,
+            (bitmap.width * factor).roundToInt().coerceAtLeast(1),
+            (bitmap.height * factor).roundToInt().coerceAtLeast(1), true)
+    }
+
+    private fun keepSharperThumbnail(handle: UInt, candidate: Bitmap) {
+        val current = thumbnails[handle]
+        if (current == null || candidate.width.toLong() * candidate.height > current.width.toLong() * current.height) {
+            thumbnails[handle] = candidate
+            cameraThumbnailCache.put(handle, candidate)
+        }
     }
 
     suspend fun readLut(entry: LutEntry): CubeLut = withContext(Dispatchers.IO) {
@@ -681,7 +961,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         store.saveLuts(luts.value)
         recentLutIds.value = recentLutIds.value.filterNot { it == entry.id }
         store.saveRecentLuts(recentLutIds.value)
-        showSnackbar("已删除 LUT")
+        showSnackbar("已删除预设")
     }
 
     fun updateLut(entry: LutEntry, name: String = entry.name, category: LutCategory = entry.category) {
@@ -689,14 +969,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         luts.value = luts.value.map { if (it.id == entry.id) updated else it }
         store.saveLuts(luts.value)
         when {
-            updated.name != entry.name -> showSnackbar("已重命名 LUT")
-            updated.category != entry.category -> showSnackbar("已修改 LUT 分类")
+            updated.name != entry.name -> showSnackbar("已重命名预设")
+            updated.category != entry.category -> showSnackbar("已修改预设分类")
         }
     }
 
     suspend fun loadLut(uri: Uri): Result<CubeLut> = withContext(Dispatchers.IO) {
         runCatching {
-            val source = getApplication<Application>().contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: error("无法读取 LUT 文件")
+            val source = getApplication<Application>().contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: error("无法读取预设文件")
             CubeLuts.parse(uri.lastPathSegment ?: "LUT", source)
         }
     }
@@ -709,10 +989,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val result = runCatching { withContext(Dispatchers.IO) { saveLutBitmap(asset, bitmap, lut.name) } }
         result.onSuccess { record ->
             logDiagnostic("LUT_EXPORT_SUCCEEDED", "LUT_EXPORT", session.value?.transport, message = "LUT export completed: ${record.name}")
-            store.addDownload(record); downloads.value = store.downloads(); workflow.value = Workflow.CONNECTED; if (!inline) showTransient("已导出套 LUT 图片")
+            recordDownload(record); workflow.value = Workflow.CONNECTED; if (!inline) showTransient("已导出调色图片")
         }.onFailure {
             logDiagnostic("LUT_EXPORT_FAILED", "LUT_EXPORT", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "LUT export failed", error = it)
-            if (inline) workflow.value = Workflow.CONNECTED else showError(it.message ?: "导出 LUT 图片失败", event = "LUT_EXPORT_FAILED", transport = session.value?.transport)
+            if (inline) workflow.value = Workflow.CONNECTED else showError(it.message ?: "导出调色图片失败", event = "LUT_EXPORT_FAILED", transport = session.value?.transport)
         }
         clearExportNotif(); isBusy.value = false; onFinished(result)
     }
@@ -725,86 +1005,91 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val result = runCatching { withContext(Dispatchers.IO) { saveLutBitmap(PhotoAsset(0u, record.name, record.size, 0x3801), bitmap, lut.name) } }
         result.onSuccess { output ->
             logDiagnostic("LUT_EXPORT_SUCCEEDED", "LUT_EXPORT", message = "Local LUT export completed: ${output.name}")
-            store.addDownload(output); downloads.value = store.downloads(); workflow.value = Workflow.CONNECTED; if (!inline) showTransient("已导出套 LUT 图片")
+            recordDownload(output); workflow.value = Workflow.CONNECTED; if (!inline) showTransient("已导出调色图片")
         }.onFailure {
             logDiagnostic("LUT_EXPORT_FAILED", "LUT_EXPORT", level = "ERROR", result = "FAILED", message = it.message ?: "LUT export failed", error = it)
-            if (inline) workflow.value = Workflow.CONNECTED else showError(it.message ?: "导出 LUT 图片失败", event = "LUT_EXPORT_FAILED")
+            if (inline) workflow.value = Workflow.CONNECTED else showError(it.message ?: "导出调色图片失败", event = "LUT_EXPORT_FAILED")
         }
         clearExportNotif(); isBusy.value = false; onFinished(result)
     }
 
-    fun downloadAllWithLut(assets: List<PhotoAsset>, lut: CubeLut, onFinished: () -> Unit = {}): Job = viewModelScope.launch {
-        val retry: () -> Unit = { downloadAllWithLut(assets, lut, onFinished); Unit }
-        pageRetry = retry
-        val active = client ?: run { showPageError("套 LUT 失败：相机连接已断开"); return@launch }
-        isBusy.value = true; workflow.value = Workflow.DOWNLOADING
-        showPageProgress("正在套用 LUT 0 / ${assets.size}")
-        logDiagnostic("LUT_EXPORT_STARTED", "LUT_EXPORT_BATCH", session.value?.transport, message = "Batch LUT export started: ${assets.size} assets")
-        var completed = 0
-        var skipped = 0
-        assets.forEachIndexed { index, asset ->
-            if (!asset.name.supportsLutInput()) {
-                skipped++
-            } else runCatching {
-                withContext(Dispatchers.IO) {
-                    val bytes = active.download(asset) { _, _ -> }
-                    val bitmap = OrientedBitmaps.decode(bytes) ?: error("无法解码 ${asset.name}")
-                    saveLutBitmap(asset, CubeLuts.apply(bitmap, lut), lut.name)
-                }
-            }.onSuccess { store.addDownload(it); completed++ }
-                .onFailure { error ->
-                    logDiagnostic("LUT_EXPORT_FAILED", "LUT_EXPORT_BATCH", session.value?.transport, level = "WARN", result = "FAILED", message = "Skipped ${asset.name}: ${error.message ?: "processing failed"}", error = error)
-                    skipped++
-                }
-            showPageProgress("正在套用 LUT ${index + 1} / ${assets.size}")
-            updateExportNotif(asset.name, index + 1, assets.size)
+    private fun <T> launchBatchEdits(
+        items: List<T>,
+        title: String,
+        supported: (T) -> Boolean,
+        fileName: (T) -> String,
+        onFinished: () -> Unit,
+        process: suspend (T) -> DownloadRecord,
+    ): Job {
+        batchEditJob?.takeIf { it.isActive }?.let {
+            showSnackbar("已有批量任务正在处理，请稍候")
+            return it
         }
-        downloads.value = store.downloads(); workflow.value = Workflow.CONNECTED
-        clearExportNotif()
-        showPageSuccess(if (skipped == 0) "已导出 $completed 张套 LUT 图片" else "已导出 $completed 张，跳过 $skipped 个文件")
-        isBusy.value = false
-        onFinished()
+        val job = viewModelScope.launch {
+            editMutex.withLock {
+                isBusy.value = true
+                var completed = 0
+                var unsupported = 0
+                val failed = mutableListOf<T>()
+                showPageProgress("正在$title 0 / ${items.size}")
+                try {
+                    items.forEachIndexed { index, item ->
+                        if (!supported(item)) unsupported++
+                        else try {
+                            withContext(Dispatchers.IO) { store.addDownload(process(item)) }
+                            completed++
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Exception) {
+                            failed += item
+                            logDiagnostic("EDIT_EXPORT_FAILED", "EDIT_EXPORT_BATCH", level = "WARN", result = "FAILED", message = "${fileName(item)}: ${error.message}", error = error)
+                        }
+                        showPageProgress("正在$title ${index + 1} / ${items.size}")
+                        updateExportNotif(fileName(item), index + 1, items.size)
+                    }
+                    downloads.value = withContext(Dispatchers.IO) { store.downloads() }
+                    val message = "已导出 $completed 张，失败 ${failed.size} 张，跳过 $unsupported 个不支持的文件"
+                    if (failed.isNotEmpty()) {
+                        pageRetry = { launchBatchEdits(failed.toList(), title, supported, fileName, onFinished, process); Unit }
+                        showPageError(message)
+                    } else {
+                        pageRetry = null
+                        showPageSuccess(message)
+                    }
+                    onFinished()
+                } finally {
+                    clearExportNotif()
+                    isBusy.value = false
+                }
+            }
+        }
+        batchEditJob = job
+        return job
     }
 
-    fun applyLutToDownloads(records: List<DownloadRecord>, lut: CubeLut, onFinished: () -> Unit = {}): Job = viewModelScope.launch {
-        val retry: () -> Unit = { applyLutToDownloads(records, lut, onFinished); Unit }
-        pageRetry = retry
-        isBusy.value = true; workflow.value = Workflow.DOWNLOADING
-        showPageProgress("正在套用 LUT 0 / ${records.size}")
-        logDiagnostic("LUT_EXPORT_STARTED", "LUT_EXPORT_BATCH", message = "Batch local LUT export started: ${records.size} files")
-        var completed = 0
-        var skipped = 0
-        records.forEachIndexed { index, record ->
-            if (!record.name.supportsLutInput()) {
-                skipped++
-            } else runCatching {
-                withContext(Dispatchers.IO) {
-                    val bytes = getApplication<Application>().contentResolver.openInputStream(Uri.parse(record.uri))?.use { it.readBytes() }
-                        ?: error("无法读取 ${record.name}")
-                    val bitmap = OrientedBitmaps.decode(bytes) ?: error("无法解码 ${record.name}")
-                    saveLutBitmap(PhotoAsset(0u, record.name, record.size, 0x3801), CubeLuts.apply(bitmap, lut), lut.name)
-                }
-            }.onSuccess { store.addDownload(it); completed++ }
-                .onFailure { error ->
-                    logDiagnostic("LUT_EXPORT_FAILED", "LUT_EXPORT_BATCH", level = "WARN", result = "FAILED", message = "Skipped ${record.name}: ${error.message ?: "processing failed"}", error = error)
-                    skipped++
-                }
-            showPageProgress("正在套用 LUT ${index + 1} / ${records.size}")
-            updateExportNotif(record.name, index + 1, records.size)
+    fun downloadAllWithLut(assets: List<PhotoAsset>, lut: CubeLut, onFinished: () -> Unit = {}): Job {
+        val sourceSession = session.value
+        return launchBatchEdits(assets, "套用预设", { it.name.supportsLutInput() }, { it.name }, onFinished) { asset ->
+            check(asset.downloadSourceKey(session.value) == asset.downloadSourceKey(sourceSession)) { "请连接创建任务时的原相机后重试" }
+            val active = client ?: error("相机连接已断开")
+            val bytes = active.download(asset) { _, _ -> }
+            renderAndSaveOriginal(asset, bytes, lut, null, lut.name, config.value.jpegQuality, PhotoMetadata(capturedAt = asset.capturedAt))
         }
-        downloads.value = store.downloads(); workflow.value = Workflow.CONNECTED
-        clearExportNotif()
-        showPageSuccess("已导出 $completed 张，跳过 $skipped 个不支持的文件。")
-        isBusy.value = false
-        onFinished()
     }
+
+    fun applyLutToDownloads(records: List<DownloadRecord>, lut: CubeLut, onFinished: () -> Unit = {}): Job =
+        launchBatchEdits(records, "套用预设", { it.name.supportsLutInput() && !it.name.isVideoName() }, { it.name }, onFinished) { record ->
+            val bytes = getApplication<Application>().contentResolver.openInputStream(Uri.parse(record.uri))?.use { it.readBytes() }
+                ?: error("无法读取 ${record.name}")
+            renderAndSaveOriginal(PhotoAsset(0u, record.name, record.size, 0x3801), bytes, lut, null, lut.name, config.value.jpegQuality, PhotoMetadata(capturedAt = Date(record.completedAt)))
+        }
 
     fun exportEditedPhoto(
         asset: PhotoAsset,
         lut: CubeLut?,
         watermark: WatermarkPreset?,
         suffix: String,
-        quality: Int = 95,
+        quality: Int = config.value.jpegQuality,
         rotation: Int = 0,
         sourceBytes: ByteArray? = null,
         lutIntensity: Float = 1f,
@@ -830,14 +1115,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         lutEntry: LutEntry?,
         watermark: WatermarkPreset?,
         suffix: String,
-        quality: Int = 95,
+        quality: Int = config.value.jpegQuality,
         rotation: Int = 0,
         sourceBytes: ByteArray? = null,
         lutIntensity: Float = 1f,
         inline: Boolean = false,
         onFinished: (Result<DownloadRecord>) -> Unit = {},
     ): Job = launchEditedExport(record.name, null, inline, onFinished) {
-        if (getApplication<Application>().mediaKind(record) == MediaKind.VIDEO) error("视频暂不支持 LUT 和水印")
+        if (getApplication<Application>().mediaKind(record) == MediaKind.VIDEO) error("视频暂不支持调色和水印")
         val bytes = sourceBytes ?: getApplication<Application>().contentResolver.openInputStream(Uri.parse(record.uri))?.use { it.readBytes() }
             ?: error("无法读取 ${record.name}")
         renderAndSaveOriginal(
@@ -863,46 +1148,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         onProgress: (Int) -> Unit = {},
         onFinished: (Result<DownloadRecord>) -> Unit = {},
     ): Job = viewModelScope.launch {
-        require(getApplication<Application>().mediaKind(record) == MediaKind.VIDEO) { "只能导出视频文件" }
-        isBusy.value = true
-        workflow.value = Workflow.DOWNLOADING
-        val app = getApplication<Application>()
-        val tempDirectory = app.externalCacheDir ?: app.cacheDir
-        var temp: java.io.File? = null
-        val result = runCatching {
-            requireVideoExportSpace(tempDirectory, record.size.coerceAtLeast(256L * 1024 * 1024) + 256L * 1024 * 1024, "生成视频")
-            val outputFile = java.io.File.createTempFile("camera_bridge_video_", ".mp4", tempDirectory).also { temp = it }
-            logDiagnostic("VIDEO_EXPORT_STARTED", "VIDEO_EXPORT", message = "Hardware export started: ${record.name}")
-            updateVideoExportNotif(record.name, 0)
-            VideoLutExporter.export(
-                context = getApplication(),
-                input = Uri.parse(record.uri),
-                output = outputFile,
-                lut = lut,
-                intensity = lutIntensity,
-                clockwiseQuarterTurns = clockwiseQuarterTurns,
-            ) { progress ->
-                onProgress(progress)
-                updateVideoExportNotif(record.name, progress)
+        editMutex.withLock {
+            require(getApplication<Application>().mediaKind(record) == MediaKind.VIDEO) { "只能导出视频文件" }
+            var temp: java.io.File? = null
+            try {
+                isBusy.value = true
+                workflow.value = Workflow.DOWNLOADING
+                val app = getApplication<Application>()
+                val tempDirectory = app.externalCacheDir ?: app.cacheDir
+                val result = runCatching {
+                    requireVideoExportSpace(tempDirectory, record.size.coerceAtLeast(256L * 1024 * 1024) + 256L * 1024 * 1024, "生成视频")
+                    val outputFile = java.io.File.createTempFile("camera_bridge_video_", ".mp4", tempDirectory).also { temp = it }
+                    logDiagnostic("VIDEO_EXPORT_STARTED", "VIDEO_EXPORT", message = "Hardware export started: ${record.name}")
+                    updateVideoExportNotif(record.name, 0)
+                    VideoLutExporter.export(
+                        context = getApplication(),
+                        input = Uri.parse(record.uri),
+                        output = outputFile,
+                        lut = lut,
+                        intensity = lutIntensity,
+                        clockwiseQuarterTurns = clockwiseQuarterTurns,
+                    ) { progress ->
+                        onProgress(progress)
+                        updateVideoExportNotif(record.name, progress)
+                    }
+                    requireVideoExportSpace(Environment.getExternalStorageDirectory(), outputFile.length() + 128L * 1024 * 1024, "保存到相册")
+                    withContext(Dispatchers.IO) { saveExportedVideo(record, outputFile, suffix) }
+                }
+                temp?.delete()
+                result.onSuccess { output ->
+                    recordDownload(output)
+                    logDiagnostic("VIDEO_EXPORT_SUCCEEDED", "VIDEO_EXPORT", message = "Video export completed: ${output.name}")
+                    showSnackbar(if (config.value.autoExport) "视频已导出到相册" else "视频已保存到下载目录")
+                }.onFailure { error ->
+                    if (error is CancellationException) throw error
+                    logDiagnostic("VIDEO_EXPORT_FAILED", "VIDEO_EXPORT", level = "ERROR", result = "FAILED", message = error.message ?: "Video export failed", error = error)
+                    showSnackbar("视频导出失败：${error.message ?: "未知错误"}")
+                }
+                workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
+                clearExportNotif()
+                isBusy.value = false
+                onFinished(result)
+            } finally {
+                temp?.delete()
+                isBusy.value = false
+                clearExportNotif()
+                if (workflow.value == Workflow.DOWNLOADING) workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
             }
-            requireVideoExportSpace(Environment.getExternalStorageDirectory(), outputFile.length() + 128L * 1024 * 1024, "保存到相册")
-            withContext(Dispatchers.IO) { saveExportedVideo(record, outputFile, suffix) }
         }
-        temp?.delete()
-        result.onSuccess { output ->
-            store.addDownload(output)
-            downloads.value = store.downloads()
-            logDiagnostic("VIDEO_EXPORT_SUCCEEDED", "VIDEO_EXPORT", message = "Video export completed: ${output.name}")
-            showSnackbar("视频已导出到相册")
-        }.onFailure { error ->
-            logDiagnostic("VIDEO_EXPORT_FAILED", "VIDEO_EXPORT", level = "ERROR", result = "FAILED", message = error.message ?: "Video export failed", error = error)
-            showSnackbar("视频导出失败：${error.message ?: "未知错误"}")
-        }
-        workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
-        clearExportNotif()
-        isBusy.value = false
-        onFinished(result)
     }
+
 
     private fun requireVideoExportSpace(directory: java.io.File, requiredBytes: Long, stage: String) {
         val available = StatFs(directory.absolutePath).availableBytes
@@ -918,6 +1213,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
         val resolver = app.contentResolver
         val pendingFolders = listOf(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_PICTURES}/Link/",
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_MOVIES}/Link/",
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_DOWNLOADS}/Link/",
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_PICTURES}/Camera_Bridge/",
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_MOVIES}/Camera_Bridge/",
             MediaStore.Downloads.EXTERNAL_CONTENT_URI to "${Environment.DIRECTORY_DOWNLOADS}/Camera_Bridge/",
@@ -944,27 +1242,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         onFinished: (Result<DownloadRecord>) -> Unit,
         export: suspend () -> DownloadRecord,
     ): Job = viewModelScope.launch {
-        isBusy.value = true
-        workflow.value = Workflow.DOWNLOADING
-        if (!inline) notice.value = "正在导出 $sourceName"
-        logDiagnostic("WATERMARK_EXPORT_STARTED", "EDIT_EXPORT", transport, message = "Exporting original file: $sourceName")
-        updateExportNotif(sourceName, 0, 0)
-        val result = runCatching { withContext(Dispatchers.IO) { export() } }
-        result.onSuccess { record ->
-            store.addDownload(record)
-            downloads.value = store.downloads()
-            workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
-            logDiagnostic("WATERMARK_EXPORT_SUCCEEDED", "EDIT_EXPORT", transport, message = "Edit export completed: ${record.name}")
-            if (!inline) showTransient("已导出编辑图片")
-        }.onFailure {
-            workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
-            logDiagnostic("WATERMARK_EXPORT_FAILED", "EDIT_EXPORT", transport, level = "ERROR", result = "FAILED", message = it.message ?: "Edit export failed", error = it)
-            if (!inline) showError(it.message ?: "导出编辑图片失败", event = "WATERMARK_EXPORT_FAILED", transport = transport)
+        editMutex.withLock {
+            try {
+                isBusy.value = true
+                workflow.value = Workflow.DOWNLOADING
+                if (!inline) notice.value = "正在导出 $sourceName"
+                logDiagnostic("WATERMARK_EXPORT_STARTED", "EDIT_EXPORT", transport, message = "Exporting original file: $sourceName")
+                updateExportNotif(sourceName, 0, 0)
+                val result = runCatching { withContext(Dispatchers.IO) { export() } }
+                result.onSuccess { record ->
+                    recordDownload(record)
+                    workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
+                    logDiagnostic("WATERMARK_EXPORT_SUCCEEDED", "EDIT_EXPORT", transport, message = "Edit export completed: ${record.name}")
+                    if (!inline) showTransient("已导出编辑图片")
+                }.onFailure {
+                    if (it is CancellationException) throw it
+                    workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
+                    logDiagnostic("WATERMARK_EXPORT_FAILED", "EDIT_EXPORT", transport, level = "ERROR", result = "FAILED", message = it.message ?: "Edit export failed", error = it)
+                    if (!inline) showError(it.message ?: "导出编辑图片失败", event = "WATERMARK_EXPORT_FAILED", transport = transport)
+                }
+                clearExportNotif()
+                isBusy.value = false
+                onFinished(result)
+            } finally {
+                isBusy.value = false
+                clearExportNotif()
+                if (workflow.value == Workflow.DOWNLOADING) workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
+            }
         }
-        clearExportNotif()
-        isBusy.value = false
-        onFinished(result)
     }
+
 
     private fun renderAndSaveOriginal(
         asset: PhotoAsset,
@@ -1006,97 +1313,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun applyLutAndWatermarkToDownloads(records: List<DownloadRecord>, lut: CubeLut, preset: WatermarkPreset, onFinished: () -> Unit = {}): Job = processLocalEdits(records, lut, preset, onFinished)
 
     private fun processRemoteEdits(assets: List<PhotoAsset>, lut: CubeLut?, preset: WatermarkPreset, onFinished: () -> Unit): Job {
-        val retry: () -> Unit = { processRemoteEdits(assets, lut, preset, onFinished); Unit }
-        pageRetry = retry
-        return viewModelScope.launch {
-            val active = client ?: run { showPageError("添加水印失败：相机连接已断开"); return@launch }
-            if (assets.isEmpty()) return@launch
-            val title = if (lut == null) "添加水印" else "套 LUT + 水印"
-            val suffix = if (lut == null) "Watermark" else "${lut.name}_Watermark"
-            isBusy.value = true
-            workflow.value = Workflow.DOWNLOADING
-            showPageProgress("正在$title 0 / ${assets.size}")
-            logDiagnostic("WATERMARK_EXPORT_STARTED", "EDIT_EXPORT_BATCH", session.value?.transport, message = "Batch $title started: ${assets.size} assets")
-            var completed = 0
-            var skipped = 0
-            assets.forEachIndexed { index, asset ->
-                if (!asset.name.supportsLutInput()) {
-                    skipped++
-                } else runCatching {
-                    withContext(Dispatchers.IO) {
-                        val bytes = active.download(asset) { _, _ -> }
-                        renderAndSaveOriginal(
-                            asset,
-                            bytes,
-                            lut,
-                            preset,
-                            suffix,
-                            preset.quality,
-                            PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt),
-                        )
-                    }
-                }.onSuccess { store.addDownload(it); completed++ }.onFailure { error ->
-                    logDiagnostic("WATERMARK_EXPORT_FAILED", "EDIT_EXPORT_BATCH", session.value?.transport, level = "WARN", result = "FAILED", message = "Skipped ${asset.name}: ${error.message ?: "processing failed"}", error = error)
-                    skipped++
-                }
-                showPageProgress("正在$title ${index + 1} / ${assets.size}")
-                updateExportNotif(asset.name, index + 1, assets.size)
-            }
-            downloads.value = store.downloads()
-            workflow.value = Workflow.CONNECTED
-            clearExportNotif()
-            logDiagnostic("WATERMARK_EXPORT_SUCCEEDED", "EDIT_EXPORT_BATCH", session.value?.transport, message = "Batch $title completed: $completed exported, $skipped skipped")
-            showPageSuccess(if (skipped == 0) "已导出 $completed 张水印图片" else "已导出 $completed 张，跳过 $skipped 个不支持或失败的文件")
-            isBusy.value = false
-            onFinished()
+        val sourceSession = session.value
+        val title = if (lut == null) "添加水印" else "调色 + 水印"
+        val suffix = if (lut == null) "Watermark" else "${lut.name}_Watermark"
+        return launchBatchEdits(assets, title, { it.name.supportsLutInput() }, { it.name }, onFinished) { asset ->
+            check(asset.downloadSourceKey(session.value) == asset.downloadSourceKey(sourceSession)) { "请连接创建任务时的原相机后重试" }
+            val active = client ?: error("相机连接已断开")
+            val bytes = active.download(asset) { _, _ -> }
+            renderAndSaveOriginal(asset, bytes, lut, preset, suffix, preset.quality, PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt))
         }
     }
 
     private fun processLocalEdits(records: List<DownloadRecord>, lut: CubeLut?, preset: WatermarkPreset, onFinished: () -> Unit): Job {
-        val retry: () -> Unit = { processLocalEdits(records, lut, preset, onFinished); Unit }
-        pageRetry = retry
-        return viewModelScope.launch {
-            if (records.isEmpty()) return@launch
-            val title = if (lut == null) "添加水印" else "套 LUT + 水印"
-            val suffix = if (lut == null) "Watermark" else "${lut.name}_Watermark"
-            isBusy.value = true
-            workflow.value = Workflow.DOWNLOADING
-            showPageProgress("正在$title 0 / ${records.size}")
-            logDiagnostic("WATERMARK_EXPORT_STARTED", "EDIT_EXPORT_BATCH", message = "Batch local $title started: ${records.size} files")
-            var completed = 0
-            var skipped = 0
-            val app = getApplication<Application>()
-            records.forEachIndexed { index, record ->
-                if (app.mediaKind(record) == MediaKind.VIDEO || !record.name.supportsLutInput()) {
-                    skipped++
-                } else runCatching {
-                    withContext(Dispatchers.IO) {
-                        val bytes = getApplication<Application>().contentResolver.openInputStream(Uri.parse(record.uri))?.use { it.readBytes() }
-                            ?: error("无法读取 ${record.name}")
-                        renderAndSaveOriginal(
-                            PhotoAsset(0u, record.name, record.size, 0x3801),
-                            bytes,
-                            lut,
-                            preset,
-                            suffix,
-                            preset.quality,
-                            PhotoMetadata(capturedAt = Date(record.completedAt)),
-                        )
-                    }
-                }.onSuccess { store.addDownload(it); completed++ }.onFailure { error ->
-                    logDiagnostic("WATERMARK_EXPORT_FAILED", "EDIT_EXPORT_BATCH", level = "WARN", result = "FAILED", message = "Skipped ${record.name}: ${error.message ?: "processing failed"}", error = error)
-                    skipped++
-                }
-                showPageProgress("正在$title ${index + 1} / ${records.size}")
-                updateExportNotif(record.name, index + 1, records.size)
-            }
-            downloads.value = store.downloads()
-            workflow.value = Workflow.CONNECTED
-            clearExportNotif()
-            logDiagnostic("WATERMARK_EXPORT_SUCCEEDED", "EDIT_EXPORT_BATCH", message = "Batch local $title completed: $completed exported, $skipped skipped")
-            showPageSuccess(if (skipped == 0) "已导出 $completed 张水印图片" else "已导出 $completed 张，跳过 $skipped 个不支持或失败的文件")
-            isBusy.value = false
-            onFinished()
+        val title = if (lut == null) "添加水印" else "调色 + 水印"
+        val suffix = if (lut == null) "Watermark" else "${lut.name}_Watermark"
+        return launchBatchEdits(records, title, { it.name.supportsLutInput() && !it.name.isVideoName() }, { it.name }, onFinished) { record ->
+            val bytes = getApplication<Application>().contentResolver.openInputStream(Uri.parse(record.uri))?.use { it.readBytes() }
+                ?: error("无法读取 ${record.name}")
+            renderAndSaveOriginal(PhotoAsset(0u, record.name, record.size, 0x3801), bytes, lut, preset, suffix, preset.quality, PhotoMetadata(capturedAt = Date(record.completedAt)))
         }
     }
 
@@ -1120,11 +1354,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }.getOrNull()
     }
 
-    fun enqueueDownload(asset: PhotoAsset): EnqueueDownloadResult {
+    fun enqueueDownload(asset: PhotoAsset, sourceBytes: ByteArray? = null): EnqueueDownloadResult {
         val result = synchronized(downloadLock) {
             val key = asset.downloadSourceKey(session.value)
             if (_downloadTasks.value.any { it.id == key }) EnqueueDownloadResult.ALREADY_EXISTS
             else {
+                sourceBytes?.let { queuedOriginals[key] = it }
                 _downloadTasks.value = _downloadTasks.value + DownloadTask(id = key, asset = asset)
                 EnqueueDownloadResult.CREATED
             }
@@ -1167,6 +1402,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 cancelledDownloadIds += id
                 _downloadTasks.update { tasks -> tasks.map { if (it.id == id) it.copy(status = DownloadTaskStatus.CANCELLING) else it } }
             } else if (cancelling?.status == DownloadTaskStatus.QUEUED) {
+                queuedOriginals.remove(id)
                 _downloadTasks.update { tasks -> tasks.filterNot { it.id == id } }
             }
         }
@@ -1180,6 +1416,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun recordDownload(record: DownloadRecord) {
+        downloads.value = withContext(Dispatchers.IO) {
+            store.addDownload(record)
+            store.downloads()
+        }
+    }
+
     private fun startDownloadWorker() {
         if (downloadWorkerJob?.isActive == true) return
         downloadWorkerJob = viewModelScope.launch { processDownloadQueue() }
@@ -1187,24 +1430,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun processDownloadQueue() {
         store.setDownloadWorkerActive(true)
-        isBusy.value = true
-        workflow.value = Workflow.DOWNLOADING
+        try {
         while (true) {
+            // New downloads may be queued during a countdown; do not interleave with a shutter.
+            while (remoteCapture.value.inProgress) delay(200)
             val task = synchronized(downloadLock) {
                 val queued = _downloadTasks.value.firstOrNull { it.status == DownloadTaskStatus.QUEUED } ?: return@synchronized null
                 _downloadTasks.value = _downloadTasks.value.map { if (it.id == queued.id) it.copy(status = DownloadTaskStatus.DOWNLOADING) else it }
                 queued
             } ?: break
             val result = runCatching {
-                require(task.belongsTo(session.value)) { "请连接创建任务时的原相机后重试" }
-                val active = client ?: error("相机连接已断开")
+                val original = synchronized(downloadLock) { queuedOriginals.remove(task.id) }
+                if (original == null) require(task.belongsTo(session.value)) { "请连接创建任务时的原相机后重试" }
+                val active = client
+                if (original == null && active == null) error("相机连接已断开")
                 withContext(Dispatchers.IO) {
                     var lastAt = SystemClock.elapsedRealtime()
                     var lastDone = 0L
                     var smoothedSpeed: Double? = null
                     var lastEmit = 0L
                     saveToMediaStore(task.asset, config.value.autoExport) { stream ->
-                        active.downloadTo(task.asset, stream, { done, callbackTotal ->
+                        if (original != null) {
+                            var offset = 0
+                            while (offset < original.size) {
+                                if (synchronized(downloadLock) { task.id in cancelledDownloadIds }) throw DownloadCancelledException()
+                                val count = minOf(1024 * 1024, original.size - offset)
+                                stream.write(original, offset, count)
+                                offset += count
+                            }
+                            original.size.toLong()
+                        } else requireNotNull(active).downloadTo(task.asset, stream, { done, callbackTotal ->
                             val now = SystemClock.elapsedRealtime()
                             val (total, _) = downloadProgress(done, callbackTotal, task.asset.size)
                             val normalizedDone = normalizedDownloadBytes(done, total)
@@ -1236,8 +1491,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     logDiagnostic("DOWNLOAD_CANCELLED", "DOWNLOAD", session.value?.transport, result = "CANCELLED", message = "taskId=${task.id} ${task.asset.name}")
                     showSnackbar("已取消下载")
                 } else {
-                    store.addDownload(record)
-                    downloads.value = store.downloads()
+                    recordDownload(record)
+                    val kind = mediaKindFor(null, record.name)
+                    if (kind != MediaKind.VIDEO) {
+                        withContext(Dispatchers.IO) {
+                            loadDownloadThumbnail(getApplication(), record.uri, kind)
+                        }?.let { keepSharperThumbnail(task.asset.handle, it) }
+                    }
                     _downloadTasks.update { it.filterNot { taskItem -> taskItem.id == task.id } }
                     showSnackbar("下载完成，可到下载页查看")
                 }
@@ -1260,9 +1520,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        store.setDownloadWorkerActive(false)
-        isBusy.value = false
-        workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
+        } finally {
+            store.setDownloadWorkerActive(false)
+            clearDownloadNotif()
+            synchronized(downloadLock) { queuedOriginals.clear() }
+        }
     }
 
     fun downloadAll(assets: List<PhotoAsset>): Job = viewModelScope.launch {
@@ -1272,19 +1534,71 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun retryDownload() { _downloadTasks.value.firstOrNull { it.status == DownloadTaskStatus.FAILED }?.let { retryDownloadTask(it.id) } }
 
-    fun deleteDownloads(uris: Set<String>) = viewModelScope.launch {
+    fun removeDownloadRecords(uris: Set<String>): Job = viewModelScope.launch {
+        if (uris.isEmpty()) return@launch
+        val (removed, remaining) = withContext(Dispatchers.IO) {
+            val existing = store.downloads().mapTo(mutableSetOf()) { it.uri }.intersect(uris)
+            store.removeDownloads(existing)
+            existing to store.downloads()
+        }
+        removed.forEach { localThumbnailCache.remove(it) }
+        thumbnailVersion.value += 1
+        downloads.value = remaining
+        logDiagnostic("DOWNLOAD_RECORDS_REMOVED", "DELETE", message = "Removed ${removed.size} local records without modifying media files")
+        val message = "已移除 ${removed.size} 条下载记录，相册文件不受影响"
+        showPageSuccess(message)
+        showSnackbar(message)
+    }
+
+    fun deleteDownloads(uris: Set<String>): Job = viewModelScope.launch {
         if (uris.isEmpty()) return@launch
         logDiagnostic("DELETE_STARTED", "DELETE", message = "Deleting ${uris.size} downloaded files")
         showPageProgress("正在删除 ${uris.size} 个文件")
         val resolver = getApplication<Application>().contentResolver
-        withContext(Dispatchers.IO) {
-            uris.forEach { uri -> runCatching { resolver.delete(android.net.Uri.parse(uri), null, null) } }
+        var inaccessibleCount = 0
+        val (deleted, missing, remainingRecords) = withContext(Dispatchers.IO) {
+            val deleted = mutableSetOf<String>()
+            val missing = mutableSetOf<String>()
+            for (value in uris) {
+                val uri = Uri.parse(value)
+                try {
+                    if (resolver.delete(uri, null, null) > 0) {
+                        deleted += value
+                    } else {
+                        // A successful empty MediaStore query confirms a stale record.
+                        // Null cursors and permission errors must not count as missing files.
+                        val absent = uri.authority == MediaStore.AUTHORITY &&
+                            resolver.query(uri, arrayOf(MediaStore.MediaColumns._ID), null, null, null)
+                                ?.use { !it.moveToFirst() } == true
+                        if (absent) missing += value
+                    }
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (error: SecurityException) {
+                    inaccessibleCount += 1
+                    logDiagnostic("DELETE_FAILED", "DELETE", level = "WARN", result = "FAILED", message = "No media access for $value; local record can be removed separately", error = error)
+                } catch (error: Exception) {
+                    logDiagnostic("DELETE_FAILED", "DELETE", level = "WARN", result = "FAILED", message = "Unable to delete $value", error = error)
+                }
+            }
+            store.removeDownloads(deleted + missing)
+            Triple(deleted, missing, store.downloads())
         }
-        store.removeDownloads(uris)
-        downloads.value = store.downloads()
-        logDiagnostic("DELETE_SUCCEEDED", "DELETE", message = "Deleted ${uris.size} downloaded files")
-        showPageSuccess("已删除 ${uris.size} 个文件")
-        showSnackbar("已删除 ${uris.size} 个文件")
+        val removed = deleted + missing
+        removed.forEach { localThumbnailCache.remove(it) }
+        downloads.value = remainingRecords
+        val failed = uris.size - removed.size
+        val message = buildList {
+            if (deleted.isNotEmpty()) add("已删除 ${deleted.size} 个文件")
+            if (missing.isNotEmpty()) add("已清理 ${missing.size} 条失效记录")
+            if (failed > 0) add("$failed 个未删除，可重试")
+            if (inaccessibleCount > 0) add("其中 $inaccessibleCount 个无访问权限，可在操作菜单中选择‘仅移除记录’")
+        }.joinToString("，")
+        if (failed > 0) {
+            pageRetry = { deleteDownloads(uris - removed); Unit }
+            showPageError(message)
+        } else showPageSuccess(message)
+        showSnackbar(message)
     }
 
     private fun saveToMediaStore(
@@ -1306,9 +1620,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             else -> MediaStore.Files.getContentUri("external")
         }
         val folder = when {
-            exportToGallery && isImage -> "${Environment.DIRECTORY_PICTURES}/Camera_Bridge"
-            exportToGallery && isVideo -> "${Environment.DIRECTORY_MOVIES}/Camera_Bridge"
-            else -> "${Environment.DIRECTORY_DOWNLOADS}/Camera_Bridge"
+            exportToGallery && isImage -> "${Environment.DIRECTORY_PICTURES}/Link"
+            exportToGallery && isVideo -> "${Environment.DIRECTORY_MOVIES}/Link"
+            else -> "${Environment.DIRECTORY_DOWNLOADS}/Link"
         }
         val displayName = uniqueDisplayName(resolver, collection, folder.takeIf { scopedStorage }, asset.name)
         val values = ContentValues().apply {
@@ -1346,33 +1660,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun saveLutBitmap(asset: PhotoAsset, bitmap: Bitmap, lutName: String): DownloadRecord {
-        val output = asset.copy(name = "${asset.name.substringBeforeLast('.')}_${lutName.replace(Regex("[^A-Za-z0-9_-]"), "_")}.jpg")
-        return saveToMediaStore(output, true) { stream ->
-            require(bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)) { "无法编码 JPG" }
+        val output = asset.copy(name = editedFileName(asset.name, lutName, "jpg"))
+        return saveToMediaStore(output, config.value.autoExport) { stream ->
+            require(bitmap.compress(Bitmap.CompressFormat.JPEG, config.value.jpegQuality, stream)) { "无法编码 JPG" }
             0L
         }
     }
 
     private fun saveEditedBitmap(asset: PhotoAsset, bitmap: Bitmap, metadata: PhotoMetadata, suffix: String, quality: Int): DownloadRecord {
-        val safeSuffix = suffix.replace(Regex("[^A-Za-z0-9_-]"), "_")
-        val output = asset.copy(name = "${asset.name.substringBeforeLast('.')}_${safeSuffix}.jpg")
-        return saveToMediaStore(output, true, afterWrite = { uri -> preserveExif(uri, metadata) }) { stream ->
+        val output = asset.copy(name = editedFileName(asset.name, suffix, "jpg"))
+        return saveToMediaStore(output, config.value.autoExport, afterWrite = { uri -> preserveExif(uri, metadata) }) { stream ->
             require(bitmap.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(80, 100), stream)) { "无法编码 JPG" }
             0L
         }
     }
 
     private fun saveExportedVideo(record: DownloadRecord, file: java.io.File, suffix: String): DownloadRecord {
-        val safeSuffix = suffix.replace(Regex("[^A-Za-z0-9_-]"), "_").ifBlank { "Export" }
         val output = PhotoAsset(
             handle = 0u,
-            name = "${record.name.substringBeforeLast('.')}_${safeSuffix}.mp4",
+            name = editedFileName(record.name, suffix, "mp4"),
             size = file.length(),
             format = 0x300C,
         )
-        return saveToMediaStore(output, true) { stream ->
+        return saveToMediaStore(output, config.value.autoExport) { stream ->
             file.inputStream().use { it.copyTo(stream, 1024 * 1024) }
         }
+    }
+
+    private fun editedFileName(original: String, suffix: String, extension: String): String {
+        val base = original.substringBeforeLast('.')
+        val date = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.ROOT).format(Date())
+        val pattern = config.value.fileNamingRule.ifBlank { "原文件名_编辑类型" }
+        val name = pattern.replace("{name}", base).replace("{type}", suffix).replace("{date}", date)
+            .replace("原文件名", base).replace("编辑类型", suffix).replace("日期", date)
+            .replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]"), "_").trim().trim('.')
+            .removeSuffix(".$extension").ifBlank { "${base}_$suffix" }
+        return "$name.$extension"
     }
 
     private fun preserveExif(uri: Uri, metadata: PhotoMetadata) {
@@ -1401,8 +1724,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         noticeClearJob?.cancel(); workflow.value = Workflow.ERROR; notice.value = message
     }
     override fun onCleared() {
+        remoteCancellation.set(true)
         runCatching { getApplication<Application>().unregisterReceiver(usbReceiver) }
-        keepConnectionAlive(false); client?.close(); bindCameraNetwork(null); clearDownloadNotif(); clearExportNotif(); diagnostics.close()
+        val closing = client
+        client = null
+        Thread({ runCatching { closing?.close() } }, "Link-close-camera").apply { isDaemon = true; start() }
+        keepConnectionAlive(false); bindCameraNetwork(null); releaseRequestedWifi(); clearDownloadNotif(); clearExportNotif(); diagnostics.close()
     }
 
     private fun keepConnectionAlive(enabled: Boolean) {
@@ -1463,7 +1790,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         getApplication<Application>().getSystemService(android.app.NotificationManager::class.java).cancel(1003)
     }
 
-    private fun cameraNetwork(): android.net.Network? = getApplication<Application>().getSystemService(ConnectivityManager::class.java)
+    private fun cameraNetwork(): android.net.Network? = requestedCameraNetwork ?: getApplication<Application>().getSystemService(ConnectivityManager::class.java)
         .allNetworks.firstOrNull { network ->
             getApplication<Application>().getSystemService(ConnectivityManager::class.java)
                 .getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
@@ -1477,7 +1804,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     @Suppress("DEPRECATION")
-    private fun cameraGateway(): String {
+    private fun cameraGateway(network: Network): String {
+        getApplication<Application>().getSystemService(ConnectivityManager::class.java)
+            .getLinkProperties(network)?.routes?.firstOrNull { it.isDefaultRoute && it.gateway is java.net.Inet4Address }
+            ?.gateway?.hostAddress?.let { return it }
+        if (requestedCameraNetwork == network) return ""
         val address = getApplication<Application>().getSystemService(WifiManager::class.java).dhcpInfo?.serverAddress ?: return ""
         if (address == 0) return ""
         return listOf(address and 0xFF, address shr 8 and 0xFF, address shr 16 and 0xFF, address shr 24 and 0xFF).joinToString(".")
@@ -1485,6 +1816,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun currentSsid(): String? {
         val app = getApplication<Application>()
+        @Suppress("DEPRECATION")
+        val connectedSsid = app.getSystemService(WifiManager::class.java).connectionInfo?.ssid
+            ?.trim('"')?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
+        if (requestedCameraNetwork == null && connectedSsid != null) return connectedSsid
         val cm = app.getSystemService(ConnectivityManager::class.java)
         val network = cameraNetwork() ?: return null
         val caps = cm.getNetworkCapabilities(network) ?: return null
@@ -1492,7 +1827,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) caps.transportInfo as? android.net.wifi.WifiInfo else null
         @Suppress("DEPRECATION")
         val ssid = info?.ssid ?: app.getSystemService(WifiManager::class.java).connectionInfo?.ssid
-        return ssid?.trim('"')?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
+        return ssid?.trim('"')?.takeIf { it.isNotBlank() && it != "<unknown ssid>" } ?: connectedSsid
     }
 
     private companion object {
