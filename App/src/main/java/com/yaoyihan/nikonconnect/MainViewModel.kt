@@ -80,6 +80,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val isBusy = MutableStateFlow(false)
     val remoteCapture = MutableStateFlow(RemoteCaptureState())
     val remoteSupported = MutableStateFlow(false)
+    val remoteLiveView = MutableStateFlow(RemoteLiveViewState())
+    val remoteParameterEditor = MutableStateFlow(RemoteParameterEditor())
+    private val remoteColorController = RemotePreviewColorController(viewModelScope,
+        (application.getSystemService(android.app.ActivityManager::class.java)?.deviceConfigurationInfo?.reqGlEsVersion ?: 0) >= 0x30000,
+        ::readLut)
+    val remotePreviewColor = remoteColorController.state
+    val remoteFocus = MutableStateFlow(RemoteFocusState())
+    private var remoteFocusJob: Job? = null
+    private val remoteFocusGeneration = java.util.concurrent.atomic.AtomicLong(0)
+    private var remoteParameterJob: Job? = null
+    private val remotePreviewMutex = Mutex()
+    private var remotePreviewJob: Job? = null
+    private var remotePreviewClient: CameraClient? = null
+    private var remoteViewVisible = false
+    private var remoteForeground = true
     private var remoteCaptureJob: Job? = null
     private var remoteCancellation = java.util.concurrent.atomic.AtomicBoolean(false)
     val hasMorePhotos = MutableStateFlow(false)
@@ -88,6 +103,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val cameraThumbnailCache = BitmapMemoryCache<UInt> { thumbnails.remove(it) }
     private val localThumbnailCache = BitmapMemoryCache<String>()
     private val thumbnailLoads = mutableSetOf<String>()
+    private val thumbnailDiskCache = ThumbnailDiskCache(application.cacheDir.resolve("camera_thumbnails_v1"))
+    val thumbnailCacheBytes = MutableStateFlow(0L)
+    val clearingThumbnailCache = MutableStateFlow(false)
     val thumbnailVersion = MutableStateFlow(0)
     val isLoadingMorePhotos = MutableStateFlow(false)
     private var loadMoreJob: Job? = null
@@ -144,6 +162,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
+        refreshThumbnailCacheSize()
         registerUsbReceiver()
         logDiagnostic("APP_STARTED", "APP_READY", message = "Link started")
         if (store.consumeInterruptedDownload()) pageTask.value = PageTask("上次下载因应用关闭而中断，请重新连接原相机后创建任务", running = false, failed = true)
@@ -420,11 +439,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearThumbnailCache() {
+        if (clearingThumbnailCache.value) return
+        clearingThumbnailCache.value = true
+        thumbnailDiskCache.invalidate()
         cameraThumbnailCache.clear()
         localThumbnailCache.clear()
         thumbnails.clear()
-        thumbnailVersion.update { it + 1 }
-        showSnackbar("已清理缩略图缓存")
+        viewModelScope.launch {
+            val result = runCatching { withContext(Dispatchers.IO) { thumbnailDiskCache.clear() } }
+            refreshThumbnailCacheSize()
+            clearingThumbnailCache.value = false
+            thumbnailVersion.update { it + 1 }
+            showSnackbar(if (result.isSuccess) "已清理缩略图缓存" else "部分缓存清理失败，请重试")
+        }
+    }
+
+    fun refreshThumbnailCacheSize() {
+        viewModelScope.launch(Dispatchers.IO) { thumbnailCacheBytes.value = thumbnailDiskCache.sizeBytes() }
+    }
+
+    private fun thumbnailDiskKey(camera: CameraClient, asset: PhotoAsset): String =
+        listOf("v1", camera.cameraDetails.manufacturer, camera.cameraDetails.model, camera.cameraDetails.serialNumber,
+            camera.cameraName, asset.handle, asset.name, asset.size, asset.capturedAt.time,
+            asset.imageWidth, asset.imageHeight).joinToString("\u0000")
+
+    private fun cacheThumbnail(key: String, bitmap: Bitmap, cacheGeneration: Long) {
+        runCatching {
+            val bytes = java.io.ByteArrayOutputStream().use { output ->
+                check(bitmap.compress(Bitmap.CompressFormat.JPEG, 94, output))
+                output.toByteArray()
+            }
+            thumbnailDiskCache.write(key, bytes, cacheGeneration)
+        }
+        thumbnailCacheBytes.value = thumbnailDiskCache.sizeBytes()
     }
 
     private fun resetCameraThumbnails() {
@@ -607,6 +654,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnect() = viewModelScope.launch(Dispatchers.IO) {
+        clearRemoteFocus()
+        remoteParameterJob?.cancel()
+        remoteParameterEditor.value = RemoteParameterEditor()
         cancelPendingRemoteCapture()
         remoteSupported.value = false
         val closing = client
@@ -631,6 +681,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startRemoteCapture(delaySeconds: Int) {
+        if (remoteFocus.value.inProgress) { showSnackbar("请等待对焦完成"); return }
+        if (remoteParameterEditor.value.busy) { showSnackbar("请等待参数读取或修改完成"); return }
         if (remoteCaptureJob?.isActive == true || remoteCapture.value.inProgress) return
         val active = client
         val remote = active as? RemoteCameraControl
@@ -645,6 +697,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val seconds = delaySeconds.takeIf { it in listOf(0, 2, 5, 10) } ?: 0
         val cancellation = java.util.concurrent.atomic.AtomicBoolean(false)
+        clearRemoteFocus()
         remoteCancellation = cancellation
         metadataJob?.cancel()
         loadMoreJob?.cancel()
@@ -699,6 +752,261 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 RemoteCapturePhase.COUNTDOWN -> { cancellation.set(true); remoteCaptureJob?.cancel() }
                 RemoteCapturePhase.PREPARING -> cancellation.set(true)
                 else -> Unit
+            }
+        }
+    }
+
+    fun setRemoteViewVisible(visible: Boolean) {
+        if (!visible) clearRemoteFocus()
+        if (!visible) closeRemoteParameterEditor()
+        remoteViewVisible = visible
+        reconcileRemotePreview()
+    }
+
+    fun setRemoteForeground(foreground: Boolean) {
+        if (!foreground) clearRemoteFocus()
+        remoteForeground = foreground
+        reconcileRemotePreview()
+    }
+
+    fun retryRemotePreview() {
+        remotePreviewJob?.cancel()
+        remotePreviewClient = null
+        reconcileRemotePreview()
+    }
+
+    private fun parameterAccessAllowed(): Boolean = remoteViewVisible && remoteForeground &&
+        session.value?.transport == ConnectionTransport.WIFI && !isBusy.value &&
+        !remoteCapture.value.inProgress && !remoteFocus.value.inProgress && !_downloadTasks.value.any {
+            it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING || it.status == DownloadTaskStatus.QUEUED
+        }
+
+    fun openRemoteParameter(parameter: RemoteParameter) {
+        if (remoteParameterJob?.isActive == true) return
+        if (!parameterAccessAllowed()) { showSnackbar("请连接相机，并等待拍摄或传输完成"); return }
+        val active = client as? RemoteCameraControl ?: return
+        remoteParameterEditor.value = RemoteParameterEditor(parameter = parameter, loading = true)
+        remoteParameterJob = viewModelScope.launch {
+            try {
+                val descriptor = withContext(Dispatchers.IO) { active.parameterDescriptor(parameter) }
+                if (client === active && remoteViewVisible) {
+                    remoteParameterEditor.value = RemoteParameterEditor(parameter, descriptor, message = descriptor.reason)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (client === active && remoteViewVisible) remoteParameterEditor.value = RemoteParameterEditor(parameter = parameter, message = error.message ?: "无法读取参数")
+            }
+        }
+    }
+
+    fun setRemoteParameter(value: Long) {
+        val editor = remoteParameterEditor.value
+        val parameter = editor.parameter ?: return
+        if (editor.busy || !parameterAccessAllowed()) { showSnackbar("请等待拍摄或传输完成后再修改参数"); return }
+        val active = client as? RemoteCameraControl ?: return
+        if (editor.descriptor?.let { it.writable && it.allows(value) } != true) return
+        remoteParameterEditor.value = editor.copy(saving = true, message = "正在修改并确认相机实际值")
+        remoteParameterJob = viewModelScope.launch {
+            try {
+                val parameters = withContext(Dispatchers.IO) { active.setParameter(parameter, value) }
+                if (client === active) {
+                    remoteLiveView.update { it.copy(parameters = parameters) }
+                    remoteParameterEditor.value = RemoteParameterEditor()
+                    showSnackbar("${parameter.title}已更新")
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (client === active && remoteViewVisible) {
+                    val actual = withContext(Dispatchers.IO) { runCatching { active.parameterDescriptor(parameter) }.getOrNull() }
+                    remoteParameterEditor.value = editor.copy(descriptor = actual ?: editor.descriptor, saving = false,
+                        message = error.message ?: "未确认修改生效，请检查相机")
+                    logDiagnostic("REMOTE_PARAMETER_FAILED", "REMOTE_PARAMETER", ConnectionTransport.WIFI,
+                        level = "WARN", result = "FAILED", message = "${parameter.title}: ${error.message}", error = error)
+                }
+            }
+        }
+    }
+
+    fun closeRemoteParameterEditor() {
+        if (remoteParameterEditor.value.saving) return
+        remoteParameterJob?.cancel()
+        remoteParameterEditor.value = RemoteParameterEditor()
+    }
+
+    fun selectRemotePreviewLut(entry: LutEntry?) {
+        remoteColorController.select(entry)
+    }
+
+    fun setRemotePreviewIntensity(value: Float) {
+        remoteColorController.setIntensity(value)
+    }
+
+    private fun clearRemoteFocus() {
+        remoteFocusGeneration.incrementAndGet()
+        remoteFocusJob?.cancel()
+        remoteFocus.value = RemoteFocusState()
+    }
+
+    fun focusRemoteAt(point: NormalizedFocusPoint, geometry: LiveViewFocusGeometry?) {
+        if (remoteFocus.value.inProgress) return
+        if (!parameterAccessAllowed() || remoteParameterEditor.value.busy || !remoteLiveView.value.streaming) {
+            showSnackbar("请等待取景恢复，并等待拍摄或传输完成"); return
+        }
+        if (geometry == null) { showSnackbar("相机未提供可识别的对焦坐标信息"); return }
+        if (remoteLiveView.value.focusGeometry != geometry) return
+        val active = client as? RemoteCameraControl ?: return
+        clearRemoteFocus()
+        val generation = remoteFocusGeneration.get()
+        remoteFocus.value = RemoteFocusState(point, RemoteFocusPhase.FOCUSING, "对焦中")
+        remoteFocusJob = viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    active.focusAt(point, geometry) {
+                        generation != remoteFocusGeneration.get() || client !== active || !remoteViewVisible || !remoteForeground
+                    }
+                }
+                if (generation == remoteFocusGeneration.get() && client === active && remoteViewVisible && remoteForeground) {
+                    remoteFocus.value = RemoteFocusState(point, result.phase, result.message)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                if (generation == remoteFocusGeneration.get() && client === active && remoteViewVisible && remoteForeground) {
+                    val message = if (error is PtpResponseException && error.response == 0xA002) "相机未能合焦" else error.message ?: "未确认对焦结果"
+                    remoteFocus.value = RemoteFocusState(point, RemoteFocusPhase.FAILED, message)
+                    logDiagnostic("REMOTE_FOCUS_FAILED", "REMOTE_FOCUS", ConnectionTransport.WIFI,
+                        level = "WARN", result = "FAILED", message = message, error = error)
+                }
+            } finally {
+                if (generation == remoteFocusGeneration.get() && remoteFocus.value.inProgress) remoteFocus.value = RemoteFocusState()
+            }
+            delay(3000)
+            if (generation == remoteFocusGeneration.get()) remoteFocus.value = RemoteFocusState()
+        }
+    }
+
+    private fun reconcileRemotePreview() {
+        val active = client
+        if (!remoteViewVisible || !remoteForeground || session.value?.transport != ConnectionTransport.WIFI || active !is RemoteCameraControl) {
+            remotePreviewJob?.cancel()
+            remotePreviewClient = null
+            remoteLiveView.value = RemoteLiveViewState()
+            return
+        }
+        if (remotePreviewClient === active && remotePreviewJob?.isActive == true) return
+        remotePreviewJob?.cancel()
+        remotePreviewClient = active
+        remotePreviewJob = viewModelScope.launch {
+            // A new page/session waits for the old session's live-view cleanup.
+            remotePreviewMutex.withLock {
+                if (!isActive || client !== active || !remoteViewVisible || !remoteForeground) return@withLock
+                remoteLiveView.value = RemoteLiveViewState(loading = true, message = "正在开启实时取景")
+                var started = false
+                var frameFailed = false
+                var transientErrors = 0
+                var invalidFrames = 0
+                var frameFailureMessage: String? = null
+                var lastParametersAt = 0L
+                try {
+                    val supported = withContext(Dispatchers.IO) { active.supportsLiveView }
+                    if (!supported) {
+                        frameFailed = true
+                        frameFailureMessage = "当前连接未提供实时取景能力，仍可读取拍摄参数"
+                        remoteLiveView.value = remoteLiveView.value.copy(loading = false, failed = true, message = "当前连接未提供实时取景能力，仍可读取拍摄参数")
+                    }
+                    while (isActive && client === active && remoteViewVisible && remoteForeground) {
+                        // Keep live view active during AF; do not stop it when a transfer gets queued.
+                        if (remoteFocus.value.inProgress) { delay(50); continue }
+                        val shooting = remoteCapture.value.phase == RemoteCapturePhase.PREPARING || remoteCapture.value.phase == RemoteCapturePhase.WAITING
+                        val transferring = _downloadTasks.value.any { it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING || it.status == DownloadTaskStatus.QUEUED }
+                        if (shooting || transferring || isBusy.value) {
+                            remoteLiveView.value = remoteLiveView.value.copy(streaming = false, loading = false,
+                                message = if (shooting) "拍摄中，取景暂时暂停" else "相机正在读取或传输，取景暂时暂停")
+                            if (started) {
+                                withContext(Dispatchers.IO) { active.stopLiveView() }
+                                started = false
+                            }
+                            delay(200)
+                            continue
+                        }
+                        val frameStartedAt = SystemClock.elapsedRealtime()
+                        try {
+                            if (frameFailed) remoteLiveView.value = remoteLiveView.value.copy(streaming = false, loading = false, failed = true, message = frameFailureMessage ?: "无法显示实时画面")
+                            if (!frameFailed) {
+                                if (!started) {
+                                    remoteLiveView.value = remoteLiveView.value.copy(loading = true, message = "正在开启实时取景")
+                                    withContext(Dispatchers.IO) { active.startLiveView() }
+                                    started = true
+                                }
+                                val frame = withContext(Dispatchers.IO) {
+                                    val liveFrame = active.liveViewFrame()
+                                    val jpeg = liveFrame.jpeg
+                                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                                    BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, bounds)
+                                    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) throw LiveViewImageException("相机返回了无法解码的取景画面")
+                                    var sample = 1
+                                    while (maxOf(bounds.outWidth, bounds.outHeight) / sample > 1024) sample *= 2
+                                    val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, BitmapFactory.Options().apply {
+                                        inSampleSize = sample
+                                        inPreferredConfig = Bitmap.Config.RGB_565
+                                    }) ?: throw LiveViewImageException("无法解码相机实时画面")
+                                    bitmap to liveFrame.focusGeometry?.takeIf { it.jpegWidth == bounds.outWidth && it.jpegHeight == bounds.outHeight }
+                                }
+                                if (client !== active) break
+                                remoteLiveView.value = remoteLiveView.value.copy(frame = frame.first, focusGeometry = frame.second,
+                                    streaming = true, loading = false, failed = false, message = "实时取景")
+                                transientErrors = 0
+                                invalidFrames = 0
+                            }
+                            val now = SystemClock.elapsedRealtime()
+                            if (now - lastParametersAt >= 1500) {
+                                val parameters = withContext(Dispatchers.IO) { active.shootingParameters() }
+                                if (client !== active) break
+                                remoteLiveView.value = remoteLiveView.value.copy(parameters = parameters)
+                                lastParametersAt = now
+                            }
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (error: LiveViewImageException) {
+                            if (++invalidFrames > 3) throw error
+                            delay(120)
+                            continue
+                        }
+                        catch (error: PtpResponseException) {
+                            if (error.response in listOf(0x2019, 0xA004, 0xA00B) && ++transientErrors <= 20) {
+                                remoteLiveView.value = remoteLiveView.value.copy(streaming = false, loading = true, message = "相机正在准备取景")
+                                delay(250)
+                                continue
+                            }
+                            if (!frameFailed) {
+                                frameFailed = true
+                                frameFailureMessage = error.message ?: "无法开启实时取景"
+                                remoteLiveView.value = remoteLiveView.value.copy(streaming = false, loading = false, failed = true, message = error.message ?: "无法开启实时取景")
+                                logDiagnostic("REMOTE_LIVE_VIEW_FAILED", "REMOTE_LIVE_VIEW", ConnectionTransport.WIFI, level = "WARN", result = "FAILED", message = error.message ?: "Live view failed", error = error)
+                            } else throw error
+                        }
+                        // No prefetch queue: drop the old bitmap naturally after Compose releases it.
+                        delay(if (frameFailed) 1000 else (100 - (SystemClock.elapsedRealtime() - frameStartedAt)).coerceAtLeast(16))
+                    }
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (error: Exception) {
+                    if (client === active) {
+                        remoteLiveView.value = remoteLiveView.value.copy(streaming = false, loading = false, failed = true, message = error.message ?: "取景连接中断，请重试")
+                        logDiagnostic("REMOTE_LIVE_VIEW_FAILED", "REMOTE_LIVE_VIEW", ConnectionTransport.WIFI, level = "WARN", result = "FAILED", message = error.message ?: "Live view failed", error = error)
+                    }
+                } finally {
+                    withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                        // ON_STOP pauses frames; keep remote/application mode until the user
+                        // leaves the remote page. Backgrounding is not an explicit remote exit.
+                        runCatching {
+                            if (remoteViewVisible && client === active) active.stopLiveView()
+                            else active.exitRemoteControl()
+                        }.onFailure { error ->
+                            logDiagnostic("REMOTE_EXIT_FAILED", "REMOTE_LIVE_VIEW", ConnectionTransport.WIFI,
+                                level = "WARN", result = "FAILED", message = error.message ?: "Unable to release remote control", error = error)
+                            showSnackbar("退出遥控未完成，请检查相机，必要时重新连接")
+                        }
+                    }
+                    if (!remoteViewVisible || !remoteForeground || client !== active) remoteLiveView.value = RemoteLiveViewState()
+                }
             }
         }
     }
@@ -817,24 +1125,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadThumbnail(asset: PhotoAsset) {
+        if (clearingThumbnailCache.value) return
         if (cameraThumbnailCache.get(asset.handle) != null) return
         val generation = photoGeneration
-        val loadKey = "$generation:${asset.handle}"
+        val cacheGeneration = thumbnailDiskCache.generation
+        val loadKey = "$generation:$cacheGeneration:${asset.handle}"
         if (!thumbnailLoads.add(loadKey)) return
         val camera = client
         viewModelScope.launch {
             val result = runCatching {
                 withContext(Dispatchers.IO) {
                     val active = camera ?: return@withContext null
+                    val diskKey = thumbnailDiskKey(active, asset)
+                    thumbnailDiskCache.read(diskKey)?.let { cached ->
+                        BitmapFactory.decodeByteArray(cached, 0, cached.size)?.let { return@withContext it }
+                    }
                     val data = active.thumbnail(asset) ?: return@withContext null
                     val orientation = OrientedBitmaps.orientationOrNull(data)
                         ?: active.imageHeader(asset)?.let(OrientedBitmaps::orientationOrNull)
                         ?: android.media.ExifInterface.ORIENTATION_NORMAL
-                    OrientedBitmaps.decode(data, orientation)
+                    OrientedBitmaps.decode(data, orientation)?.let { decoded ->
+                        val clean = trimThumbnailPadding(decoded, asset.imageWidth, asset.imageHeight)
+                        if (clean !== decoded) decoded.recycle()
+                        scaledThumbnail(clean).also {
+                            if (it !== clean) clean.recycle()
+                            cacheThumbnail(diskKey, it, cacheGeneration)
+                        }
+                    }
                 }
             }
             result.onSuccess { bitmap ->
-                if (bitmap != null && client === camera && generation == photoGeneration) keepSharperThumbnail(asset.handle, bitmap)
+                if (bitmap != null && client === camera && generation == photoGeneration &&
+                    cacheGeneration == thumbnailDiskCache.generation) keepSharperThumbnail(asset.handle, bitmap)
                 if (bitmap == null) logDiagnostic("THUMBNAIL_LOAD_FAILED", "THUMBNAIL", session.value?.transport, level = "WARN", result = "FAILED", message = "Unable to decode thumbnail ${asset.name}")
             }.onFailure {
                 logDiagnostic("THUMBNAIL_LOAD_FAILED", "THUMBNAIL", session.value?.transport, level = "WARN", result = "FAILED", message = it.message ?: "Unable to load thumbnail ${asset.name}", error = it)
@@ -861,10 +1183,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun loadOriginalPhoto(asset: PhotoAsset): LoadedPhoto? = withContext(Dispatchers.IO) {
         runCatching {
             val camera = client ?: return@runCatching null
+            val cacheGeneration = thumbnailDiskCache.generation
             val bytes = readCameraOriginal(camera, asset)
             val bitmap = decodePreviewBitmap(bytes) ?: return@runCatching null
             val thumbnail = scaledThumbnail(bitmap)
-            withContext(Dispatchers.Main) { if (client === camera) keepSharperThumbnail(asset.handle, thumbnail) }
+            cacheThumbnail(thumbnailDiskKey(camera, asset), thumbnail, cacheGeneration)
+            withContext(Dispatchers.Main) {
+                if (client === camera && cacheGeneration == thumbnailDiskCache.generation) keepSharperThumbnail(asset.handle, thumbnail)
+            }
             val fallback = PhotoMetadata(cameraModel = session.value?.name, capturedAt = asset.capturedAt)
             LoadedPhoto(bitmap, ExifMetadataReader.fromBytes(bytes, fallback), bytes)
         }.onFailure { if (it is CancellationException) throw it; logDiagnostic("ORIGINAL_LOAD_FAILED", "ORIGINAL_PREVIEW", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to load original ${asset.name}", error = it) }.getOrNull()
@@ -956,6 +1282,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun removeLut(entry: LutEntry) {
+        if (remotePreviewColor.value.entry?.id == entry.id) selectRemotePreviewLut(null)
         getApplication<Application>().filesDir.resolve("luts").resolve(entry.id).delete()
         luts.value = luts.value.filterNot { it.id == entry.id }
         store.saveLuts(luts.value)
@@ -1433,7 +1760,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         try {
         while (true) {
             // New downloads may be queued during a countdown; do not interleave with a shutter.
-            while (remoteCapture.value.inProgress) delay(200)
+            while (remoteCapture.value.inProgress || remoteParameterEditor.value.busy || remoteFocus.value.inProgress) delay(200)
             val task = synchronized(downloadLock) {
                 val queued = _downloadTasks.value.firstOrNull { it.status == DownloadTaskStatus.QUEUED } ?: return@synchronized null
                 _downloadTasks.value = _downloadTasks.value.map { if (it.id == queued.id) it.copy(status = DownloadTaskStatus.DOWNLOADING) else it }
@@ -1724,6 +2051,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         noticeClearJob?.cancel(); workflow.value = Workflow.ERROR; notice.value = message
     }
     override fun onCleared() {
+        remoteViewVisible = false
+        remotePreviewJob?.cancel()
         remoteCancellation.set(true)
         runCatching { getApplication<Application>().unregisterReceiver(usbReceiver) }
         val closing = client

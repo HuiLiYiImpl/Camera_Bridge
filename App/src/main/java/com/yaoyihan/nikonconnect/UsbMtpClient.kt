@@ -69,7 +69,7 @@ class UsbMtpClient(
             runCatching {
                 val info = mtp.getObjectInfo(handle) ?: return@runCatching null
                 if (info.getFormat() == MtpConstants.FORMAT_ASSOCIATION) return@runCatching null
-                PhotoAsset(handle.toUInt(), info.getName().orEmpty().ifBlank { "IMG_$handle" }, info.getCompressedSizeLong(), info.getFormat(), Date(info.getDateCreated().takeIf { it > 0 } ?: System.currentTimeMillis()))
+                PhotoAsset(handle.toUInt(), info.getName().orEmpty().ifBlank { "IMG_$handle" }, info.getCompressedSizeLong(), info.getFormat(), Date(info.getDateCreated().takeIf { it > 0 } ?: System.currentTimeMillis()), info.getImagePixWidth(), info.getImagePixHeight())
             }.getOrNull()?.let(cachedAssets::add)
         }
         return cachedAssets.drop(offset).take(limit)

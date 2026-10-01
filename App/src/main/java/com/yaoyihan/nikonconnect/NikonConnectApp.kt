@@ -70,6 +70,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -211,12 +212,26 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val snackbarHostState = remember { SnackbarHostState() }
     var tab by rememberSaveable { mutableStateOf(Tab.CAMERA) }
+    var remoteFullscreen by rememberSaveable { mutableStateOf(false) }
+    var remoteDelaySeconds by rememberSaveable { mutableIntStateOf(0) }
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
-    LaunchedEffect(tab, settingsOpen) {
+    val exitRemote: () -> Unit = {
+        vm.cancelPendingRemoteCapture()
+        vm.setRemoteViewVisible(false)
+        remoteFullscreen = false
+        tab = Tab.CAMERA
+    }
+    LaunchedEffect(tab, settingsOpen, session) {
+        if (tab != Tab.REMOTE || settingsOpen) remoteFullscreen = false
+        vm.setRemoteViewVisible(tab == Tab.REMOTE && !settingsOpen)
         if (tab != Tab.REMOTE || settingsOpen) vm.cancelPendingRemoteCapture()
     }
     val pageStates = rememberSaveableStateHolder()
-    BackHandler(tab != Tab.CAMERA) { tab = if (tab == Tab.WATERMARK) Tab.LUT else Tab.CAMERA }
+    BackHandler(tab != Tab.CAMERA && !remoteFullscreen) {
+        if (tab == Tab.REMOTE) exitRemote() else tab = if (tab == Tab.WATERMARK) Tab.LUT else Tab.CAMERA
+    }
+    BackHandler(remoteFullscreen) { remoteFullscreen = false }
+    RemoteWindowPresentation(remoteFullscreen, tab == Tab.REMOTE && !settingsOpen)
     var lightingOpen by remember { mutableStateOf(false) }
     var playbackScene by remember { mutableStateOf<LightScene?>(null) }
     val connectionCenter = tab == Tab.CAMERA && session == null
@@ -224,18 +239,28 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
         if (session == null && tab == Tab.PHOTOS) tab = Tab.CAMERA
     }
     DisposableEffect(lifecycleOwner) {
+        vm.setRemoteForeground(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
         val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START) vm.setRemoteForeground(true)
             if (event == Lifecycle.Event.ON_RESUME) vm.checkConnectionOnResume()
-            if (event == Lifecycle.Event.ON_STOP) vm.cancelPendingRemoteCapture()
+            if (event == Lifecycle.Event.ON_STOP) { vm.setRemoteForeground(false); vm.cancelPendingRemoteCapture() }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer); vm.setRemoteViewVisible(false) }
     }
     LaunchedEffect(snackbarText) { snackbarText?.let { snackbarHostState.showSnackbar(it, duration = SnackbarDuration.Short) } }
     BridgeTheme(config.colorTheme) {
         LinkUpdatePrompt()
         if (settingsOpen) SettingsSheet(vm) { settingsOpen = false }
             when {
+                remoteFullscreen && tab == Tab.REMOTE -> Box(Modifier.fillMaxSize()) {
+                    RemoteCaptureScreen(vm, openConnection = { tab = Tab.CAMERA },
+                    fullscreen = true, onFullscreen = { remoteFullscreen = false }, onExitRemote = exitRemote,
+                    delaySeconds = remoteDelaySeconds, onDelayChange = { remoteDelaySeconds = it })
+                    SnackbarHost(snackbarHostState, Modifier.align(Alignment.TopCenter).padding(horizontal = 56.dp, vertical = 48.dp)) {
+                        data -> BridgeSnackbar(data.visuals.message)
+                    }
+                }
                 playbackScene != null -> LightPlaybackScreen(playbackScene!!, onExit = { playbackScene = null })
                 lightingOpen -> LightCanvasScreen(onBack = { lightingOpen = false }, onPlay = { playbackScene = it })
                 else -> Scaffold(
@@ -244,7 +269,7 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                 ) { contentPadding ->
                     Box(Modifier.fillMaxSize().bridgeBackground().padding(contentPadding)) {
                         Column(Modifier.fillMaxSize().statusBarsPadding()) {
-                            if (!connectionCenter) AnimatedActivityPill(
+                            if (!connectionCenter && (tab != Tab.REMOTE || workflow == Workflow.ERROR)) AnimatedActivityPill(
                                 notice,
                                 busy,
                                 if (workflow == Workflow.ERROR) vm::retry else null,
@@ -260,7 +285,9 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                                     Tab.PHOTOS -> GalleryScreen(vm, busy)
                                     Tab.DOWNLOADS -> DownloadsScreen(vm)
                                     Tab.LUT -> LutScreen(vm) { tab = Tab.WATERMARK }
-                                    Tab.REMOTE -> RemoteCaptureScreen(vm, openConnection = { tab = Tab.CAMERA })
+                                    Tab.REMOTE -> RemoteCaptureScreen(vm, openConnection = { tab = Tab.CAMERA },
+                                        fullscreen = false, onFullscreen = { remoteFullscreen = true }, onExitRemote = exitRemote,
+                                        delaySeconds = remoteDelaySeconds, onDelayChange = { remoteDelaySeconds = it })
                                     Tab.WATERMARK -> WatermarkScreen(vm) { tab = Tab.LUT }
                                 }
                                 }
@@ -942,6 +969,7 @@ private fun Status(state: Workflow) {
 
 @Composable
 private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
+    val config by vm.config.collectAsState()
     val photos by vm.photos.collectAsState()
     val session by vm.session.collectAsState()
     val hasMore by vm.hasMorePhotos.collectAsState()
@@ -1137,6 +1165,11 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
                 Unit
             }
             inlineRetry = run; run()
+        }
+        LaunchedEffect(asset.handle, config.autoLoadOriginalOnPreview) {
+            if (config.autoLoadOriginalOnPreview && !asset.name.isVideoName() && previewBitmap == null && !previewLoading) {
+                startLoadOriginal()
+            }
         }
         val startDownload: () -> Unit = {
             val run = {
@@ -1697,9 +1730,9 @@ private fun PhotoCard(asset: PhotoAsset, bitmap: Bitmap?, task: DownloadTask?, l
     LaunchedEffect(asset.handle, cacheVersion) { load() }
     val ratio = shownBitmap?.let { it.width.toFloat() / it.height.coerceAtLeast(1) }
         ?.coerceIn(.65f, 1.6f) ?: 1f
-    Card(Modifier.fillMaxWidth().combinedClickable(onClick = click, onLongClick = longClick), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = if (selected) androidx.compose.foundation.BorderStroke(2.dp, BridgeEmber) else null) {
+    Card(Modifier.fillMaxWidth().combinedClickable(onClick = click, onLongClick = longClick), shape = RectangleShape, colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = if (selected) androidx.compose.foundation.BorderStroke(2.dp, BridgeEmber) else null) {
         Box(Modifier.aspectRatio(ratio)) {
-            if (shownBitmap != null) Image(shownBitmap.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Image, null, tint = BridgeEmber, modifier = Modifier.size(32.dp)) }
+            if (shownBitmap != null) Image(shownBitmap.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RectangleShape), contentAlignment = Alignment.Center) { Icon(Icons.Default.Image, null, tint = BridgeEmber, modifier = Modifier.size(32.dp)) }
             task?.let { PhotoDownloadOverlay(it, cancel) }
             if (selected) Surface(Modifier.align(Alignment.TopEnd).padding(8.dp), shape = CircleShape, color = BridgeEmber) { Icon(Icons.Default.Check, "已选择", tint = BridgeNight, modifier = Modifier.padding(6.dp).size(17.dp)) }
         }
@@ -2364,6 +2397,9 @@ private fun SettingsSheet(vm: MainViewModel, dismiss: () -> Unit) {
 @Composable
 private fun SettingsContent(vm: MainViewModel, modifier: Modifier = Modifier) {
     val config by vm.config.collectAsState()
+    val thumbnailCacheBytes by vm.thumbnailCacheBytes.collectAsState()
+    val clearingThumbnailCache by vm.clearingThumbnailCache.collectAsState()
+    LaunchedEffect(vm) { vm.refreshThumbnailCacheSize() }
     val diagnostic by vm.diagnosticState.collectAsState()
     val context = LocalContext.current
     var exportingDiagnostics by remember { mutableStateOf(false) }
@@ -2377,6 +2413,17 @@ private fun SettingsContent(vm: MainViewModel, modifier: Modifier = Modifier) {
             }
             PlaceNameSettingsCard()
             Column(Modifier.fillMaxWidth()) {
+                Text("相机照片预览", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge)
+                Spacer(Modifier.height(8.dp))
+                Card(Modifier.fillMaxWidth().bridgeGlass(RoundedCornerShape(20.dp)),
+                    colors = CardDefaults.cardColors(containerColor = Color.Transparent), shape = RoundedCornerShape(20.dp)) {
+                    PreferenceSwitch("点击缩略图自动加载原图", "开启：打开照片即加载原图；关闭：点击“加载原图”后才加载",
+                        config.autoLoadOriginalOnPreview) {
+                        vm.updateConfig { it.copy(autoLoadOriginalOnPreview = !it.autoLoadOriginalOnPreview) }
+                    }
+                }
+            }
+            Column(Modifier.fillMaxWidth()) {
                 Text("导出偏好", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge); Spacer(Modifier.height(8.dp))
                 Card(Modifier.fillMaxWidth().bridgeGlass(RoundedCornerShape(20.dp)), colors = CardDefaults.cardColors(containerColor = Color.Transparent), shape = RoundedCornerShape(20.dp)) { Column(Modifier.padding(vertical = 6.dp)) {
                     PreferenceSwitch("保存到手机相册", "开启保存到相册，关闭保存到下载目录", config.autoExport) { vm.updateConfig { it.copy(autoExport = !it.autoExport) } }
@@ -2387,7 +2434,18 @@ private fun SettingsContent(vm: MainViewModel, modifier: Modifier = Modifier) {
             Column(Modifier.fillMaxWidth()) {
                 Text("存储", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge); Spacer(Modifier.height(8.dp))
                 Card(Modifier.fillMaxWidth().bridgeGlass(RoundedCornerShape(20.dp)), colors = CardDefaults.cardColors(containerColor = Color.Transparent), shape = RoundedCornerShape(20.dp)) { Column(Modifier.padding(vertical = 6.dp)) {
-                    TextButton(vm::clearThumbnailCache, Modifier.padding(horizontal = 10.dp)) { Text("清理缓存", color = Color(0xFFE57373)) }
+                    Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("缩略图缓存", color = BridgeWhite, style = MaterialTheme.typography.bodyMedium)
+                            Text("本地占用 ${android.text.format.Formatter.formatFileSize(context, thumbnailCacheBytes)}",
+                                color = BridgeWhite.copy(alpha = .6f), style = MaterialTheme.typography.bodySmall)
+                        }
+                        TextButton(vm::clearThumbnailCache, enabled = !clearingThumbnailCache) {
+                            Text(if (clearingThumbnailCache) "清理中…" else "清理缓存", color = Color(0xFFE57373))
+                        }
+                    }
+                    Text("同时清理内存中的缩略图，不删除照片或色彩预设", Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                        color = BridgeWhite.copy(alpha = .5f), style = MaterialTheme.typography.bodySmall)
                 } }
             }
             Column(Modifier.fillMaxWidth()) {
@@ -2629,10 +2687,10 @@ private fun DownloadedPhotoDetailsSheet(row: DownloadRecord, dismiss: () -> Unit
     }
     val ratio = bitmap?.let { it.width.toFloat() / it.height.coerceAtLeast(1) }
         ?.coerceIn(.65f, 1.6f) ?: 1f
-    Card(Modifier.fillMaxWidth().combinedClickable(onClick = click, onLongClick = longClick), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = if (selected) androidx.compose.foundation.BorderStroke(2.dp, BridgeEmber) else androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
+    Card(Modifier.fillMaxWidth().combinedClickable(onClick = click, onLongClick = longClick), shape = RectangleShape, colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = if (selected) androidx.compose.foundation.BorderStroke(2.dp, BridgeEmber) else androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
         Box(Modifier.aspectRatio(ratio)) {
             if (bitmap != null) Image(bitmap!!.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-            else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(if (kind == MediaKind.VIDEO) Icons.Default.Videocam else Icons.Default.Download, null, tint = BridgeEmber); if (kind == MediaKind.VIDEO) Text("无法生成视频缩略图", color = BridgeWhite.copy(alpha = .72f), style = MaterialTheme.typography.labelSmall) } }
+            else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RectangleShape), contentAlignment = Alignment.Center) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(if (kind == MediaKind.VIDEO) Icons.Default.Videocam else Icons.Default.Download, null, tint = BridgeEmber); if (kind == MediaKind.VIDEO) Text("无法生成视频缩略图", color = BridgeWhite.copy(alpha = .72f), style = MaterialTheme.typography.labelSmall) } }
             if (kind == MediaKind.VIDEO) {
                 Surface(Modifier.align(Alignment.Center).size(48.dp), shape = CircleShape, color = BridgeNight.copy(alpha = .72f)) { Icon(Icons.Default.PlayArrow, "播放", tint = BridgeWhite, modifier = Modifier.padding(10.dp)) }
                 Surface(Modifier.align(Alignment.BottomStart).padding(7.dp), shape = RoundedCornerShape(10.dp), color = BridgeNight.copy(alpha = .72f)) { Text(row.name, Modifier.padding(horizontal = 7.dp, vertical = 4.dp), color = BridgeWhite, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall) }
@@ -2661,10 +2719,10 @@ private fun DownloadedPhotoDetailsSheet(row: DownloadRecord, dismiss: () -> Unit
         else -> task.bytesPerSecond?.takeIf { it > 0 }?.let { "${it.prettySize()}/s" } ?: "正在下载"
     }
     var confirmCancel by remember(task.id) { mutableStateOf(false) }
-    Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
+    Card(Modifier.fillMaxWidth(), shape = RectangleShape, colors = CardDefaults.cardColors(containerColor = BridgeWhite.copy(alpha = .08f)), border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .1f))) {
         Box(Modifier.aspectRatio(.78f)) {
             thumbnail?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
-                ?: Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RoundedCornerShape(20.dp)), contentAlignment = Alignment.Center) { Icon(Icons.Default.Download, null, tint = BridgeEmber) }
+                ?: Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(BridgeWine, BridgeNight)), RectangleShape), contentAlignment = Alignment.Center) { Icon(Icons.Default.Download, null, tint = BridgeEmber) }
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(BridgeNight.copy(alpha = .28f), BridgeNight.copy(alpha = .42f), BridgeNight.copy(alpha = .96f)))))
             Surface(Modifier.align(Alignment.TopStart).padding(9.dp), shape = RoundedCornerShape(12.dp), color = if (failed) Color(0xFFE57373).copy(alpha = .9f) else BridgeNight.copy(alpha = .78f)) {
                 Text(stateLabel, Modifier.padding(horizontal = 8.dp, vertical = 5.dp), color = BridgeWhite, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)

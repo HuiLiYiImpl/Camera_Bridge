@@ -40,6 +40,7 @@ data class CameraConfig(
     val colorTheme: AppColorTheme = AppColorTheme.DARKROOM_ORANGE,
     val initialPhotoBatchSize: Int = 30,
     val loadMorePhotoBatchSize: Int = 15,
+    val autoLoadOriginalOnPreview: Boolean = false,
 )
 
 data class CameraSession(
@@ -56,6 +57,8 @@ data class PhotoAsset(
     val size: Long,
     val format: Int,
     val capturedAt: Date = Date(),
+    val imageWidth: Int = 0,
+    val imageHeight: Int = 0,
 ) {
     val type: String get() = when (format) {
         0x3801, 0x3808 -> "JPEG"
@@ -172,6 +175,7 @@ class AppStore(context: Context) {
         prefs.getString("color_theme", AppColorTheme.DARKROOM_ORANGE.name)?.let { runCatching { AppColorTheme.valueOf(it) }.getOrDefault(AppColorTheme.DARKROOM_ORANGE) } ?: AppColorTheme.DARKROOM_ORANGE,
         prefs.getInt("initial_photo_batch_size", 30).coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
         prefs.getInt("load_more_photo_batch_size", 15).coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE),
+        prefs.getBoolean("auto_load_original_on_preview", false),
     )
 
     fun save(config: CameraConfig) = prefs.edit()
@@ -190,6 +194,7 @@ class AppStore(context: Context) {
         .putString("color_theme", config.colorTheme.name)
         .putInt("initial_photo_batch_size", config.initialPhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE))
         .putInt("load_more_photo_batch_size", config.loadMorePhotoBatchSize.coerceIn(MIN_PHOTO_BATCH_SIZE, MAX_PHOTO_BATCH_SIZE))
+        .putBoolean("auto_load_original_on_preview", config.autoLoadOriginalOnPreview)
         .apply()
 
     @Synchronized fun downloads(): List<DownloadRecord> = runCatching {

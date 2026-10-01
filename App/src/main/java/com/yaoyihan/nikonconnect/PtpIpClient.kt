@@ -23,11 +23,21 @@ class PtpIpClient(
     private var transaction = 1u
     private var objectHandles: List<UInt>? = null
     private var supportedOperations = emptySet<Int>()
+    private var supportedProperties = emptySet<Int>()
+    private val unreadableProperties = mutableSetOf<Int>()
+    private var vendorPropertiesLoaded = false
+    private var liveViewActive = false
+    private var liveViewOwned = false
+    private var touchFocusConfirmed = false
     private var cameraModeChanged = false
     private var applicationModeChanged = false
     private var captureEvents = java.util.concurrent.ConcurrentLinkedQueue<CaptureEvent>()
     override val supportsRemoteCapture: Boolean
         @Synchronized get() = NIKON_CAPTURE_TO_CARD in supportedOperations || INITIATE_CAPTURE in supportedOperations
+    override val supportsLiveView: Boolean
+        @Synchronized get() = listOf(NIKON_START_LIVE_VIEW, NIKON_END_LIVE_VIEW, NIKON_GET_LIVE_VIEW).all { it in supportedOperations }
+    override val supportsTouchFocus: Boolean
+        @Synchronized get() = listOf(NIKON_CHANGE_AF_AREA, NIKON_AF_DRIVE, NIKON_DEVICE_READY).all { it in supportedOperations }
     override var cameraName: String = "Nikon 相机"; private set
     override var cameraDetails: CameraDetails = CameraDetails(manufacturer = "Nikon"); private set
     override val transport = ConnectionTransport.WIFI
@@ -35,6 +45,11 @@ class PtpIpClient(
     @Synchronized override fun connect() {
         cameraModeChanged = false
         applicationModeChanged = false
+        liveViewActive = false
+        liveViewOwned = false
+        touchFocusConfirmed = false
+        unreadableProperties.clear()
+        vendorPropertiesLoaded = false
         captureEvents = java.util.concurrent.ConcurrentLinkedQueue()
         command = Channel(host, port, socketFactory).also { it.open() }
         // Nikon's Android client identifies its PTP/IP session with this stable value.
@@ -53,6 +68,7 @@ class PtpIpClient(
         require(event.read().type == INIT_EVENT_ACK) { "相机拒绝了事件通道连接" }
         val device = parseDeviceInfo(requestData(GET_DEVICE_INFO, 0u))
         supportedOperations = device.supportedOperations
+        supportedProperties = device.supportedProperties
         cameraDetails = device.details
         cameraName = cameraDisplayName(cameraDetails, connectionName)
         requestResponse(OPEN_SESSION, 0u, 1u)
@@ -77,7 +93,22 @@ class PtpIpClient(
         return true
     }
 
-    @Synchronized override fun thumbnail(asset: PhotoAsset): ByteArray? = runCatching { requestData(GET_THUMB, next(), asset.handle) }.getOrNull()
+    @Synchronized override fun thumbnail(asset: PhotoAsset): ByteArray? = runCatching {
+        if (NIKON_GET_LARGE_THUMB in supportedOperations) {
+            val large = try { requestData(NIKON_GET_LARGE_THUMB, next(), asset.handle) }
+            catch (error: PtpResponseException) {
+                // Only an explicit response leaves the connection safe for another request.
+                if (error.response !in listOf(0x2005, 0x200A, 0x2010, 0x201D)) throw error
+                null
+            }
+            if (large != null && large.isNotEmpty()) {
+                val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                android.graphics.BitmapFactory.decodeByteArray(large, 0, large.size, bounds)
+                if (bounds.outWidth > 0 && bounds.outHeight > 0) return@runCatching large
+            }
+        }
+        requestData(GET_THUMB, next(), asset.handle)
+    }.getOrNull()
     @Synchronized override fun imageHeader(asset: PhotoAsset): ByteArray? = runCatching {
         val length = minOf(asset.size.takeIf { it > 0 } ?: IMAGE_HEADER_SIZE.toLong(), IMAGE_HEADER_SIZE.toLong()).toUInt()
         requestData(GET_PARTIAL_OBJECT, next(), asset.handle, 0u, length)
@@ -144,10 +175,12 @@ class PtpIpClient(
     private fun parseObject(handle: UInt, data: ByteArray): PhotoAsset {
         val r = Reader(data)
         r.u32(); val format = r.u16(); r.u16(); val size = r.u32().toLong()
-        r.u16(); r.u32(); r.u32(); r.u32(); r.u32(); r.u32(); r.u32(); r.u32(); r.u16(); r.u32(); r.u32()
+        r.u16(); r.u32(); r.u32(); r.u32()
+        val imageWidth = r.u32().toInt(); val imageHeight = r.u32().toInt()
+        r.u32(); r.u32(); r.u16(); r.u32(); r.u32()
         val name = r.ptpString().ifBlank { "IMG_$handle" }
         val date = parsePtpDate(r.ptpString())
-        return PhotoAsset(handle, name, size, format, date)
+        return PhotoAsset(handle, name, size, format, date, imageWidth, imageHeight)
     }
 
     private fun parseDeviceInfo(data: ByteArray): ParsedDeviceInfo {
@@ -217,6 +250,225 @@ class PtpIpClient(
 
     private data class CaptureEvent(val code: Int, val transaction: UInt, val at: Long)
 
+    private fun prepareRemoteControl() {
+        if (!cameraModeChanged && NIKON_CHANGE_CAMERA_MODE in supportedOperations) {
+            try {
+                requestResponse(NIKON_CHANGE_CAMERA_MODE, next(), 1u)
+                cameraModeChanged = true
+            } catch (error: PtpResponseException) {
+                if (error.response != 0xA003) throw error
+            }
+        }
+        if (!applicationModeChanged && NIKON_CHANGE_APPLICATION_MODE in supportedOperations) {
+            requestResponse(NIKON_CHANGE_APPLICATION_MODE, next(), 1u)
+            applicationModeChanged = true
+        }
+        loadVendorProperties()
+    }
+
+    private fun loadVendorProperties() {
+        if (vendorPropertiesLoaded) return
+        // Nikon's generic DeviceInfo can omit the vendor shutter/ISO/live-view properties.
+        if (0x90CA in supportedOperations) {
+            try { supportedProperties = supportedProperties + Reader(requestData(0x90CA, next())).u16Array() }
+            catch (error: PtpResponseException) { if (error.response == 0x2019) throw error }
+        }
+        if (0x9439 in supportedOperations) {
+            try { supportedProperties = supportedProperties + Reader(requestData(0x9439, next(), 0xDu)).u32Array().map { it.toInt() } }
+            catch (error: PtpResponseException) { if (error.response == 0x2019) throw error }
+        }
+        vendorPropertiesLoaded = true
+    }
+
+    @Synchronized override fun startLiveView() {
+        require(supportsLiveView) { "当前连接未提供实时取景能力" }
+        if (liveViewActive) return
+        prepareRemoteControl()
+        if (unsignedProperty(NIKON_LIVE_VIEW_STATUS) == 1L) {
+            liveViewActive = true
+            return // Do not end live view that was already active on the camera.
+        }
+        requestResponse(NIKON_START_LIVE_VIEW, next())
+        liveViewOwned = true
+        liveViewActive = true
+    }
+
+    @Synchronized override fun stopLiveView() {
+        if (liveViewOwned) {
+            try { requestResponse(NIKON_END_LIVE_VIEW, next()) }
+            catch (error: PtpResponseException) { if (error.response != 0xA00B) throw error }
+        }
+        liveViewOwned = false
+        liveViewActive = false
+        touchFocusConfirmed = false
+    }
+
+    @Synchronized override fun liveViewFrame(): CameraLiveViewFrame {
+        startLiveView()
+        val data = try { requestData(NIKON_GET_LIVE_VIEW, next()) }
+        catch (error: PtpResponseException) {
+            if (error.response == 0xA00B) { liveViewActive = false; liveViewOwned = false }
+            throw error
+        }
+        // Nikon prepends model-specific metadata. Locate JPEG instead of hardcoding an offset.
+        for (offset in 0 until (data.size - 2).coerceAtLeast(0)) {
+            if (data[offset] == 0xff.toByte() && data[offset + 1] == 0xd8.toByte() && data[offset + 2] == 0xff.toByte()) {
+                val geometry = LiveViewFocusGeometry.parse(data, offset)
+                val focusStatus = if (geometry != null) data[48].toInt() and 0xff else null
+                if (focusStatus == 1) touchFocusConfirmed = false
+                return CameraLiveViewFrame(data.copyOfRange(offset, data.size), geometry, focusStatus)
+            }
+        }
+        throw LiveViewImageException("相机取景数据中没有可显示的 JPEG 画面")
+    }
+
+    @Synchronized override fun focusAt(point: NormalizedFocusPoint, geometry: LiveViewFocusGeometry,
+        isCancelled: () -> Boolean): RemoteFocusResult {
+        require(supportsTouchFocus) { "当前连接不支持点击对焦" }
+        fun checkCancelled() {
+            if (isCancelled()) throw kotlin.coroutines.cancellation.CancellationException("对焦操作已取消")
+        }
+        checkCancelled()
+        require(liveViewActive) { "请等待实时取景恢复后再对焦" }
+        touchFocusConfirmed = false
+        require(unsignedProperty(0x500A) != 1L) { "相机当前为手动对焦，请在机身上切换为自动对焦" }
+        val currentFrame = liveViewFrame()
+        require(currentFrame.focusGeometry == geometry) { "相机取景范围已改变，请在最新画面上重新点按" }
+        val (x, y) = geometry.cameraPoint(point)
+        checkCancelled()
+        requestResponse(NIKON_CHANGE_AF_AREA, next(), x.toUInt(), y.toUInt())
+        checkCancelled()
+        requestResponse(NIKON_AF_DRIVE, next())
+        val deadline = System.nanoTime() + 5_000_000_000L
+        while (System.nanoTime() < deadline) {
+            checkCancelled()
+            try {
+                requestResponse(NIKON_DEVICE_READY, next())
+                val resultFrame = liveViewFrame()
+                checkCancelled()
+                if (resultFrame.focusGeometry != geometry) {
+                    return RemoteFocusResult(RemoteFocusPhase.UNCONFIRMED, "相机取景范围已改变，请重新点按对焦")
+                }
+                return when (resultFrame.focusStatus) {
+                    2 -> { touchFocusConfirmed = true; RemoteFocusResult(RemoteFocusPhase.FOCUSED, "已合焦") }
+                    1 -> RemoteFocusResult(RemoteFocusPhase.FAILED, "未能合焦，请换一个位置或检查镜头")
+                    else -> RemoteFocusResult(RemoteFocusPhase.UNCONFIRMED, "对焦指令已完成，相机未提供合焦状态")
+                }
+            } catch (error: PtpResponseException) {
+                when (error.response) {
+                    0x2019 -> Thread.sleep(100)
+                    0xA002 -> return RemoteFocusResult(RemoteFocusPhase.FAILED, "未能合焦，请换一个位置或检查镜头")
+                    else -> throw error
+                }
+            }
+        }
+        return RemoteFocusResult(RemoteFocusPhase.UNCONFIRMED, "暂未确认对焦结果，请查看画面后重试")
+    }
+
+    private fun unsignedProperty(code: Int): Long? {
+        if (code !in supportedProperties || code in unreadableProperties) return null
+        val bytes = try { requestData(GET_DEVICE_PROP_VALUE, next(), code.toUInt()) }
+        catch (error: PtpResponseException) {
+            if (error.response == 0x2019) throw error
+            unreadableProperties += code
+            return null
+        }
+        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        return when (bytes.size) {
+            1 -> bytes[0].toLong() and 0xff
+            2 -> buffer.short.toLong() and 0xffff
+            4 -> buffer.int.toLong() and 0xffffffffL
+            8 -> buffer.long
+            else -> null
+        }
+    }
+
+    @Synchronized override fun shootingParameters(): CameraShootingParameters {
+        loadVendorProperties()
+        val nikonTime = unsignedProperty(0xD100)
+        val shutter = when (nikonTime) {
+            0xffffffffL -> "Bulb"
+            0xfffffffdL -> "Time"
+            0xfffffffeL -> "X 1/200"
+            null -> unsignedProperty(0x500D)?.takeIf { it > 0 }?.let { ticks ->
+                val seconds = ticks / 10000.0
+                if (seconds < 1) "1/${kotlin.math.round(1 / seconds).toInt()}" else "${"%.1f".format(Locale.US, seconds).removeSuffix(".0")}s"
+            }
+            else -> {
+                val numerator = nikonTime shr 16
+                val denominator = nikonTime and 0xffff
+                when {
+                    denominator == 1L -> "${numerator}s"
+                    numerator > 0 && denominator > 0 -> "$numerator/$denominator"
+                    else -> null
+                }
+            }
+        }
+        val aperture = unsignedProperty(0x5007)?.takeIf { it > 0 }?.let { "f/${formatHundredths(it)}" }
+        val iso = (unsignedProperty(0x500F) ?: unsignedProperty(0xD0B4))?.let {
+            when (it) { 0L, 0xffffL, 0xffffffffL -> "AUTO"; else -> it.toString() }
+        }
+        val mode = when (val value = unsignedProperty(0x500E)) {
+            1L -> "M"; 2L -> "P"; 3L -> "A"; 4L -> "S"; 0x8010L -> "AUTO"
+            null -> null; else -> "0x${value.toString(16)}"
+        }
+        return CameraShootingParameters(shutter, aperture, iso, mode,
+            unsignedProperty(0x5008)?.takeIf { it > 0 }?.let { "${formatHundredths(it)} mm" },
+            unsignedProperty(BATTERY_LEVEL)?.toInt()?.takeIf { it in 0..100 },
+            unsignedProperty(0x5010)?.let { RemoteParameter.COMPENSATION.display(0x5010, it.toShort().toLong()) },
+            unsignedProperty(0x5005)?.let { RemoteParameter.WHITE_BALANCE.display(0x5005, it) },
+            unsignedProperty(0xD200)?.let(NikonPictureControls::label))
+    }
+
+    @Synchronized override fun parameterDescriptor(parameter: RemoteParameter): CameraParameterDescriptor {
+        prepareRemoteControl()
+        loadVendorProperties()
+        require(0x1014 in supportedOperations) { "当前连接不支持读取可调参数" }
+        var fallback: CameraParameterDescriptor? = null
+        for (code in parameter.codes.filter { it in supportedProperties }) {
+            val descriptor = try {
+                CameraParameterDescriptor.parse(requestData(0x1014, next(), code.toUInt()))
+                    .also { require(it.code == code) { "相机返回的参数编号不匹配" } }
+            } catch (error: PtpResponseException) {
+                if (error.response !in listOf(0x2005, 0x200A)) throw error
+                continue
+            }
+            fallback = fallback ?: descriptor
+            if (descriptor.writable) { fallback = descriptor; break }
+        }
+        val descriptor = fallback ?: error("相机未提供${parameter.title}的可调参数")
+        if (parameter == RemoteParameter.PICTURE_CONTROL && descriptor.values.isEmpty()) {
+            return descriptor.copy(writable = false, reason = "相机未提供可选择的机内滤镜列表")
+        }
+        val mode = unsignedProperty(0x500E)
+        val allowed = parameter.modeAllows(mode)
+        return descriptor.copy(
+            writable = descriptor.writable && allowed && 0x1016 in supportedOperations,
+            reason = when {
+                !allowed -> "当前拍摄模式下由相机控制，请在机身上选择适合的模式"
+                !descriptor.writable -> descriptor.reason ?: "此参数当前由相机控制，只能查看"
+                0x1016 !in supportedOperations -> "当前连接不支持修改参数"
+                else -> null
+            },
+        )
+    }
+
+    @Synchronized override fun setParameter(parameter: RemoteParameter, value: Long): CameraShootingParameters {
+        // Re-read mode, write permission and allowed values immediately before sending.
+        val descriptor = parameterDescriptor(parameter)
+        val bytes = descriptor.encode(value)
+        val id = next()
+        for (writePacket in ptpParameterWritePackets(id, descriptor.code, bytes)) command.send(writePacket)
+        validateResponse(0x1016, id, command.read())
+        val actual = CameraParameterDescriptor.parse(requestData(0x1014, next(), descriptor.code.toUInt()))
+        require(actual.code == descriptor.code && actual.current == value) {
+            "相机返回的实际值为${parameter.display(descriptor.code, actual.current)}，未确认修改生效"
+        }
+        // A previously unavailable value may become readable after the mode changes.
+        unreadableProperties.remove(descriptor.code)
+        return shootingParameters()
+    }
+
     /** One reader per event socket; close/reconnect unblocks and retires the old reader. */
     private fun startEventReader(channel: Channel) {
         channel.disableReadTimeout()
@@ -247,19 +499,12 @@ class PtpIpClient(
         require(supportsRemoteCapture) { "当前相机连接未提供遥控拍摄能力" }
         fun checkCancelled() { if (isCancelled()) throw kotlin.coroutines.cancellation.CancellationException("拍摄已取消") }
         checkCancelled()
-        if (!cameraModeChanged && NIKON_CHANGE_CAMERA_MODE in supportedOperations) {
-            try {
-                requestResponse(NIKON_CHANGE_CAMERA_MODE, next(), 1u)
-                cameraModeChanged = true
-            } catch (error: PtpResponseException) {
-                if (error.response != 0xA003) throw error
-            }
-        }
+        // Retain the already working AF + card capture path while live view is paused.
+        val cameraLiveViewKept = liveViewActive && !liveViewOwned
+        val preserveTouchFocus = liveViewActive && touchFocusConfirmed
+        stopLiveView()
+        prepareRemoteControl()
         checkCancelled()
-        if (!applicationModeChanged && NIKON_CHANGE_APPLICATION_MODE in supportedOperations) {
-            requestResponse(NIKON_CHANGE_APPLICATION_MODE, next(), 1u)
-            applicationModeChanged = true
-        }
         // Snapshot all card handles, not just the currently loaded gallery page.
         val baseline = try {
             Reader(requestData(GET_OBJECT_HANDLES, next(), UInt.MAX_VALUE, 0u, 0u)).u32Array().toSet()
@@ -269,7 +514,7 @@ class PtpIpClient(
         val startedAt = System.nanoTime()
         val captureId = next()
         val operation = if (NIKON_CAPTURE_TO_CARD in supportedOperations) NIKON_CAPTURE_TO_CARD else INITIATE_CAPTURE
-        val parameters = if (operation == NIKON_CAPTURE_TO_CARD) uintArrayOf(0xfffffffeu, 0u) else uintArrayOf(0u, 0u)
+        val parameters = if (operation == NIKON_CAPTURE_TO_CARD) uintArrayOf(if (cameraLiveViewKept || preserveTouchFocus) 0xffffffffu else 0xfffffffeu, 0u) else uintArrayOf(0u, 0u)
         // The UI stops offering cancellation before any shutter bytes are sent.
         onSending()
         try {
@@ -362,18 +607,30 @@ class PtpIpClient(
     private fun requestToStream(operation: Int, id: UInt, handle: UInt, offset: UInt, count: UInt, output: OutputStream, progress: (Long, Long) -> Unit, total: Long, baseOffset: Long, isCancelled: () -> Boolean): Long =
         requestToStream(operation, id, output, progress, total, baseOffset, isCancelled, handle, offset, count)
 
+    @Synchronized override fun exitRemoteControl() {
+        stopLiveView()
+        if (applicationModeChanged) {
+            requestResponse(NIKON_CHANGE_APPLICATION_MODE, next(), 0u)
+            applicationModeChanged = false
+        }
+        if (cameraModeChanged) {
+            requestResponse(NIKON_CHANGE_CAMERA_MODE, next(), 0u)
+            cameraModeChanged = false
+        }
+    }
+
     private fun next() = transaction++
     @Synchronized override fun close() {
         if (::command.isInitialized) {
             runCatching {
-                if (applicationModeChanged) requestResponse(NIKON_CHANGE_APPLICATION_MODE, next(), 0u)
-                if (cameraModeChanged) requestResponse(NIKON_CHANGE_CAMERA_MODE, next(), 0u)
+                exitRemoteControl()
                 requestResponse(CLOSE_SESSION, next())
             }
             runCatching { command.close() }
         }
         if (::event.isInitialized) runCatching { event.close() }
         supportedOperations = emptySet()
+        supportedProperties = emptySet()
         captureEvents.clear()
     }
 
@@ -442,12 +699,20 @@ class PtpIpClient(
         private const val PROTOCOL_VERSION = 0x00010000u
         private const val INIT_COMMAND_REQUEST = 1; private const val INIT_COMMAND_ACK = 2; private const val INIT_EVENT_REQUEST = 3; private const val INIT_EVENT_ACK = 4
         private const val OPERATION_REQUEST = 6; private const val OPERATION_RESPONSE = 7; private const val START_DATA = 9; private const val DATA = 10; private const val END_DATA = 12
+        private const val NIKON_GET_LARGE_THUMB = 0x90C4
         private const val GET_DEVICE_INFO = 0x1001; private const val OPEN_SESSION = 0x1002; private const val CLOSE_SESSION = 0x1003; private const val GET_STORAGE_IDS = 0x1004; private const val GET_OBJECT_HANDLES = 0x1007; private const val GET_OBJECT_INFO = 0x1008; private const val GET_OBJECT = 0x1009; private const val GET_THUMB = 0x100A; private const val GET_DEVICE_PROP_VALUE = 0x1015; private const val GET_PARTIAL_OBJECT = 0x101B
         private const val RESPONSE_OK = 0x2001
         private const val INITIATE_CAPTURE = 0x100E
         private const val NIKON_CHANGE_CAMERA_MODE = 0x90C2
         private const val NIKON_CHANGE_APPLICATION_MODE = 0x9435
         private const val NIKON_CAPTURE_TO_CARD = 0x9207
+        private const val NIKON_START_LIVE_VIEW = 0x9201
+        private const val NIKON_END_LIVE_VIEW = 0x9202
+        private const val NIKON_GET_LIVE_VIEW = 0x9203
+        private const val NIKON_CHANGE_AF_AREA = 0x9205
+        private const val NIKON_AF_DRIVE = 0x90C1
+        private const val NIKON_DEVICE_READY = 0x90C8
+        private const val NIKON_LIVE_VIEW_STATUS = 0xD1A2
         private const val EVENT = 8; private const val PING = 13; private const val PONG = 14
         private const val OBJECT_ADDED = 0x4002; private const val CAPTURE_COMPLETE = 0x400D
         private const val BATTERY_LEVEL = 0x5001

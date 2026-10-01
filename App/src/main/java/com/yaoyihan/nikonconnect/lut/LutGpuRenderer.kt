@@ -66,6 +66,12 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
     }
 
     fun setImage(bitmap: Bitmap?) { lutRenderer.image = bitmap; requestRender() }
+    fun setPreview(bitmap: Bitmap?, lut: CubeLut?, intensity: Float) {
+        lutRenderer.image = bitmap
+        lutRenderer.lut = lut
+        lutRenderer.intensity = intensity
+        requestRender()
+    }
     fun setLut(lut: CubeLut?) { lutRenderer.lut = lut; requestRender() }
     fun setIntensity(value: Float) { lutRenderer.intensity = value; requestRender() }
     fun setImageRotation(degrees: Int) { lutRenderer.rotation = ((degrees % 360) + 360) % 360 / 90; requestRender() }
@@ -108,6 +114,8 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
         }
 
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+            // A resumed/recreated EGL context no longer owns the previous texture identifiers.
+            imageTexture = 0; lutTexture = 0; uploadedImage = null; uploadedLut = null
             program = runCatching {
                 linkProgram(compile(GLES30.GL_VERTEX_SHADER, VertexShader), compile(GLES30.GL_FRAGMENT_SHADER, FragmentShader))
             }.getOrElse { error ->
