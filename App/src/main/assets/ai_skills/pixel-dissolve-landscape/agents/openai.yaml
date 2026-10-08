@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pixel Dissolve Landscape"
+  short_description: "Turn photos into airy pixel-dissolve landscapes"
+  default_prompt: "Use $pixel-dissolve-landscape to turn each uploaded photo into a separate 3:4 pixel-dissolve landscape poster."

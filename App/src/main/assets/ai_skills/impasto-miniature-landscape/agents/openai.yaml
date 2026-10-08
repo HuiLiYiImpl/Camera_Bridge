@@ -1,0 +1,4 @@
+interface:
+  display_name: "Impasto Miniature Landscape"
+  short_description: "Turn photos into luminous impasto miniature scenes"
+  default_prompt: "Use $impasto-miniature-landscape to turn each uploaded photo into a separate 3:4 impasto miniature landscape poster."

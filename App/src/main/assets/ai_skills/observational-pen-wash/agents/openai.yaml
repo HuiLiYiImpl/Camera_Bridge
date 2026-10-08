@@ -1,0 +1,4 @@
+interface:
+  display_name: "Observational Pen Wash"
+  short_description: "Turn photos into minimal observational pen washes"
+  default_prompt: "Use $observational-pen-wash to turn each uploaded photo into a separate 3:4 observational pen-and-wash poster."

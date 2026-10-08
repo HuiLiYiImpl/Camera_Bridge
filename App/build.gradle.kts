@@ -14,8 +14,8 @@ android {
         applicationId = "com.yaoyihan.nikonconnect"
         minSdk = 26
         targetSdk = 35
-        versionCode = 29
-        versionName = "1.0.29"
+        versionCode = 31
+        versionName = "1.0.31"
     }
 
     buildFeatures { compose = true; buildConfig = true }
@@ -56,4 +56,5 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

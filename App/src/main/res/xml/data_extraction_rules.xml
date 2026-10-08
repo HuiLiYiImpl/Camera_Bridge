@@ -2,8 +2,10 @@
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="link_geocoding.xml" />
+        <exclude domain="sharedpref" path="link_ai_image.xml" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="link_geocoding.xml" />
+        <exclude domain="sharedpref" path="link_ai_image.xml" />
     </device-transfer>
 </data-extraction-rules>

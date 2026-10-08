@@ -1,0 +1,4 @@
+interface:
+  display_name: "Papercraft Travel Diorama"
+  short_description: "Turn photos into handcrafted travel dioramas"
+  default_prompt: "Use $papercraft-travel-diorama to turn each uploaded photo into a separate 3:4 handcrafted travel diorama poster."

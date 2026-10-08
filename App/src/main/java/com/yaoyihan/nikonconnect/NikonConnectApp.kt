@@ -75,6 +75,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalView
@@ -207,8 +209,6 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
     val snackbarText by vm.snackbar.collectAsState()
     val session by vm.session.collectAsState()
     val config by vm.config.collectAsState()
-    val diagnostic by vm.diagnosticState.collectAsState()
-    val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val snackbarHostState = remember { SnackbarHostState() }
     var tab by rememberSaveable { mutableStateOf(Tab.CAMERA) }
@@ -249,6 +249,9 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer); vm.setRemoteViewVisible(false) }
     }
     LaunchedEffect(snackbarText) { snackbarText?.let { snackbarHostState.showSnackbar(it, duration = SnackbarDuration.Short) } }
+    LaunchedEffect(workflow, notice) {
+        if (workflow == Workflow.ERROR) notice?.let { vm.notify(it) }
+    }
     BridgeTheme(config.colorTheme) {
         LinkUpdatePrompt()
         if (settingsOpen) SettingsSheet(vm) { settingsOpen = false }
@@ -269,15 +272,6 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                 ) { contentPadding ->
                     Box(Modifier.fillMaxSize().bridgeBackground().padding(contentPadding)) {
                         Column(Modifier.fillMaxSize().statusBarsPadding()) {
-                            if (!connectionCenter && (tab != Tab.REMOTE || workflow == Workflow.ERROR)) AnimatedActivityPill(
-                                notice,
-                                busy,
-                                if (workflow == Workflow.ERROR) vm::retry else null,
-                                diagnostic.takeIf { workflow == Workflow.ERROR },
-                                { vm.exportDiagnostics { it.onSuccess { uri -> shareDiagnostic(context, uri) } } },
-                                { copyDiagnostic(context, vm.diagnosticCopyText()); vm.notify("已复制诊断信息") },
-                                vm::dismissError,
-                            )
                             AnimatedContent(tab, label = "tab", modifier = Modifier.weight(1f)) { screen ->
                                 pageStates.SaveableStateProvider(if (screen == Tab.PHOTOS) "${screen.name}:${session?.transport}:${session?.name}:${session?.details?.serialNumber}" else screen.name) {
                                 when (screen) {
@@ -1201,7 +1195,7 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
                 selectedLut = null
                 selectedLutEntry = entry
             }
-        }, selectedLutEntry?.name, download = startDownload, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 }, gpuSource = previewBitmap, gpuLut = selectedLut, gpuIntensity = selectedLutIntensity, setGpuIntensity = { intensityDragging = true; selectedLutIntensity = it }, intensityChangeFinished = { intensityDragging = false }, previousPhoto = previousPhoto, nextPhoto = nextPhoto, sourceRotation = previewRotation, selectedLutEntry = selectedLutEntry, downloadOnly = asset.name.isVideoName(), viewDetails = if (asset.name.isVideoName()) null else { { showCameraDetails = true } })
+        }, selectedLutEntry?.name, download = startDownload, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 }, gpuSource = previewBitmap, gpuLut = selectedLut, gpuIntensity = selectedLutIntensity, setGpuIntensity = { intensityDragging = true; selectedLutIntensity = it }, intensityChangeFinished = { intensityDragging = false }, previousPhoto = previousPhoto, nextPhoto = nextPhoto, sourceRotation = previewRotation, selectedLutEntry = selectedLutEntry, downloadOnly = asset.name.isVideoName(), viewDetails = if (asset.name.isVideoName()) null else { { showCameraDetails = true } }, aiController = vm.aiPhoto, aiPhotoKey = asset.downloadSourceKey(session), aiSettingsContent = { profileId, close -> SettingsSheet(vm, focusAi = true, initialProfileId = profileId, dismiss = close) })
         if (showCameraDetails) CameraPhotoDetailsSheet(asset, photoMetadata, previewBitmap != null, previewLoading, { showCameraDetails = false }, startLoadOriginal, { showCameraDetails = false; startDownload() })
     }
     if (showWatermarkEditor) WatermarkEditorDialog(editingWatermark, { showWatermarkEditor = false }, { preset -> if (editingWatermark == null) vm.addWatermark(preset) else vm.updateWatermark(preset); showWatermarkEditor = false })
@@ -1240,18 +1234,6 @@ private fun GalleryScreen(vm: MainViewModel, busy: Boolean) {
         val suffix = if (videoCount > 0) "视频需先下载，再到下载页逐个处理。" else ""
         val combined = batchLutWatermarkMode && batchLut != null
         BridgeBottomAlertDialog(onDismissRequest = { showBatchWatermarkConfirm = false }, title = { Text(if (combined) "批量导出编辑图" else "批量添加水印", color = BridgeWhite) }, text = { Text(if (combined) "将为 ${selected.size} 张图片先应用「${batchLutEntry?.name}」，再添加「${batchWatermark!!.name}」水印并导出新文件。原图不会被覆盖。$suffix" else "将为 ${selected.size} 张图片添加「${batchWatermark!!.name}」水印并导出新文件。原图不会被覆盖。$suffix", color = BridgeWhite.copy(alpha = .8f)) }, confirmButton = { TextButton({ showBatchWatermarkConfirm = false; if (combined) vm.applyLutAndWatermarkToPhotos(selected, batchLut!!, batchWatermark!!) { selectionMode = false; selectedHandles = emptySet(); batchLutWatermarkMode = false } else vm.addWatermarkToPhotos(selected, batchWatermark!!) { if (selectedHandles == selected.mapTo(mutableSetOf()) { it.handle }) { selectionMode = false; selectedHandles = emptySet() } } }) { Text("开始导出", color = BridgeEmber) } }, dismissButton = { TextButton({ showBatchWatermarkConfirm = false }) { Text("取消", color = BridgeWhite.copy(alpha = .7f)) } }, containerColor = BridgeSurface, titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
-    }
-}
-
-@Composable
-private fun AnimatedActivityPill(text: String?, busy: Boolean, retry: (() -> Unit)?, diagnostic: DiagnosticState?, exportDiagnostic: () -> Unit, copyDiagnostic: () -> Unit, dismiss: () -> Unit) {
-    var shownText by remember { mutableStateOf(text) }
-    LaunchedEffect(text) {
-        if (text != null) shownText = text
-        else { delay(180); shownText = null }
-    }
-    AnimatedVisibility(visible = text != null, enter = fadeIn(tween(220)) + expandVertically(tween(220), expandFrom = Alignment.Top) + slideInVertically(tween(220)) { -it / 3 }, exit = fadeOut(tween(180)) + shrinkVertically(tween(180), shrinkTowards = Alignment.Top) + slideOutVertically(tween(180)) { -it / 3 }) {
-        shownText?.let { ActivityPill(it, busy, Modifier.padding(horizontal = 20.dp, vertical = 10.dp), retry, diagnostic, exportDiagnostic, copyDiagnostic, dismiss) }
     }
 }
 
@@ -1380,12 +1362,13 @@ private fun WatermarkTemplatePreview(layout: WatermarkLayout, modifier: Modifier
 }
 
 @Composable
-private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, watermarks: List<WatermarkPreset> = emptyList(), selectWatermark: ((WatermarkPreset?) -> Unit)? = null, watermarkName: String? = null, exportEdited: (() -> Unit)? = null, createWatermark: () -> Unit = {}, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}, rotation: Int = 0, rotateLeft: () -> Unit = {}, gpuSource: Bitmap? = null, gpuLut: CubeLut? = null, gpuIntensity: Float = 1f, setGpuIntensity: (Float) -> Unit = {}, selectedLutEntry: LutEntry? = null, downloadOnly: Boolean = false, viewDetails: (() -> Unit)? = null, intensityChangeFinished: () -> Unit = {}, previousPhoto: (() -> Unit)? = null, nextPhoto: (() -> Unit)? = null, sourceRotation: Int = rotation) {
+private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, watermarks: List<WatermarkPreset> = emptyList(), selectWatermark: ((WatermarkPreset?) -> Unit)? = null, watermarkName: String? = null, exportEdited: (() -> Unit)? = null, createWatermark: () -> Unit = {}, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}, rotation: Int = 0, rotateLeft: () -> Unit = {}, gpuSource: Bitmap? = null, gpuLut: CubeLut? = null, gpuIntensity: Float = 1f, setGpuIntensity: (Float) -> Unit = {}, selectedLutEntry: LutEntry? = null, downloadOnly: Boolean = false, viewDetails: (() -> Unit)? = null, intensityChangeFinished: () -> Unit = {}, previousPhoto: (() -> Unit)? = null, nextPhoto: (() -> Unit)? = null, sourceRotation: Int = rotation, aiController: AiPhotoController? = null, aiPhotoKey: String = "", aiSettingsContent: @Composable (String?, () -> Unit) -> Unit = { _, _ -> }) {
     var comparing by remember(name) { mutableStateOf(false) }
     val context = LocalContext.current
     var lutMenu by remember(name) { mutableStateOf(false) }
     var watermarkMenu by remember(name) { mutableStateOf(false) }
     var editSheet by remember(name) { mutableStateOf(false) }
+    var aiSheet by remember(aiPhotoKey) { mutableStateOf(false) }
     var lutPanelExpanded by remember(name) { mutableStateOf(false) }
     val taskRunning = inlineTask?.running == true
     val exportAction = exportEdited ?: exportLut
@@ -1434,6 +1417,7 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
                         }
                     }
                     if (!editSheet) InlineStatusCard(inlineTask, dismissInline, retryInline)
+                    if (!editSheet && originalLoaded && !downloadOnly && aiController != null) AiPhotoStatus(aiController, aiPhotoKey) { aiSheet = true }
                 }
 
                  if (!editSheet && !downloadOnly && originalLoaded && luts.isNotEmpty() && selectLut != null) LutBottomPanel(luts, selectedLutEntry ?: luts.firstOrNull { it.name == lutName }, gpuIntensity, lutPanelExpanded, selectLut, setGpuIntensity, { lutPanelExpanded = !lutPanelExpanded }, Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 148.dp), intensityChangeFinished)
@@ -1516,6 +1500,9 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
                         { editSheet = false; watermarkMenu = true },
                         { selectLut?.invoke(null); selectWatermark?.invoke(null); editSheet = false },
                         { editSheet = false },
+                        openAi = if (aiController != null && originalLoaded && gpuSource != null && !downloadOnly) {
+                            { editSheet = false; aiSheet = true }
+                        } else null,
                     )
                 }
             }
@@ -1523,6 +1510,9 @@ private fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: 
     }
     if (lutMenu && selectLut != null) LutPickerSheet(true, luts, recentLutIds, { lutMenu = false }, { entry -> lutMenu = false; selectLut(entry) })
     if (watermarkMenu && selectWatermark != null) WatermarkPickerSheet(true, watermarks, { watermarkMenu = false }, { preset -> watermarkMenu = false; selectWatermark(preset) }, { watermarkMenu = false; createWatermark() })
+    if (aiSheet && aiController != null && gpuSource != null && originalLoaded && !downloadOnly) {
+        AiStyleDialog(aiController, aiPhotoKey, name, gpuSource, sourceRotation, { shareUris(context, listOf(it.uri)) }, aiSettingsContent) { aiSheet = false }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1620,6 +1610,7 @@ private fun EditDrawer(
     openWatermark: () -> Unit,
     restore: () -> Unit,
     dismiss: () -> Unit,
+    openAi: (() -> Unit)? = null,
 ) {
     AnimatedVisibility(
         visible = true,
@@ -1629,13 +1620,13 @@ private fun EditDrawer(
         Surface(
             Modifier
                 .fillMaxWidth()
-                .heightIn(max = 240.dp)
+                .heightIn(max = 360.dp)
                 .imePadding(),
             shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp),
             color = BridgeSurface,
             border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .12f)),
         ) {
-            Column(Modifier.padding(horizontal = 16.dp, vertical = 10.dp)) {
+            Column(Modifier.verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 10.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         "编辑照片",
@@ -1654,37 +1645,47 @@ private fun EditDrawer(
                 ) {
                     OutlinedButton(
                         openLut,
-                        Modifier.weight(1f).height(48.dp),
+                        Modifier.weight(1f).heightIn(min = 64.dp),
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
                         shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = BridgeWhite),
                         border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .22f)),
                     ) {
-                        Icon(Icons.Default.ColorLens, null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("调色", maxLines = 1)
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Icon(Icons.Default.ColorLens, null, modifier = Modifier.size(20.dp))
+                            Text("调色", maxLines = 1, style = MaterialTheme.typography.labelLarge)
+                        }
                     }
                     OutlinedButton(
                         openWatermark,
-                        Modifier.weight(1f).height(48.dp),
+                        Modifier.weight(1f).heightIn(min = 64.dp),
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
                         shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = BridgeWhite),
                         border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .22f)),
                     ) {
-                        Icon(Icons.Default.TextFields, null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("水印", maxLines = 1)
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Icon(Icons.Default.TextFields, null, modifier = Modifier.size(20.dp))
+                            Text("水印", maxLines = 1, style = MaterialTheme.typography.labelLarge)
+                        }
                     }
                     OutlinedButton(
                         restore,
-                        Modifier.weight(1f).height(48.dp),
+                        Modifier.weight(1f).heightIn(min = 64.dp),
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 8.dp),
                         shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = BridgeWhite),
                         border = androidx.compose.foundation.BorderStroke(1.dp, BridgeWhite.copy(alpha = .22f)),
                     ) {
-                        Icon(Icons.Default.RestartAlt, null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("还原", maxLines = 1)
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Icon(Icons.Default.RestartAlt, null, modifier = Modifier.size(20.dp))
+                            Text("还原", maxLines = 1, style = MaterialTheme.typography.labelLarge)
+                        }
                     }
+                }
+                if (openAi != null) OutlinedButton(openAi, Modifier.fillMaxWidth().height(44.dp)) {
+                    Icon(Icons.Default.AutoAwesome, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp)); Text("AI 风格", maxLines = 1)
                 }
                 Text("当前效果", color = BridgeWhite.copy(alpha = .58f), style = MaterialTheme.typography.labelMedium)
                 Text(
@@ -1701,7 +1702,7 @@ private fun EditDrawer(
 }
 
 @Composable
-private fun ZoomableImage(bitmap: Bitmap, rotation: Int, modifier: Modifier = Modifier, previous: (() -> Unit)? = null, next: (() -> Unit)? = null) {
+internal fun ZoomableImage(bitmap: Bitmap, rotation: Int, modifier: Modifier = Modifier, previous: (() -> Unit)? = null, next: (() -> Unit)? = null) {
     var scale by remember(bitmap, rotation) { mutableFloatStateOf(1f) }
     var offset by remember(bitmap, rotation) { mutableStateOf(Offset.Zero) }
     var viewport by remember { mutableStateOf(IntSize.Zero) }
@@ -1970,7 +1971,7 @@ private fun DownloadsScreen(vm: MainViewModel) {
             inlineRetry = run
             run()
         }
-        PreviewDialog(row.name, row.size, null, watermarkedBitmap ?: gradedBitmap ?: previewBitmap, previewLoading || grading || watermarking || lutLoading, { preview = null; previewBitmap = null; previewSourceBytes = null; previewRotation = 0; previewLut = null; previewLutData = null; previewLutIntensity = 1f; gradedBitmap = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {} }, { originalReload++ }, previewBitmap != null, luts, recentLutIds, { entry -> previewLut = entry; previewLutData = null; previewLutIntensity = 1f; entry?.let(vm::markLutUsed); Unit }, previewLut?.name, download = null, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 }, gpuSource = previewBitmap, gpuLut = previewLutData, gpuIntensity = previewLutIntensity, setGpuIntensity = { intensityDragging = true; previewLutIntensity = it }, intensityChangeFinished = { intensityDragging = false }, previousPhoto = previousPhoto, nextPhoto = nextPhoto, sourceRotation = previewRotation, selectedLutEntry = previewLut, viewDetails = { detailsRecord = row })
+        PreviewDialog(row.name, row.size, null, watermarkedBitmap ?: gradedBitmap ?: previewBitmap, previewLoading || grading || watermarking || lutLoading, { preview = null; previewBitmap = null; previewSourceBytes = null; previewRotation = 0; previewLut = null; previewLutData = null; previewLutIntensity = 1f; gradedBitmap = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {} }, { originalReload++ }, previewBitmap != null, luts, recentLutIds, { entry -> previewLut = entry; previewLutData = null; previewLutIntensity = 1f; entry?.let(vm::markLutUsed); Unit }, previewLut?.name, download = null, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 }, gpuSource = previewBitmap, gpuLut = previewLutData, gpuIntensity = previewLutIntensity, setGpuIntensity = { intensityDragging = true; previewLutIntensity = it }, intensityChangeFinished = { intensityDragging = false }, previousPhoto = previousPhoto, nextPhoto = nextPhoto, sourceRotation = previewRotation, selectedLutEntry = previewLut, viewDetails = { detailsRecord = row }, aiController = vm.aiPhoto, aiPhotoKey = row.uri, aiSettingsContent = { profileId, close -> SettingsSheet(vm, focusAi = true, initialProfileId = profileId, dismiss = close) })
     }
     if (showWatermarkEditor) WatermarkEditorDialog(editingWatermark, { showWatermarkEditor = false }, { preset -> if (editingWatermark == null) vm.addWatermark(preset) else vm.updateWatermark(preset); showWatermarkEditor = false })
     LutPickerSheet(showBatchLutPicker, luts, recentLutIds, { showBatchLutPicker = false }, { entry ->
@@ -2380,7 +2381,7 @@ private fun WatermarkEditorDialog(existing: WatermarkPreset?, dismiss: () -> Uni
 }
 
 @Composable
-private fun SettingsSheet(vm: MainViewModel, dismiss: () -> Unit) {
+private fun SettingsSheet(vm: MainViewModel, focusAi: Boolean = false, initialProfileId: String? = null, dismiss: () -> Unit) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(onDismissRequest = dismiss, sheetState = sheetState, containerColor = Color.Transparent,
         contentColor = BridgeWhite, dragHandle = null) {
@@ -2389,13 +2390,13 @@ private fun SettingsSheet(vm: MainViewModel, dismiss: () -> Unit) {
                 Text("设置", Modifier.weight(1f), color = BridgeWhite, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                 IconButton(dismiss) { Icon(Icons.Default.Close, "关闭设置", tint = BridgeWhite) }
             }
-            SettingsContent(vm, Modifier.weight(1f))
+            SettingsContent(vm, Modifier.weight(1f), focusAi, initialProfileId)
         }
     }
 }
 
 @Composable
-private fun SettingsContent(vm: MainViewModel, modifier: Modifier = Modifier) {
+private fun SettingsContent(vm: MainViewModel, modifier: Modifier = Modifier, focusAi: Boolean = false, initialProfileId: String? = null) {
     val config by vm.config.collectAsState()
     val thumbnailCacheBytes by vm.thumbnailCacheBytes.collectAsState()
     val clearingThumbnailCache by vm.clearingThumbnailCache.collectAsState()
@@ -2404,14 +2405,26 @@ private fun SettingsContent(vm: MainViewModel, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     var exportingDiagnostics by remember { mutableStateOf(false) }
     var namingRule by remember(config.fileNamingRule) { mutableStateOf(config.fileNamingRule) }
+    val scroll = rememberScrollState()
+    var aiTop by remember { mutableIntStateOf(-1) }
+    var jumpToAi by remember { mutableStateOf(focusAi) }
+    LaunchedEffect(aiTop, jumpToAi) {
+        if (jumpToAi && aiTop >= 0) {
+            scroll.scrollTo(aiTop)
+            jumpToAi = false
+        }
+    }
     Column(modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(start = 20.dp, end = 20.dp, bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Column(Modifier.fillMaxWidth()) {
                 Text("外观", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge)
                 Spacer(Modifier.height(8.dp))
                 ThemeSelector(config.colorTheme) { theme -> vm.updateConfig { it.copy(colorTheme = theme) } }
             }
             PlaceNameSettingsCard()
+            Box(Modifier.fillMaxWidth().onGloballyPositioned { aiTop = it.positionInParent().y.roundToInt() }) {
+                AiSettingsEntry(vm.aiPhoto, initialProfileId)
+            }
             Column(Modifier.fillMaxWidth()) {
                 Text("相机照片预览", color = BridgeWhite.copy(alpha = .55f), style = MaterialTheme.typography.labelLarge)
                 Spacer(Modifier.height(8.dp))

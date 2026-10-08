@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compose Photo Memory Archive"
+  short_description: "Create faithful watercolor photo-memory archive diptychs."
+  default_prompt: "Use $compose-photo-memory-archive to turn this photograph into a faithful editorial watercolor memory-archive diptych."

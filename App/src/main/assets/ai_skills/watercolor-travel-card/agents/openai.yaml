@@ -1,0 +1,4 @@
+interface:
+  display_name: "Watercolor Travel Card"
+  short_description: "Turn reference photos into watercolor travel cards"
+  default_prompt: "Use $watercolor-travel-card to turn each uploaded photo into a separate 3:4 perforated watercolor travel card."

@@ -205,17 +205,21 @@ class AppStore(context: Context) {
     }.getOrDefault(emptyList())
 
     @Synchronized fun addDownload(record: DownloadRecord) {
+        synchronized(AppStore::class.java) {
         val rows = downloads().filterNot { it.uri == record.uri }.toMutableList().apply { add(0, record) }
         val array = JSONArray()
         rows.forEach { array.put(JSONObject().put("name", it.name).put("size", it.size).put("uri", it.uri).put("time", it.completedAt)) }
         prefs.edit().putString("downloads", array.toString()).apply()
+        }
     }
 
     @Synchronized fun removeDownloads(uris: Set<String>) {
+        synchronized(AppStore::class.java) {
         val rows = downloads().filter { it.uri !in uris }
         val array = JSONArray()
         rows.forEach { array.put(JSONObject().put("name", it.name).put("size", it.size).put("uri", it.uri).put("time", it.completedAt)) }
         prefs.edit().putString("downloads", array.toString()).apply()
+        }
     }
 
     fun setDownloadWorkerActive(active: Boolean) {

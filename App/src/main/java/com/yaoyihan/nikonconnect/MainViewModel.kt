@@ -72,6 +72,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val luts = MutableStateFlow(store.luts())
     val recentLutIds = MutableStateFlow(store.recentLuts())
     val watermarks = MutableStateFlow(store.watermarks())
+    internal val aiPhoto = AiPhotoController.shared(application)
     val diagnosticState = diagnostics.state
     val usbState = MutableStateFlow(UsbConnectionState())
     val notice = MutableStateFlow<String?>(null)
@@ -162,6 +163,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
+        viewModelScope.launch {
+            aiPhoto.events.collect { message -> downloads.value = store.downloads(); showSnackbar(message) }
+        }
         refreshThumbnailCacheSize()
         registerUsbReceiver()
         logDiagnostic("APP_STARTED", "APP_READY", message = "Link started")
@@ -1925,13 +1929,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             pageRetry = { deleteDownloads(uris - removed); Unit }
             showPageError(message)
         } else showPageSuccess(message)
-        showSnackbar(message)
     }
 
     private fun saveToMediaStore(
         asset: PhotoAsset,
         exportToGallery: Boolean,
-        afterWrite: ((Uri) -> Unit)? = null,
+        afterWrite: ((Uri, Long) -> Unit)? = null,
         write: (java.io.OutputStream) -> Long,
     ): DownloadRecord {
         val resolver = getApplication<Application>().contentResolver
@@ -1959,13 +1962,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val uri = requireNotNull(resolver.insert(collection, values)) { "无法创建保存文件" }
         var size = 0L
+        var savedAtMillis = 0L
         try {
             resolver.openOutputStream(uri)?.use { size = write(it) } ?: error("无法写入系统相册")
-            afterWrite?.invoke(uri)
+            savedAtMillis = System.currentTimeMillis()
+            afterWrite?.invoke(uri, savedAtMillis)
             if (size <= 0L) size = resolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
-            if (scopedStorage) { values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING, 0); resolver.update(uri, values, null, null) }
+            values.clear()
+            if (exportToGallery && isImage) values.put(MediaStore.Images.ImageColumns.DATE_TAKEN, savedAtMillis)
+            if (scopedStorage) values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+            if (values.size() > 0) resolver.update(uri, values, null, null)
         } catch (e: Exception) { resolver.delete(uri, null, null); throw e }
-        return DownloadRecord(displayName, size, uri.toString(), Date().time)
+        return DownloadRecord(displayName, size, uri.toString(), savedAtMillis)
     }
 
     private fun uniqueDisplayName(resolver: android.content.ContentResolver, collection: Uri, folder: String?, requested: String): String {
@@ -1996,7 +2004,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun saveEditedBitmap(asset: PhotoAsset, bitmap: Bitmap, metadata: PhotoMetadata, suffix: String, quality: Int): DownloadRecord {
         val output = asset.copy(name = editedFileName(asset.name, suffix, "jpg"))
-        return saveToMediaStore(output, config.value.autoExport, afterWrite = { uri -> preserveExif(uri, metadata) }) { stream ->
+        return saveToMediaStore(output, config.value.autoExport, afterWrite = { uri, savedAt -> preserveExif(uri, metadata, savedAt) }) { stream ->
             require(bitmap.compress(Bitmap.CompressFormat.JPEG, quality.coerceIn(80, 100), stream)) { "无法编码 JPG" }
             0L
         }
@@ -2025,7 +2033,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return "$name.$extension"
     }
 
-    private fun preserveExif(uri: Uri, metadata: PhotoMetadata) {
+    private fun preserveExif(uri: Uri, metadata: PhotoMetadata, exportedAtMillis: Long) {
         runCatching {
             getApplication<Application>().contentResolver.openFileDescriptor(uri, "rw")?.use { descriptor ->
                 val exif = android.media.ExifInterface(descriptor.fileDescriptor)
@@ -2037,9 +2045,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     android.media.ExifInterface.TAG_ORIENTATION,
                     android.media.ExifInterface.ORIENTATION_NORMAL.toString(),
                 )
-                metadata.capturedAt?.let { date ->
-                    exif.setAttribute("DateTimeOriginal", java.text.SimpleDateFormat("yyyy:MM:dd HH:mm:ss", java.util.Locale.US).format(date))
-                }
+                // Edited output is a new photo. Match embedded dates to MediaStore so
+                // gallery rescans do not put the export beside the original capture.
+                val exportDate = java.text.SimpleDateFormat("yyyy:MM:dd HH:mm:ss", java.util.Locale.US)
+                    .format(Date(exportedAtMillis))
+                val subsecond = (exportedAtMillis % 1000).toString().padStart(3, '0')
+                val zone = java.text.SimpleDateFormat("XXX", java.util.Locale.US).format(Date(exportedAtMillis))
+                    .let { if (it == "Z") "+00:00" else it }
+                listOf("DateTime", "DateTimeOriginal", "DateTimeDigitized").forEach { exif.setAttribute(it, exportDate) }
+                listOf("SubSecTime", "SubSecTimeOriginal", "SubSecTimeDigitized").forEach { exif.setAttribute(it, subsecond) }
+                listOf("OffsetTime", "OffsetTimeOriginal", "OffsetTimeDigitized").forEach { exif.setAttribute(it, zone) }
                 metadata.copyrightText?.let { exif.setAttribute("Copyright", it) }
                 exif.saveAttributes()
             }
