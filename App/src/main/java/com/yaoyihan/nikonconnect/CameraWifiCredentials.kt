@@ -24,6 +24,13 @@ object CameraWifiCredentials {
     fun isOpen(context: Context, ssid: String): Boolean =
         records(context).firstOrNull { it.optString("ssid") == ssid }?.optBoolean("open", false) == true
 
+    fun brand(context: Context, ssid: String): CameraBrand? = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getString("brand:$ssid", null)?.let { stored -> CameraBrand.entries.firstOrNull { it.name == stored && it.available } }
+
+    fun rememberBrand(context: Context, ssid: String, brand: CameraBrand) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("brand:$ssid", brand.name).apply()
+    }
+
     fun save(context: Context, ssid: String, password: String, open: Boolean = password.isEmpty()) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key()) }
         val encrypted = cipher.doFinal(password.toByteArray(Charsets.UTF_8))
@@ -54,6 +61,7 @@ object CameraWifiCredentials {
             records(context).filterNot { it.optString("ssid") == ssid }.forEach(::put)
         }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .remove("brand:$ssid")
             .putString("entries", updated.toString())
             .remove("ssid")
             .remove("password")

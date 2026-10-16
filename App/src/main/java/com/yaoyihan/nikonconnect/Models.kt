@@ -11,8 +11,8 @@ import java.util.Locale
 enum class CameraBrand(val title: String, val subtitle: String, val available: Boolean) {
     NIKON("尼康", "PTP/IP", true),
     CANON("佳能", "即将支持", false),
-    SONY("索尼", "即将支持", false),
-    PANASONIC("松下", "即将支持", false),
+    SONY("索尼", "Remote API · 试用", true),
+    PANASONIC("松下 LUMIX", "Wi-Fi 相册 · 试用", true),
     FUJIFILM("富士", "即将支持", false),
     OTHER("其他品牌", "即将支持", false),
 }
@@ -74,7 +74,7 @@ data class DownloadRecord(val name: String, val size: Long, val uri: String, val
 enum class MediaKind { IMAGE, RAW_IMAGE, VIDEO, UNKNOWN }
 
 private val VideoExtensions = setOf("mp4", "mov", "m4v", "3gp")
-private val RawImageExtensions = setOf("nef", "nrw", "cr2", "arw", "dng", "raf")
+private val RawImageExtensions = setOf("nef", "nrw", "cr2", "arw", "dng", "raf", "rw2", "raw")
 private val ImageExtensions = setOf("jpg", "jpeg", "png", "webp", "heic", "heif")
 
 fun mediaKindFor(mime: String?, name: String): MediaKind {

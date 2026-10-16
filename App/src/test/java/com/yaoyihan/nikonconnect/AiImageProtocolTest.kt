@@ -74,7 +74,7 @@ class AiImageProtocolTest {
         assertTrue(aiPhotoPrompt("watercolor", "MY TRIP", 800, 1200).contains("MY TRIP"))
         assertThrows(IllegalArgumentException::class.java) { aiPhotoPrompt("", "", 1, 1) }
         assertThrows(IllegalArgumentException::class.java) { aiPhotoPrompt("paint", "x".repeat(81), 1, 1) }
-        assertEquals(9, AiPhotoStyle.entries.size)
+        assertEquals(8, AiPhotoStyle.entries.size)
     }
 
     @Test fun decodingStartsAtOneAndBoundsLargeImageMemory() {

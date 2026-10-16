@@ -5,6 +5,7 @@ package com.yaoyihan.nikonconnect
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
@@ -147,6 +148,9 @@ private fun AiProviderEditor(controller: AiPhotoController, initial: AiProviderP
     var deletingModel by remember { mutableStateOf<String?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     val existing = catalog.profiles.any { it.id == initial.id }
+    var fieldErrors by remember { mutableStateOf(emptyMap<String, String>()) }
+    var invalidAttempt by remember { mutableIntStateOf(0) }
+    val saveInteraction = remember { MutableInteractionSource() }
     val requestDismiss = { if (!saving) { if (draft != baseline) discard = true else dismiss() } }
 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -164,8 +168,10 @@ private fun AiProviderEditor(controller: AiPhotoController, initial: AiProviderP
         }
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             run {
-                OutlinedTextField(draft.name, { if (it.length <= 60) draft = draft.copy(name = it) }, Modifier.fillMaxWidth(), enabled = !saving,
-                    label = { Text("供应商名称") }, singleLine = true, colors = bridgeFieldColors())
+                OutlinedTextField(draft.name, { if (it.length <= 60) draft = draft.copy(name = it); fieldErrors = fieldErrors - "name" },
+                    Modifier.fillMaxWidth().bridgeShake(if ("name" in fieldErrors) invalidAttempt else 0), enabled = !saving,
+                    label = { Text("供应商名称") }, singleLine = true, colors = bridgeFieldColors(), isError = "name" in fieldErrors,
+                    supportingText = fieldErrors["name"]?.let { { Text(it) } })
             }
             run {
                 Box {
@@ -185,12 +191,16 @@ private fun AiProviderEditor(controller: AiPhotoController, initial: AiProviderP
                 }
             }
             run {
-                OutlinedTextField(draft.endpoint, { draft = draft.copy(endpoint = it.trim()) }, Modifier.fillMaxWidth(), enabled = !saving,
-                    label = { Text("完整 HTTPS 接口地址") }, minLines = 2, maxLines = 4, colors = bridgeFieldColors())
+                OutlinedTextField(draft.endpoint, { draft = draft.copy(endpoint = it.trim()); fieldErrors = fieldErrors - "endpoint" },
+                    Modifier.fillMaxWidth().bridgeShake(if ("endpoint" in fieldErrors) invalidAttempt else 0), enabled = !saving,
+                    label = { Text("完整 HTTPS 接口地址") }, minLines = 2, maxLines = 4, colors = bridgeFieldColors(),
+                    isError = "endpoint" in fieldErrors, supportingText = fieldErrors["endpoint"]?.let { { Text(it) } })
             }
             run {
-                OutlinedTextField(draft.key, { draft = draft.copy(key = it.trim()) }, Modifier.fillMaxWidth(), enabled = !saving,
+                OutlinedTextField(draft.key, { draft = draft.copy(key = it.trim()); fieldErrors = fieldErrors - "key" },
+                    Modifier.fillMaxWidth().bridgeShake(if ("key" in fieldErrors) invalidAttempt else 0), enabled = !saving,
                     label = { Text("API Key") }, singleLine = true, colors = bridgeFieldColors(),
+                    isError = "key" in fieldErrors, supportingText = fieldErrors["key"]?.let { { Text(it) } },
                     visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
                     trailingIcon = { IconButton({ showKey = !showKey }) {
                         Icon(if (showKey) Icons.Default.VisibilityOff else Icons.Default.Visibility, if (showKey) "隐藏密钥" else "显示密钥")
@@ -256,6 +266,8 @@ private fun AiProviderEditor(controller: AiPhotoController, initial: AiProviderP
                 Icon(Icons.Default.DeleteOutline, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("清除 Key")
             }
             Button({
+                fieldErrors = aiProviderFieldErrors(draft)
+                if (fieldErrors.isNotEmpty()) { invalidAttempt++; return@Button }
                 saving = true
                 scope.launch {
                     try { controller.saveProfile(draft); complete("已保存配置，未发起付费请求") }
@@ -264,7 +276,8 @@ private fun AiProviderEditor(controller: AiPhotoController, initial: AiProviderP
                     catch (error: Exception) { message = "配置加密保存失败，请重试" }
                     finally { saving = false }
                 }
-            }, Modifier.weight(1f), enabled = !saving, contentPadding = PaddingValues(8.dp),
+            }, Modifier.weight(1f).bridgePress(saveInteraction), interactionSource = saveInteraction,
+                enabled = !saving, contentPadding = PaddingValues(8.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) {
                 Icon(Icons.Default.Save, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(if (saving) "保存中" else "保存配置")
             }
@@ -298,12 +311,13 @@ private fun AiProviderEditor(controller: AiPhotoController, initial: AiProviderP
 private fun AiModelEditor(original: String, models: List<AiProviderModel>, dismiss: () -> Unit, save: (String) -> Unit) {
     var value by remember { mutableStateOf(original) }
     var error by remember { mutableStateOf<String?>(null) }
+    var invalidAttempt by remember { mutableIntStateOf(0) }
     AlertDialog(onDismissRequest = dismiss, title = { Text(if (original.isBlank()) "添加模型" else "编辑模型") },
         text = {
             Column {
-                OutlinedTextField(value, { value = it; error = null }, Modifier.fillMaxWidth(), label = { Text("模型 ID") },
-                    minLines = 1, maxLines = 3, colors = bridgeFieldColors(), isError = error != null)
-                error?.let { Text(it, Modifier.padding(top = 8.dp), color = BridgeEmber, style = MaterialTheme.typography.bodySmall) }
+                OutlinedTextField(value, { value = it; error = null }, Modifier.fillMaxWidth().bridgeShake(if (error != null) invalidAttempt else 0), label = { Text("模型 ID") },
+                    minLines = 1, maxLines = 3, colors = bridgeFieldColors(), isError = error != null,
+                    supportingText = error?.let { { Text(it) } })
             }
         }, confirmButton = { TextButton({
             val clean = value.trim()
@@ -311,7 +325,7 @@ private fun AiModelEditor(original: String, models: List<AiProviderModel>, dismi
                 aiValidateModelId(clean)
                 require(models.none { it.id == clean && it.id != original }) { "此模型已存在" }
                 save(clean)
-            } catch (invalid: IllegalArgumentException) { error = invalid.message }
+            } catch (invalid: IllegalArgumentException) { error = invalid.message; invalidAttempt++ }
         }) { Text("保存", color = BridgeEmber) } }, dismissButton = { TextButton(dismiss) { Text("取消", color = BridgeWhite) } },
         containerColor = BridgeSurface, titleContentColor = BridgeWhite, textContentColor = BridgeWhite)
 }

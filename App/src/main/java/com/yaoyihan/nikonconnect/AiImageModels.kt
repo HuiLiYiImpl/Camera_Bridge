@@ -56,6 +56,16 @@ internal fun aiValidateModelId(id: String) {
     require(id.isNotBlank() && id.length <= 200 && id.none { it.isWhitespace() || it.isISOControl() }) { "请填写有效的模型 ID" }
 }
 
+internal fun aiProviderFieldErrors(profile: AiProviderProfile): Map<String, String> = buildMap {
+    val clean = profile.normalized()
+    if (clean.name.isBlank() || clean.name.length > 60 || clean.name.any { it.isISOControl() })
+        put("name", "供应商名称须为 1–60 个字符")
+    if (!aiHttpsUrl(clean.endpoint, allowQuery = false))
+        put("endpoint", "请填写完整 HTTPS 接口，不能包含账号、查询参数或占位符")
+    if (clean.key.length > 8192 || clean.key.any { it.isWhitespace() || it.isISOControl() })
+        put("key", "API Key 不能包含空格或换行")
+}
+
 internal data class AiProviderCatalog(
     val profiles: List<AiProviderProfile>,
     val activeProfileId: String = "",

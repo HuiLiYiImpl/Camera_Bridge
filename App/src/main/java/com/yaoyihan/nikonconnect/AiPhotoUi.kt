@@ -9,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.*
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -60,6 +61,7 @@ internal fun AiStyleDialog(
     var submitting by remember { mutableStateOf(false) }
     val prefs = remember { context.getSharedPreferences("link_ai_image_ui", android.content.Context.MODE_PRIVATE) }
     val active = tasks.count { it.active }
+    val generateInteraction = remember { MutableInteractionSource() }
     fun submit() {
         submitting = true
         val failure = controller.generate(photoKey, name, source, rotation, style, title, postcardBack)
@@ -130,7 +132,8 @@ internal fun AiStyleDialog(
                 }
                 if (needed.isEmpty()) submit() else permissions.launch(needed.toTypedArray())
             }
-        }, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+        }, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp).bridgePress(generateInteraction),
+            interactionSource = generateInteraction,
             enabled = !busy && !submitting && aiSubmissionError(tasks, photoKey) == null,
             colors = ButtonDefaults.buttonColors(containerColor = BridgeEmber, contentColor = BridgeNight)) {
             Icon(Icons.Default.AutoAwesome, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))

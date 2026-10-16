@@ -59,6 +59,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val lutCache = LutCache(8)
     private val diagnostics = DiagnosticLogger(application)
     private var client: CameraClient? = null
+    private val wifiAttempt = java.util.concurrent.atomic.AtomicLong()
+    internal val discoveredLumix = MutableStateFlow<List<LumixDevice>>(emptyList())
+    internal val discoveredSony = MutableStateFlow<List<SonyDevice>>(emptyList())
     private var usbDevice: UsbDevice? = null
     private var cameraNetworkBound = false
     private var requestedCameraNetwork: Network? = null
@@ -68,6 +71,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val workflow = MutableStateFlow(Workflow.WAITING)
     val session = MutableStateFlow<CameraSession?>(null)
     val photos = MutableStateFlow<List<PhotoAsset>>(emptyList())
+    internal val galleryRefreshPending = MutableStateFlow(false)
     val downloads = MutableStateFlow(store.downloads())
     val luts = MutableStateFlow(store.luts())
     val recentLutIds = MutableStateFlow(store.recentLuts())
@@ -101,6 +105,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val hasMorePhotos = MutableStateFlow(false)
     val hasLoadedPhotos = MutableStateFlow(false)
     val thumbnails = mutableStateMapOf<UInt, Bitmap?>()
+    val thumbnailFailures = mutableStateMapOf<UInt, Boolean>()
     private val cameraThumbnailCache = BitmapMemoryCache<UInt> { thumbnails.remove(it) }
     private val localThumbnailCache = BitmapMemoryCache<String>()
     private val thumbnailLoads = mutableSetOf<String>()
@@ -109,6 +114,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val clearingThumbnailCache = MutableStateFlow(false)
     val thumbnailVersion = MutableStateFlow(0)
     val isLoadingMorePhotos = MutableStateFlow(false)
+    val isRefreshingPhotos = MutableStateFlow(false)
     private var loadMoreJob: Job? = null
     private var metadataJob: Job? = null
     private val editMutex = Mutex()
@@ -481,6 +487,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun resetCameraThumbnails() {
         cameraThumbnailCache.clear()
         thumbnails.clear()
+        thumbnailFailures.clear()
         thumbnailVersion.update { it + 1 }
     }
 
@@ -535,9 +542,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun connect(manual: Boolean = false) = viewModelScope.launch {
+    fun connect(manual: Boolean = false) = connectCamera(manual, null)
+
+    internal fun selectLumix(device: LumixDevice) {
+        if (device !in discoveredLumix.value) return
+        discoveredLumix.value = emptyList()
+        connectCamera(false, device)
+    }
+
+    internal fun dismissLumixSelection() {
+        discoveredLumix.value = emptyList()
+        bindCameraNetwork(null)
+    }
+
+    internal fun selectSony(device: SonyDevice) {
+        if (device !in discoveredSony.value) return
+        discoveredSony.value = emptyList()
+        connectCamera(false, null, device)
+    }
+
+    internal fun dismissSonySelection() {
+        discoveredSony.value = emptyList()
+        bindCameraNetwork(null)
+    }
+
+    private fun connectCamera(manual: Boolean, selectedLumix: LumixDevice?, selectedSony: SonyDevice? = null) = viewModelScope.launch {
+        if (isBusy.value || session.value != null) return@launch
         if (remoteCapture.value.inProgress) { showSnackbar("请等待拍摄完成，或先取消倒计时"); return@launch }
         val target = config.value
+        if (!target.brand.available) { showError("此品牌暂未支持 Wi‑Fi 接入"); return@launch }
         val network = cameraNetwork()
         if (network == null) {
             logDiagnostic("WIFI_NETWORK_LOST", "NETWORK_LOOKUP", ConnectionTransport.WIFI, level = "ERROR", result = "NOT_FOUND", message = "No Wi-Fi network available")
@@ -547,32 +580,99 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         logDiagnostic("WIFI_NETWORK_FOUND", "NETWORK_LOOKUP", ConnectionTransport.WIFI, message = "Wi-Fi network found")
         val host = cameraGateway(network).ifBlank { target.host.trim() }
         if (target.host.isBlank() || target.port !in 1..65535) { showError("请填写有效的相机地址和端口"); return@launch }
-        isBusy.value = true; workflow.value = Workflow.CONNECTING; notice.value = "正在连接 ${target.host}:${target.port}"
+        val attempt = wifiAttempt.incrementAndGet()
+        val cancelled = { wifiAttempt.get() != attempt }
+        isBusy.value = true; workflow.value = Workflow.CONNECTING
+        notice.value = when (target.brand) {
+            CameraBrand.PANASONIC -> "正在搜索松下 LUMIX，请保持相机无线连接界面开启"
+            CameraBrand.SONY -> "正在搜索索尼 Remote API，请保持智能遥控连接界面开启"
+            else -> "正在连接 $host:${target.port}"
+        }
         logDiagnostic("CAMERA_DISCOVERY_STARTED", "CAMERA_DISCOVERY", ConnectionTransport.WIFI, message = "Starting camera discovery")
         bindCameraNetwork(network)
         runCatching {
             withContext(Dispatchers.IO) {
-                client?.close(); PtpIpClient(host, target.port, network.socketFactory).also { it.connect(); client = it }
+                client?.close(); client = null
+                val opening: CameraClient = if (target.brand == CameraBrand.PANASONIC) {
+                    val device = selectedLumix ?: run {
+                        val multicast = getApplication<Application>().getSystemService(WifiManager::class.java).createMulticastLock("Link-LUMIX-search")
+                        val devices = try {
+                            multicast.acquire()
+                            LumixDiscovery.search(network, host, cancelled)
+                        } finally { if (multicast.isHeld) multicast.release() }
+                        if (devices.isEmpty()) error("未找到松下 LUMIX，请连接相机热点或同一局域网，并在相机上开启智能手机连接")
+                        if (devices.size > 1) {
+                            withContext(Dispatchers.Main) { discoveredLumix.value = devices }
+                            return@withContext null
+                        }
+                        devices.single()
+                    }
+                    val prefs = getApplication<Application>().getSharedPreferences("lumix_connection", Context.MODE_PRIVATE)
+                    val identity = prefs.getString("client_id", null) ?: ("4D454930-0100-1000-8001-" + java.util.UUID.randomUUID().toString().replace("-", "").takeLast(12).uppercase()).also {
+                        prefs.edit().putString("client_id", it).apply()
+                    }
+                    notice.value = "正在连接 ${device.name}，如相机提示访问请求，请在相机上确认"
+                    LumixCameraClient(device, identity, "Camera Bridge", { url -> network.openConnection(url) as java.net.HttpURLConnection }, cancelled,
+                        onProtocolEvent = { message -> logDiagnostic("LUMIX_AUTH_PROGRESS", "CAMERA_AUTHORIZATION", ConnectionTransport.WIFI, message = message) })
+                } else if (target.brand == CameraBrand.SONY) {
+                    val device = selectedSony ?: run {
+                        val multicast = getApplication<Application>().getSystemService(WifiManager::class.java).createMulticastLock("Link-Sony-search")
+                        val devices = try {
+                            multicast.acquire()
+                            SonyDiscovery.search(network, host, cancelled)
+                        } finally { if (multicast.isHeld) multicast.release() }
+                        if (cancelled()) throw CancellationException("连接已取消")
+                        if (devices.isEmpty()) error("未找到索尼 Camera Remote API。请在相机开启智能遥控并连接其 Wi-Fi；并非所有索尼机型都提供此协议")
+                        if (devices.size > 1) {
+                            withContext(Dispatchers.Main) { if (!cancelled()) discoveredSony.value = devices }
+                            return@withContext null
+                        }
+                        devices.single()
+                    }
+                    SonyCameraClient(device, { url -> network.openConnection(url) as java.net.HttpURLConnection }, cancelled)
+                } else PtpIpClient(host, target.port, network.socketFactory,
+                    onProtocolEvent = { message -> logDiagnostic("NIKON_CAPTURE_PROGRESS", "REMOTE_CAPTURE", ConnectionTransport.WIFI, message = message) })
+                try {
+                    opening.connect()
+                    if (cancelled()) { opening.close(); throw CancellationException("连接已取消") }
+                    client = opening
+                    opening
+                } catch (error: Exception) { opening.close(); throw error }
             }
-        }.onSuccess { ptp ->
-            remoteSupported.value = ptp.supportsRemoteCapture
-            remoteCapture.value = RemoteCaptureState(message = if (ptp.supportsRemoteCapture) "相机已连接，可以遥控拍摄" else "当前相机连接未提供遥控拍摄能力")
-            logDiagnostic("CAMERA_DISCOVERED", "CAMERA_DISCOVERY", ConnectionTransport.WIFI, message = "Camera discovered: ${ptp.cameraName}")
+        }.onSuccess { connected ->
+            if (cancelled()) { connected?.close(); return@onSuccess }
+            if (connected == null) {
+                workflow.value = Workflow.WAITING; notice.value = "发现多台 ${target.brand.title}，请选择要连接的相机"
+                bindCameraNetwork(null)
+                return@onSuccess
+            }
+            val remote = connected as? RemoteCameraControl
+            remoteSupported.value = remote?.supportsRemoteCapture == true
+            remoteCapture.value = RemoteCaptureState(message = if (remoteSupported.value) "相机已连接，可以遥控拍摄" else "当前相机连接未提供遥控拍摄能力")
+            logDiagnostic("CAMERA_DISCOVERED", "CAMERA_DISCOVERY", ConnectionTransport.WIFI, message = "Camera discovered: ${connected.cameraName}")
             logDiagnostic("CAMERA_SESSION_STARTED", "CAMERA_SESSION", ConnectionTransport.WIFI, message = "Wi-Fi camera session started")
-            session.value = CameraSession(ptp.cameraName, host, target.port, ConnectionTransport.WIFI, ptp.cameraDetails)
+            val lumix = connected as? LumixCameraClient
+            val sony = connected as? SonyCameraClient
+            session.value = CameraSession(connected.cameraName, lumix?.device?.host ?: sony?.device?.host ?: host,
+                (lumix?.device?.controlUrl ?: sony?.device?.endpoint)?.let { java.net.URI(it).port.takeIf { port -> port > 0 } ?: 80 } ?: target.port,
+                ConnectionTransport.WIFI, connected.cameraDetails)
             keepConnectionAlive(true)
-            updateConfig { it.copy(lastCameraName = ptp.cameraName, lastTransport = ConnectionTransport.WIFI) }
-            workflow.value = Workflow.CONNECTED; notice.value = "已连接 ${ptp.cameraName} · Wi‑Fi"
-            currentSsid()?.let { ssid -> if (ssid.isNotBlank()) updateConfig { c -> c.copy(lastSsid = ssid) } }
+            updateConfig { it.copy(lastCameraName = connected.cameraName, lastTransport = ConnectionTransport.WIFI) }
+            workflow.value = Workflow.CONNECTED; notice.value = "已连接 ${connected.cameraName} · Wi‑Fi"
+            currentSsid()?.let { ssid -> if (ssid.isNotBlank()) {
+                updateConfig { c -> c.copy(lastSsid = ssid) }
+                CameraWifiCredentials.rememberBrand(getApplication(), ssid, target.brand)
+            } }
             logDiagnostic("CAMERA_SESSION_READY", "CAMERA_SESSION", ConnectionTransport.WIFI, message = "Camera session ready")
             loadPhotos()
         }.onFailure {
+            if (it is CancellationException) { isBusy.value = false; throw it }
             bindCameraNetwork(null)
             if (requestedCameraNetwork != null) releaseRequestedWifi()
             workflow.value = Workflow.WAITING
             val timeout = it is SocketTimeoutException || it.message.orEmpty().contains("timeout", ignoreCase = true) || it.message.orEmpty().contains("timed out", ignoreCase = true)
             logDiagnostic(if (timeout) "CAMERA_PROTOCOL_TIMEOUT" else "CAMERA_SESSION_LOST", "CAMERA_SESSION", ConnectionTransport.WIFI, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to establish camera session", error = it)
-            if (manual) openWifiSettings() else showError(it.message ?: "无法连接相机，请确认已连接相机 Wi‑Fi", event = if (timeout) "CAMERA_PROTOCOL_TIMEOUT" else "CAMERA_SESSION_LOST", transport = ConnectionTransport.WIFI)
+            if (manual && target.brand == CameraBrand.NIKON) openWifiSettings() else showError(it.message ?: "无法连接相机，请确认已连接相机 Wi‑Fi", event = if (timeout) "CAMERA_PROTOCOL_TIMEOUT" else "CAMERA_SESSION_LOST", transport = ConnectionTransport.WIFI)
         }
         isBusy.value = false
     }
@@ -658,6 +758,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnect() = viewModelScope.launch(Dispatchers.IO) {
+        wifiAttempt.incrementAndGet()
+        discoveredLumix.value = emptyList()
+        discoveredSony.value = emptyList()
         clearRemoteFocus()
         remoteParameterJob?.cancel()
         remoteParameterEditor.value = RemoteParameterEditor()
@@ -733,7 +836,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 remoteCapture.value = RemoteCaptureState(if (result.confirmed) RemoteCapturePhase.CONFIRMED else RemoteCapturePhase.UNKNOWN, message = result.message)
                 logDiagnostic(if (result.confirmed) "REMOTE_CAPTURE_CONFIRMED" else "REMOTE_CAPTURE_UNCONFIRMED", "REMOTE_CAPTURE", ConnectionTransport.WIFI,
                     level = if (result.confirmed) "INFO" else "WARN", result = if (result.confirmed) "SUCCESS" else "UNKNOWN", message = result.message)
-                if (result.confirmed) loadPhotos()
+                if (result.confirmed) galleryRefreshPending.value = true
             } catch (cancelled: CancellationException) {
                 remoteCapture.value = RemoteCaptureState(message = "已取消待发送的拍摄")
                 throw cancelled
@@ -1025,9 +1128,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         metadataJob?.cancel()
         loadMoreJob?.cancel()
         val generation = ++photoGeneration
-        resetCameraThumbnails()
         photoLoadJob = viewModelScope.launch {
             val active = client ?: run { showError("请先连接相机"); return@launch }
+            isRefreshingPhotos.value = true
             val batchSize = config.value.initialPhotoBatchSize
             isBusy.value = true; workflow.value = Workflow.LOADING; hasLoadedPhotos.value = false; notice.value = "正在读取相册（首批 ${batchSize} 张）"
             val startedAt = System.currentTimeMillis()
@@ -1042,9 +1145,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
                 .onSuccess { (result, hasMore) ->
                     if (client !== active || generation != photoGeneration) return@onSuccess
+                    resetCameraThumbnails()
                     photos.value = result
                     hasMorePhotos.value = hasMore
                     hasLoadedPhotos.value = true
+                    galleryRefreshPending.value = false
                     workflow.value = Workflow.CONNECTED; notice.value = "${session.value?.name ?: "相机"} · ${session.value?.transport?.title ?: "Wi‑Fi"} · 已读取 ${result.size} 张"
                     if (session.value?.transport == ConnectionTransport.USB) logDiagnostic("MTP_STORAGE_DISCOVERED", "MTP_STORAGE", ConnectionTransport.USB, message = "MTP storage discovered", device = usbDevice)
                     logDiagnostic("ASSET_LIST_SUCCEEDED", "ASSET_LIST", session.value?.transport, message = "Read ${result.size} assets", durationMs = System.currentTimeMillis() - startedAt)
@@ -1054,7 +1159,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     logDiagnostic("ASSET_LIST_FAILED", "ASSET_LIST", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "Unable to read asset list", durationMs = System.currentTimeMillis() - startedAt, error = it)
                     showError(it.message ?: "读取相册失败", event = "ASSET_LIST_FAILED", transport = session.value?.transport)
                 }
-            } finally { isBusy.value = false }
+            } finally { isBusy.value = false; isRefreshingPhotos.value = false }
         }
     }
 
@@ -1135,6 +1240,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val cacheGeneration = thumbnailDiskCache.generation
         val loadKey = "$generation:$cacheGeneration:${asset.handle}"
         if (!thumbnailLoads.add(loadKey)) return
+        thumbnailFailures.remove(asset.handle)
         val camera = client
         viewModelScope.launch {
             val result = runCatching {
@@ -1144,6 +1250,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     thumbnailDiskCache.read(diskKey)?.let { cached ->
                         BitmapFactory.decodeByteArray(cached, 0, cached.size)?.let { return@withContext it }
                     }
+                    _downloadTasks.first { tasks -> tasks.none { it.status == DownloadTaskStatus.DOWNLOADING || it.status == DownloadTaskStatus.CANCELLING } }
+                    if (client !== active || generation != photoGeneration) return@withContext null
                     val data = active.thumbnail(asset) ?: return@withContext null
                     val orientation = OrientedBitmaps.orientationOrNull(data)
                         ?: active.imageHeader(asset)?.let(OrientedBitmaps::orientationOrNull)
@@ -1158,6 +1266,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             }
+            if (client === camera && generation == photoGeneration && cacheGeneration == thumbnailDiskCache.generation)
+                thumbnailFailures[asset.handle] = result.getOrNull() == null
             result.onSuccess { bitmap ->
                 if (bitmap != null && client === camera && generation == photoGeneration &&
                     cacheGeneration == thumbnailDiskCache.generation) keepSharperThumbnail(asset.handle, bitmap)
@@ -2066,6 +2176,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         noticeClearJob?.cancel(); workflow.value = Workflow.ERROR; notice.value = message
     }
     override fun onCleared() {
+        wifiAttempt.incrementAndGet()
         remoteViewVisible = false
         remotePreviewJob?.cancel()
         remoteCancellation.set(true)

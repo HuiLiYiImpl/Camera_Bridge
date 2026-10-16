@@ -17,11 +17,15 @@ class PtpIpClient(
     private val host: String,
     private val port: Int,
     private val socketFactory: SocketFactory = SocketFactory.getDefault(),
+    private val onProtocolEvent: (String) -> Unit = {},
 ) : CameraClient, RemoteCameraControl {
     private lateinit var command: Channel
     private lateinit var event: Channel
     private var transaction = 1u
     private var objectHandles: List<UInt>? = null
+    private val assetCache = mutableListOf<PhotoAsset>()
+    private var scannedHandles = 0
+    private var storageEnumerationUnsupported = false
     private var supportedOperations = emptySet<Int>()
     private var supportedProperties = emptySet<Int>()
     private val unreadableProperties = mutableSetOf<Int>()
@@ -32,6 +36,7 @@ class PtpIpClient(
     private var cameraModeChanged = false
     private var applicationModeChanged = false
     private var captureEvents = java.util.concurrent.ConcurrentLinkedQueue<CaptureEvent>()
+    private val unsupportedEventOperations = mutableSetOf<Int>()
     override val supportsRemoteCapture: Boolean
         @Synchronized get() = NIKON_CAPTURE_TO_CARD in supportedOperations || INITIATE_CAPTURE in supportedOperations
     override val supportsLiveView: Boolean
@@ -50,7 +55,9 @@ class PtpIpClient(
         touchFocusConfirmed = false
         unreadableProperties.clear()
         vendorPropertiesLoaded = false
+        storageEnumerationUnsupported = false
         captureEvents = java.util.concurrent.ConcurrentLinkedQueue()
+        unsupportedEventOperations.clear()
         command = Channel(host, port, socketFactory).also { it.open() }
         // Nikon's Android client identifies its PTP/IP session with this stable value.
         command.send(packet(INIT_COMMAND_REQUEST, NIKON_ANDROID_GUID + utf16z("Android Device") + le32(PROTOCOL_VERSION)))
@@ -78,15 +85,47 @@ class PtpIpClient(
     }
 
     @Synchronized override fun assets(offset: Int, limit: Int): List<PhotoAsset> {
-        // Zf rejects GetStorageIDs over its SnapBridge PTP session; Nikon's client
-        // queries all objects directly with the PTP “all storages” sentinel instead.
-        val handles = objectHandles ?: Reader(requestData(GET_OBJECT_HANDLES, next(), UInt.MAX_VALUE, 0u, 0u)).u32Array().asReversed().also { objectHandles = it }
-        val page = handles.drop(offset).take(limit)
-        return page.mapNotNull { handle -> runCatching { parseObject(handle, requestData(GET_OBJECT_INFO, next(), handle)) }.getOrNull() }
+        require(offset >= 0 && limit in 1..250)
+        val handles = objectHandles ?: readAllObjectHandles().asReversed().also {
+            objectHandles = it; assetCache.clear(); scannedHandles = 0
+        }
+        while (assetCache.size < offset + limit && scannedHandles < handles.size) {
+            val handle = handles[scannedHandles]
+            val asset = try { parseObject(handle, requestData(GET_OBJECT_INFO, next(), handle)) }
+            catch (error: PtpResponseException) {
+                if (error.response != 0x2009) throw error // Only skip an explicitly invalid object handle.
+                null
+            }
+            scannedHandles++
+            if (asset != null && asset.format != 0x3001) assetCache.add(asset)
+        }
+        return assetCache.drop(offset).take(limit)
     }
 
-    @Synchronized override fun hasMoreAssets(offset: Int): Boolean = offset < (objectHandles?.size ?: Int.MAX_VALUE)
-    @Synchronized override fun refreshAssets() { objectHandles = null }
+    @Synchronized override fun hasMoreAssets(offset: Int): Boolean = assetCache.size > offset || objectHandles?.let { scannedHandles < it.size } != false
+    @Synchronized override fun refreshAssets() { objectHandles = null; assetCache.clear(); scannedHandles = 0 }
+
+    private fun readAllObjectHandles(): List<UInt> {
+        fun handles(storage: UInt) = Reader(requestData(GET_OBJECT_HANDLES, next(), storage, 0u, 0u)).u32Array()
+        // Enumerate each slot instead of relying solely on the all-storages sentinel.
+        // Zf/SnapBridge can reject GetStorageIDs; keep its verified all-storages fallback.
+        if (GET_STORAGE_IDS !in supportedOperations || storageEnumerationUnsupported) return handles(UInt.MAX_VALUE).distinct()
+        val storages = try { Reader(requestData(GET_STORAGE_IDS, next())).u32Array().distinct() }
+        catch (error: PtpResponseException) {
+            if (error.response in listOf(0x2003, 0x2019)) throw error
+            storageEnumerationUnsupported = true
+            return handles(UInt.MAX_VALUE).distinct()
+        }
+        if (storages.isEmpty()) return handles(UInt.MAX_VALUE).distinct()
+        return storages.flatMap { storage ->
+            try { handles(storage) }
+            catch (error: PtpResponseException) {
+                // Empty/removed slots must not hide the other card; transport errors still propagate.
+                if (error.response !in listOf(0x2008, 0x2013)) throw error
+                emptyList()
+            }
+        }.distinct()
+    }
 
     @Synchronized override fun checkConnection(): Boolean {
         requestData(GET_DEVICE_INFO, next())
@@ -122,17 +161,26 @@ class PtpIpClient(
 
     /**
      * 下载资源到 [output]，使用动态 chunk 拥塞控制。
-     * 小文件（≤ [FULL_OBJECT_THRESHOLD]）优先整文件下载，失败回退到分块；
+     * 小文件（≤ [FULL_OBJECT_THRESHOLD]）优先整文件下载，仅接口不支持且尚未写入时回退；
      * 大文件用 [AdaptiveChunkController] 自适应调整 chunk 大小（1MB~8MB）。
      */
     @Synchronized override fun downloadTo(asset: PhotoAsset, output: OutputStream, progress: (Long, Long) -> Unit, isCancelled: () -> Boolean): Long {
-        // 小文件：尝试一次性 GET_OBJECT 整文件下载，省去分块往返
-        if (asset.size in 1..FULL_OBJECT_THRESHOLD) {
-            try { return requestToStream(GET_OBJECT, next(), asset.handle, output, progress, asset.size, 0L, isCancelled) }
-            catch (cancelled: DownloadCancelledException) { throw cancelled }
-            catch (_: Exception) { }
-            // 整文件失败则回退到分块下载（offset 从 0 开始）
-            reconnect()
+        if (isCancelled()) throw DownloadCancelledException()
+        require(asset.size <= UInt.MAX_VALUE.toLong()) { "此文件超出当前尼康 PTP 下载的大小范围" }
+        if (asset.size <= FULL_OBJECT_THRESHOLD) {
+            var touchedOutput = false
+            val destination = object : OutputStream() {
+                override fun write(value: Int) { touchedOutput = true; output.write(value) }
+                override fun write(bytes: ByteArray, offset: Int, length: Int) { touchedOutput = true; output.write(bytes, offset, length) }
+            }
+            try {
+                val copied = requestToStream(GET_OBJECT, next(), asset.handle, destination, progress, asset.size, 0L, isCancelled)
+                check(copied > 0 && (asset.size <= 0 || copied == asset.size)) { "尼康文件传输不完整，请重新下载" }
+                return copied
+            } catch (error: PtpResponseException) {
+                // A stream cannot rewind arbitrary destinations. Never append a retry after any write.
+                if (touchedOutput || error.response != 0x2005 || asset.size <= 0) throw error
+            }
         }
         return downloadInChunks(asset, output, progress, isCancelled)
     }
@@ -143,19 +191,27 @@ class PtpIpClient(
         var offset = 0L
         var retries = 0
         while (offset < asset.size) {
+            if (isCancelled()) throw DownloadCancelledException()
             val count = controller.requestLength(asset.size - offset)
+            // ponytail: stage at most 8 MiB so failed retries cannot duplicate bytes in MediaStore.
+            val chunk = java.io.ByteArrayOutputStream(count)
             try {
-                requestToStream(GET_PARTIAL_OBJECT, next(), asset.handle, offset.toUInt(), count.toUInt(), output, progress, asset.size, offset, isCancelled)
-                offset += count
-                controller.registerSuccess()
-                retries = 0
+                val copied = requestToStream(GET_PARTIAL_OBJECT, next(), asset.handle, offset.toUInt(), count.toUInt(), chunk, progress, asset.size, offset, isCancelled)
+                check(copied in 1..count.toLong()) { "尼康相机返回的分块长度无效" }
             } catch (e: Exception) {
-                if (e is DownloadCancelledException) throw e
+                if (e is kotlin.coroutines.cancellation.CancellationException || isCancelled()) throw DownloadCancelledException()
+                if (e is PtpResponseException && e.response != 0x2019) throw e
                 if (++retries > MAX_CHUNK_RETRIES) throw e
                 controller.registerFailure()
                 if (isDeviceBusy(e)) { Thread.sleep(retries * DEVICE_BUSY_BACKOFF_MS) }
                 else { reconnect() }
+                continue
             }
+            if (isCancelled()) throw DownloadCancelledException()
+            // Commit outside the retry block: output/storage failures must never resend this chunk.
+            chunk.writeTo(output)
+            offset += chunk.size()
+            controller.registerSuccess(); retries = 0
         }
         return offset
     }
@@ -248,7 +304,34 @@ class PtpIpClient(
 
     private data class ParsedDeviceInfo(val details: CameraDetails, val supportedProperties: Set<Int>, val supportedOperations: Set<Int>)
 
-    private data class CaptureEvent(val code: Int, val transaction: UInt, val at: Long)
+    private data class CaptureEvent(val code: Int, val transaction: UInt, val at: Long, val handle: UInt? = null)
+
+    private fun eventPollOperation(): Int? = listOf(NIKON_GET_EVENT_EX, NIKON_GET_EVENT).firstOrNull {
+        it in supportedOperations && it !in unsupportedEventOperations
+    }
+
+    /** Formats verified in SnapBridge ptpclient s2/t2; polling consumes pending vendor events. */
+    private fun pollNikonEvents(): List<CaptureEvent> {
+        while (true) {
+            val operation = eventPollOperation() ?: return emptyList()
+            val bytes = try { requestData(operation, next()) }
+            catch (error: PtpResponseException) {
+                if (error.response !in listOf(0x2005, 0x200A, 0x201D)) throw error
+                unsupportedEventOperations.add(operation)
+                continue
+            }
+            val reader = Reader(bytes)
+            val count = if (operation == NIKON_GET_EVENT_EX) reader.u32().toLong() else reader.u16().toLong()
+            require(count <= bytes.size / 4) { "尼康事件数量无效" }
+            return List(count.toInt()) {
+                val code = reader.u16()
+                val parameters = if (operation == NIKON_GET_EVENT_EX) reader.u16() else 1
+                require(parameters <= 16) { "尼康事件参数数量无效" }
+                val values = List(parameters) { reader.u32() }
+                CaptureEvent(code, 0u, System.nanoTime(), values.firstOrNull())
+            }
+        }
+    }
 
     private fun prepareRemoteControl() {
         if (!cameraModeChanged && NIKON_CHANGE_CAMERA_MODE in supportedOperations) {
@@ -483,7 +566,7 @@ class PtpIpClient(
                     val code = reader.u16()
                     val id = reader.u32()
                     if (code == OBJECT_ADDED || code == CAPTURE_COMPLETE) {
-                        queue.add(CaptureEvent(code, id, System.nanoTime()))
+                        queue.add(CaptureEvent(code, id, System.nanoTime(), if (incoming.payload.size >= 10) reader.u32() else null))
                         while (queue.size > 64) queue.poll()
                     }
                 }
@@ -505,10 +588,15 @@ class PtpIpClient(
         stopLiveView()
         prepareRemoteControl()
         checkCancelled()
-        // Snapshot all card handles, not just the currently loaded gallery page.
+        val preparationStarted = System.nanoTime()
+        // Drain pre-existing events so old photographs cannot confirm the new shutter.
+        if (eventPollOperation() != null) pollNikonEvents()
+        val vendorEvents = eventPollOperation() != null
+        // Vendor events avoid enumerating both cards for every shot. Legacy fallback still snapshots all cards.
         val baseline = try {
-            Reader(requestData(GET_OBJECT_HANDLES, next(), UInt.MAX_VALUE, 0u, 0u)).u32Array().toSet()
+            if (vendorEvents) objectHandles?.toSet() else readAllObjectHandles().toSet()
         } catch (_: PtpResponseException) { null }
+        onProtocolEvent("Nikon capture preparation: eventPoll=${eventPollOperation()?.toString(16) ?: "none"}, durationMs=${(System.nanoTime() - preparationStarted) / 1_000_000}")
         checkCancelled()
         captureEvents.clear()
         val startedAt = System.nanoTime()
@@ -524,26 +612,41 @@ class PtpIpClient(
         } catch (_: Exception) {
             return RemoteCaptureResult(false, "拍摄指令可能已发送，暂未确认结果，请查看相机；不会自动重拍")
         }
+        onProtocolEvent("Nikon shutter accepted: durationMs=${(System.nanoTime() - startedAt) / 1_000_000}")
         val deadline = System.nanoTime() + 30_000_000_000L
         var lastPoll = startedAt
+        var lastEventPoll = 0L
         while (System.nanoTime() < deadline) {
             var received = captureEvents.poll()
             while (received != null) {
                 if (received.at >= startedAt && (received.transaction == captureId || received.transaction == 0u || received.transaction == UInt.MAX_VALUE)) {
-                    if (received.code == CAPTURE_COMPLETE) {
+                    val objectHandle = received.handle
+                    val newObject = received.code == OBJECT_ADDED && objectHandle != null && objectHandle != 0u && objectHandle != UInt.MAX_VALUE &&
+                        (if (baseline != null) objectHandle !in baseline else vendorEvents || received.transaction == captureId)
+                    if (received.code == CAPTURE_COMPLETE || newObject) {
                         objectHandles = null
-                        return RemoteCaptureResult(true, "相机已确认拍摄完成，照片保存在相机中")
+                        onProtocolEvent("Nikon capture confirmed: source=event, code=${received.code.toString(16)}, durationMs=${(System.nanoTime() - startedAt) / 1_000_000}")
+                        return RemoteCaptureResult(true, if (newObject) "相机已生成新照片，照片保存在相机中" else "相机已确认拍摄完成，照片保存在相机中")
                     }
                 }
                 received = captureEvents.poll()
             }
-            // Some Nikon mobile sessions do not deliver CaptureComplete over PTP/IP.
-            if (baseline != null && System.nanoTime() - lastPoll >= 1_000_000_000L) {
+            // SnapBridge polls GetEventEx/GetEvent even when the PTP/IP event socket is silent.
+            if (eventPollOperation() != null && System.nanoTime() - lastEventPoll >= 150_000_000L) {
+                try { captureEvents.addAll(pollNikonEvents()) }
+                catch (error: PtpResponseException) { if (error.response != 0x2019) break }
+                catch (_: Exception) { break }
+                lastEventPoll = System.nanoTime()
+                if (captureEvents.isNotEmpty()) continue
+            }
+            // Only legacy bodies without vendor event support need expensive full-card polling.
+            if (eventPollOperation() == null && baseline != null && System.nanoTime() - lastPoll >= 1_000_000_000L) {
                 lastPoll = System.nanoTime()
                 try {
-                    val handles = Reader(requestData(GET_OBJECT_HANDLES, next(), UInt.MAX_VALUE, 0u, 0u)).u32Array()
+                    val handles = readAllObjectHandles()
                     if (handles.any { it !in baseline }) {
                         objectHandles = null
+                        onProtocolEvent("Nikon capture confirmed: source=card-list, durationMs=${(System.nanoTime() - startedAt) / 1_000_000}")
                         return RemoteCaptureResult(true, "相机中已出现新照片，照片保存在相机中")
                     }
                 } catch (error: PtpResponseException) {
@@ -586,14 +689,43 @@ class PtpIpClient(
 
     /** 流式下载：数据包直接写入 [output]，不经过 ArrayList 装箱，避免 GC 压力。 */
     @Synchronized private fun requestToStream(operation: Int, id: UInt, output: OutputStream, progress: (Long, Long) -> Unit, total: Long, baseOffset: Long, isCancelled: () -> Boolean, vararg parameters: UInt): Long {
-        command.send(operationPacket(operation, id, parameters)); var written = 0L; var expected = 0L
+        if (isCancelled()) throw DownloadCancelledException()
+        command.send(operationPacket(operation, id, parameters)); var written = 0L; var received = 0L
+        var expected: Long? = null
+        val maximum = if (operation == GET_PARTIAL_OBJECT) parameters.getOrNull(2)?.toLong() else total.takeIf { it > 0 }
+        var started = false; var ended = false
         var draining = false
         while (true) {
             val packet = command.read()
             when (packet.type) {
-                START_DATA -> { val r = Reader(packet.payload); r.u32(); expected = r.u64().toLong(); if (!isCancelled()) progress(baseOffset, total) else draining = true }
-                DATA, END_DATA -> { val r = Reader(packet.payload); r.u32(); val part = r.remaining(); if (isCancelled()) draining = true; if (!draining) { output.write(part); written += part.size; progress(baseOffset + written, total) } }
-                OPERATION_RESPONSE -> { validateResponse(operation, id, packet); if (draining || isCancelled()) throw DownloadCancelledException(); return written }
+                START_DATA -> {
+                    check(!started) { "尼康重复返回传输起始包" }
+                    val r = Reader(packet.payload)
+                    check(r.u32() == id) { "尼康数据事务编号不匹配" }
+                    val length = r.u64()
+                    check(length == ULong.MAX_VALUE || length <= Long.MAX_VALUE.toULong()) { "尼康传输长度无效" }
+                    expected = length.takeUnless { it == ULong.MAX_VALUE }?.toLong()
+                    check(maximum == null || expected == null || expected!! <= maximum) { "尼康声明的传输长度超过请求范围" }
+                    started = true
+                    if (!isCancelled()) progress(baseOffset, total.takeIf { it > 0 } ?: expected ?: 0) else draining = true
+                }
+                DATA, END_DATA -> {
+                    check(started && !ended) { "尼康数据包顺序无效" }
+                    val r = Reader(packet.payload)
+                    check(r.u32() == id) { "尼康数据事务编号不匹配" }
+                    val part = r.remaining(); received += part.size
+                    check(expected == null || received <= expected!!) { "尼康传输数据超过声明长度" }
+                    check(maximum == null || received <= maximum) { "尼康传输数据超过请求范围" }
+                    if (isCancelled()) draining = true
+                    if (!draining) { output.write(part); written += part.size; progress(baseOffset + written, total.takeIf { it > 0 } ?: expected ?: 0) }
+                    ended = packet.type == END_DATA
+                }
+                OPERATION_RESPONSE -> {
+                    validateResponse(operation, id, packet)
+                    if (draining || isCancelled()) throw DownloadCancelledException()
+                    check(started && ended && (expected == null || received == expected)) { "尼康文件传输不完整，请重新下载" }
+                    return written
+                }
                 else -> error("收到意外的 PTP/IP 数据包：${packet.type}")
             }
         }
@@ -712,6 +844,8 @@ class PtpIpClient(
         private const val NIKON_CHANGE_AF_AREA = 0x9205
         private const val NIKON_AF_DRIVE = 0x90C1
         private const val NIKON_DEVICE_READY = 0x90C8
+        private const val NIKON_GET_EVENT = 0x90C7
+        private const val NIKON_GET_EVENT_EX = 0x941C
         private const val NIKON_LIVE_VIEW_STATUS = 0xD1A2
         private const val EVENT = 8; private const val PING = 13; private const val PONG = 14
         private const val OBJECT_ADDED = 0x4002; private const val CAPTURE_COMPLETE = 0x400D
