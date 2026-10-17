@@ -4,6 +4,8 @@ import androidx.compose.animation.*
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.updateTransition
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -15,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.MotionDurationScale
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
@@ -28,6 +31,8 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.semantics.Role
@@ -35,12 +40,25 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import kotlin.math.roundToInt
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 internal val BridgeDockHeight = 64.dp
 internal val BridgeDockBottomGap = 6.dp
 internal val BridgeDockSideGap = 16.dp
 internal val BridgeDockRadius = 32.dp
 internal const val BridgeDockSwapDuration = 320
+
+internal object BridgeDockMotion {
+    const val Duration = 400
+    const val TrailDelay = 60
+    const val IconPress = 90
+    const val PageEnter = 250
+    val PageShift = 12.dp
+    val Front = spring<Float>(dampingRatio = .68f, stiffness = 840f, visibilityThreshold = .01f)
+    val Back = spring<Float>(dampingRatio = .78f, stiffness = 520f, visibilityThreshold = .01f)
+}
 
 /** Keep the outgoing button data, so both rows can be drawn in the same window. */
 internal class BridgeDockTransition {
@@ -89,13 +107,36 @@ internal fun BridgeDockBar(items: List<BridgeDockItem>, selected: String, modifi
 private fun BridgeDockButtons(items: List<BridgeDockItem>, selected: String, modifier: Modifier, interactive: Boolean = true) {
     val selectedIndex = items.indexOfFirst { it.id == selected }.coerceAtLeast(0)
     val transition = updateTransition(selectedIndex, label = "dock selection")
-    val weights = items.indices.map { index -> transition.animateFloat(transitionSpec = { tween(280) }, label = "dock width $index") { if (it == index) 2f else 1f }.value }
-    val position = transition.animateFloat(transitionSpec = { tween(280) }, label = "dock capsule") { it.toFloat() }
+    val weights = items.indices.map { index -> transition.animateFloat(transitionSpec = { tween(BridgeDockMotion.Duration) }, label = "dock width $index") { if (it == index) 2f else 1f }.value }
+    val start = remember { Animatable(selectedIndex.toFloat()) }
+    val end = remember { Animatable(selectedIndex + 2f) }
+    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    LaunchedEffect(selectedIndex) {
+        val forward = selectedIndex >= (start.value + end.value) / 2f - 1f
+        val scale = coroutineContext[MotionDurationScale]?.scaleFactor ?: 1f
+        val lag = (BridgeDockMotion.TrailDelay * scale).toLong()
+        // 前沿先到、后沿晚半拍；反向或连续点击直接从当前形状接着流动。
+        coroutineScope {
+            launch {
+                if (forward) delay(lag)
+                start.animateTo(selectedIndex.toFloat(), if (forward) BridgeDockMotion.Back else BridgeDockMotion.Front)
+            }
+            launch {
+                if (!forward) delay(lag)
+                end.animateTo(selectedIndex + 2f, if (forward) BridgeDockMotion.Front else BridgeDockMotion.Back)
+            }
+        }
+    }
     val shape = RoundedCornerShape(26.dp)
     BoxWithConstraints(modifier) {
         val unit = maxWidth / (items.size + 1)
         // A visual highlight has no Surface pointer handler or semantics of its own.
-        Box(Modifier.width(unit * 2f).fillMaxHeight().graphicsLayer { translationX = unit.toPx() * position.value }
+        Box(Modifier.width(unit * 2f).fillMaxHeight().graphicsLayer {
+            val length = (end.value - start.value).coerceAtLeast(1.4f)
+            translationX = unit.toPx() * ((start.value + end.value) / 2f - 1f) * if (rtl) -1f else 1f
+            scaleX = length / 2f
+            scaleY = (1f - (length - 2f).coerceAtLeast(0f) * .1f).coerceIn(.8f, 1f)
+        }
             .bridgeGlass(shape).background(BridgeWhite.copy(alpha = .1f), shape))
         Row(Modifier.fillMaxSize().selectableGroup(), verticalAlignment = Alignment.CenterVertically) {
             items.forEachIndexed { index, item -> key(item.id) {
@@ -103,6 +144,18 @@ private fun BridgeDockButtons(items: List<BridgeDockItem>, selected: String, mod
                 val pressed = interaction.collectIsPressedAsState()
                 val pressColor = BridgeWhite.copy(alpha = .12f)
                 val active = index == selectedIndex
+                val iconScale = remember { Animatable(1f) }
+                var lastActive by remember { mutableStateOf(active) }
+                LaunchedEffect(active) {
+                    val newlySelected = active && !lastActive
+                    lastActive = active
+                    if (newlySelected) {
+                        iconScale.animateTo(.72f, tween(BridgeDockMotion.IconPress))
+                        iconScale.animateTo(1f, spring(dampingRatio = .7f, stiffness = 600f, visibilityThreshold = .005f))
+                    } else iconScale.animateTo(1f, tween(120))
+                }
+                val color by animateColorAsState(BridgeWhite.copy(alpha = if (!item.enabled) .4f else if (active) 1f else .68f),
+                    tween(250), label = "dock color")
                 Row(Modifier.width(unit * weights[index]).fillMaxHeight().bridgePress(interaction).clip(shape)
                     // Observe press only while drawing. Rebuilding this subcomposition on DOWN
                     // replaces its selectable node before UP and cancels the click.
@@ -110,11 +163,13 @@ private fun BridgeDockButtons(items: List<BridgeDockItem>, selected: String, mod
                     .selectable(active, enabled = item.enabled && interactive, interactionSource = interaction, indication = null, role = if (item.action) Role.Button else Role.Tab, onClick = item.click),
                     horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
                     Box {
-                        Icon(item.icon, item.title, Modifier.size(23.dp), tint = BridgeWhite.copy(alpha = if (!item.enabled) .68f else if (active) 1f else .68f))
+                        Icon(item.icon, item.title, Modifier.size(23.dp).graphicsLayer {
+                            scaleX = iconScale.value; scaleY = iconScale.value
+                        }, tint = color)
                         if (item.badge) Surface(Modifier.align(Alignment.TopEnd).offset(3.dp, (-3).dp).size(7.dp), shape = CircleShape, color = BridgeEmber) { }
                     }
-                    AnimatedVisibility(active, enter = fadeIn(tween(160, delayMillis = 70)) + expandHorizontally(tween(240)), exit = fadeOut(tween(90)) + shrinkHorizontally(tween(180))) {
-                        Text(item.title, Modifier.padding(start = 7.dp), color = BridgeWhite.copy(alpha = if (item.enabled) 1f else .68f), style = MaterialTheme.typography.labelMedium,
+                    AnimatedVisibility(active, enter = fadeIn(tween(200, delayMillis = 90)) + expandHorizontally(tween(BridgeDockMotion.Duration)), exit = fadeOut(tween(90)) + shrinkHorizontally(tween(180))) {
+                        Text(item.title, Modifier.padding(start = 7.dp), color = color, style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }

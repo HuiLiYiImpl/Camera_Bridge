@@ -102,19 +102,6 @@ internal fun ColorPresetScreen(vm: MainViewModel, openWatermark: () -> Unit) {
     var query by rememberSaveable { mutableStateOf("") }
     var searchVisible by rememberSaveable { mutableStateOf(false) }
     var libraryMenu by remember { mutableStateOf(false) }
-    val menuBackdrop = LocalBridgeBackdrop.current
-    var menuSnapshot by remember { mutableStateOf<ImageBitmap?>(null) }
-    var menuSnapshotPosition by remember { mutableStateOf(Offset.Zero) }
-    var menuWindowOrigin by remember { mutableStateOf(Offset.Zero) }
-    LaunchedEffect(libraryMenu) {
-        if (libraryMenu && menuBackdrop != null) {
-            withFrameNanos { }
-            if (menuBackdrop.layer.size.width > 0) {
-                menuSnapshotPosition = menuBackdrop.position
-                menuSnapshot = runCatching { menuBackdrop.layer.toImageBitmap() }.getOrNull()
-            }
-        }
-    }
     val searchFocus = remember { FocusRequester() }
     var expanded by rememberSaveable { mutableStateOf(true) }
     var sheetFull by rememberSaveable { mutableStateOf(false) }
@@ -178,26 +165,12 @@ internal fun ColorPresetScreen(vm: MainViewModel, openWatermark: () -> Unit) {
                     if (importing > 0) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = BridgeEmber)
                     else Icon(Icons.Default.Add, "导入与管理", tint = BridgeWhite)
                 }
-                DropdownMenu(libraryMenu, { libraryMenu = false },
-                    shape = RoundedCornerShape(20.dp), containerColor = Color.Transparent,
-                    tonalElevation = 0.dp, shadowElevation = 0.dp) {
-                    val popupView = LocalView.current
-                    val menuShape = RoundedCornerShape(20.dp)
-                    Column(Modifier.testTag("presetGlassMenu").clip(menuShape).background(BridgeBackground)
-                        .onGloballyPositioned {
-                            val location = IntArray(2)
-                            popupView.getLocationOnScreen(location)
-                            menuWindowOrigin = Offset(location[0].toFloat(), location[1].toFloat())
-                        }
-                        .bridgeFrostedPanel(null, BridgeFrost, opacity = .5f, snapshot = menuSnapshot,
-                            snapshotPosition = menuSnapshotPosition - menuWindowOrigin)
-                        .bridgeColorBloom(config.colorTheme).border(BridgeGlassEdge, menuShape)) {
-                        DropdownMenuItem({ Text("导入预设") }, {
-                            libraryMenu = false
-                            runCatching { importer.launch(arrayOf("*/*")) }.onFailure { vm.notify("无法打开文件选择器") }
-                        })
-                        DropdownMenuItem({ Text("水印预设") }, { libraryMenu = false; openWatermark() })
-                    }
+                BridgeGlassDropdownMenu(libraryMenu, { libraryMenu = false }, modifier = Modifier.testTag("presetGlassMenu")) {
+                    DropdownMenuItem({ Text("导入预设") }, {
+                        libraryMenu = false
+                        runCatching { importer.launch(arrayOf("*/*")) }.onFailure { vm.notify("无法打开文件选择器") }
+                    })
+                    DropdownMenuItem({ Text("水印预设") }, { libraryMenu = false; openWatermark() })
                 }
             }
             BoxWithConstraints(Modifier.weight(1f).padding(horizontal = 8.dp).height(44.dp), contentAlignment = Alignment.Center) {

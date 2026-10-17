@@ -83,6 +83,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.rememberGraphicsLayer
@@ -255,6 +258,9 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
     val launchIntro = remember { ConnectionIntroState(launchScope, ConnectionLaunchSession.claim()) }
     LaunchedEffect(tab, session) { if (tab != Tab.CAMERA || session != null) launchIntro.finishImmediately() }
     val pageStates = rememberSaveableStateHolder()
+    var previousPage by remember { mutableStateOf(tab) }
+    val pageDirection = remember(tab) { if (tab == previousPage) 0 else if (tab.ordinal > previousPage.ordinal) 1 else -1 }
+    SideEffect { previousPage = tab }
     BackHandler(tab != Tab.CAMERA && !remoteFullscreen) {
         if (tab == Tab.REMOTE) exitRemote() else tab = if (tab == Tab.WATERMARK) Tab.LUT else Tab.CAMERA
     }
@@ -305,8 +311,14 @@ fun NikonConnectApp(vm: MainViewModel = viewModel()) {
                         LocalBridgeBackdrop provides if (tab == Tab.DOWNLOADS || tab == Tab.PHOTOS || tab == Tab.LUT || tab == Tab.CAMERA) mediaBackdrop else null) {
                     Box(Modifier.fillMaxSize().bridgeBackground().padding(contentPadding)) {
                         Column(Modifier.fillMaxSize().then(if (tab == Tab.PHOTOS || tab == Tab.DOWNLOADS || tab == Tab.LUT || tab == Tab.CAMERA) Modifier else Modifier.statusBarsPadding())) {
-                            // 主导航直接更换当前页，避免两张图片流同时绘制和模糊。
-                            Box(Modifier.weight(1f)) {
+                            // 立即挂载目标页，轻推淡入不等待图片加载，也不同时绘制两张图片流。
+                            val pageReveal = remember(tab) { androidx.compose.animation.core.Animatable(if (pageDirection == 0) 1f else 0f) }
+                            LaunchedEffect(pageReveal) { pageReveal.animateTo(1f, tween(BridgeDockMotion.PageEnter,
+                                easing = androidx.compose.animation.core.LinearOutSlowInEasing)) }
+                            Box(Modifier.weight(1f).graphicsLayer {
+                                alpha = pageReveal.value
+                                translationX = BridgeDockMotion.PageShift.toPx() * pageDirection * (1f - pageReveal.value)
+                            }) {
                                 val screen = tab
                                 pageStates.SaveableStateProvider(if (screen == Tab.PHOTOS) "${screen.name}:${session?.transport}:${session?.name}:${session?.details?.serialNumber}" else screen.name) {
                                 CompositionLocalProvider(LocalBridgeBackdrop provides if (screen == tab) LocalBridgeBackdrop.current else null) {
@@ -1426,14 +1438,14 @@ internal fun WatermarkTemplatePreview(layout: WatermarkLayout, modifier: Modifie
 }
 
 @Composable
-internal fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, watermarks: List<WatermarkPreset> = emptyList(), selectWatermark: ((WatermarkPreset?) -> Unit)? = null, watermarkName: String? = null, exportEdited: (() -> Unit)? = null, createWatermark: () -> Unit = {}, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}, rotation: Int = 0, rotateLeft: () -> Unit = {}, gpuSource: Bitmap? = null, gpuLut: CubeLut? = null, gpuIntensity: Float = PhotoLutDefaultIntensity, setGpuIntensity: (Float) -> Unit = {}, selectedLutEntry: LutEntry? = null, downloadOnly: Boolean = false, viewDetails: (() -> Unit)? = null, intensityChangeFinished: () -> Unit = {}, previousPhoto: (() -> Unit)? = null, nextPhoto: (() -> Unit)? = null, sourceRotation: Int = rotation, aiController: AiPhotoController? = null, aiPhotoKey: String = "", aiSettingsContent: @Composable (String?, () -> Unit) -> Unit = { _, _ -> }, previewSource: (() -> PhotoPreviewSource?)? = null, metadata: PhotoMetadata? = null, cameraAsset: PhotoAsset? = null, localRecord: DownloadRecord? = null, loadPresetCover: (suspend (LutEntry) -> Bitmap?)? = null, initialTool: PhotoDetailTool? = null, photoPosition: String? = null) {
+internal fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap: Bitmap?, loading: Boolean, dismiss: () -> Unit, loadOriginal: (() -> Unit)? = null, originalLoaded: Boolean = bitmap != null, luts: List<LutEntry> = emptyList(), recentLutIds: List<String> = emptyList(), selectLut: ((LutEntry?) -> Unit)? = null, lutName: String? = null, exportLut: (() -> Unit)? = null, download: (() -> Unit)? = null, watermarks: List<WatermarkPreset> = emptyList(), selectWatermark: ((WatermarkPreset?) -> Unit)? = null, watermarkName: String? = null, exportEdited: (() -> Unit)? = null, createWatermark: () -> Unit = {}, inlineTask: InlineTask? = null, dismissInline: () -> Unit = {}, retryInline: () -> Unit = {}, rotation: Int = 0, rotateLeft: () -> Unit = {}, gpuSource: Bitmap? = null, gpuLut: CubeLut? = null, gpuIntensity: Float = PhotoLutDefaultIntensity, setGpuIntensity: (Float) -> Unit = {}, selectedLutEntry: LutEntry? = null, downloadOnly: Boolean = false, viewDetails: (() -> Unit)? = null, intensityChangeFinished: () -> Unit = {}, previousPhoto: (() -> Unit)? = null, nextPhoto: (() -> Unit)? = null, sourceRotation: Int = rotation, aiController: AiPhotoController? = null, aiPhotoKey: String = "", aiSettingsContent: @Composable (String?, () -> Unit) -> Unit = { _, _ -> }, previewSource: (() -> PhotoPreviewSource?)? = null, metadata: PhotoMetadata? = null, cameraAsset: PhotoAsset? = null, localRecord: DownloadRecord? = null, loadPresetCover: (suspend (LutEntry) -> Bitmap?)? = null, initialTool: PhotoDetailTool? = null, photoPosition: String? = null, exportOriginal: (() -> Unit)? = download) {
     val motion = rememberPhotoDetailMotion(previewSource, dismiss)
     val dockTransition = LocalBridgeDockTransition.current
     val scope = rememberCoroutineScope()
     val panel = remember { PhotoDetailPanelState(scope) }
     var tool by remember { mutableStateOf(initialTool ?: PhotoDetailTool.INFO) }
     var toolsVisible by remember { mutableStateOf(true) }
-    var selectedDock by remember { mutableStateOf("export") }
+    var selectedDock by remember { mutableStateOf(PhotoDetailTool.COLOR.name) }
     var panelVisited by remember { mutableStateOf(initialTool != null) }
     var more by remember { mutableStateOf(false) }
     var comparing by remember(aiPhotoKey, name) { mutableStateOf(false) }
@@ -1455,7 +1467,7 @@ internal fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap:
         intensityChangeFinished()
         toolsVisible = true
         panelVisited = true
-        if (next != PhotoDetailTool.INFO) selectedDock = next.name
+        selectedDock = next.name
         if (next == tool && panel.target > 0f) panel.close()
         else { tool = next; panel.show() }
     }
@@ -1545,20 +1557,42 @@ internal fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap:
                                     Text(name, color = BridgeWhite, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     photoPosition?.let { Text(it, color = BridgeWhite.copy(alpha = .5f), style = MaterialTheme.typography.labelSmall) }
                                 }
-                                IconButton({ openTool(PhotoDetailTool.INFO) }) { Icon(Icons.Default.Info, "查看拍摄参数", tint = BridgeWhite) }
                                 Box {
                                     IconButton({ more = true }) { Icon(Icons.Default.MoreHoriz, "更多操作", tint = BridgeWhite) }
-                                    DropdownMenu(more, { more = false }) {
-                                        if (!downloadOnly) DropdownMenuItem({ Text("旋转照片") }, { more = false; rotateLeft() }, leadingIcon = { Icon(Icons.Default.RotateLeft, null) })
-                                        if (download != null) DropdownMenuItem({ Text("保存原始文件") }, { more = false; download() }, enabled = !taskRunning)
-                                        if (originalLoaded && !downloadOnly) DropdownMenuItem({ Text("还原色彩和水印") }, { more = false; comparing = false; selectLut?.invoke(null); selectWatermark?.invoke(null) }, enabled = !taskRunning && !loading)
+                                    BridgeGlassDropdownMenu(more, { more = false }, backdrop) {
+                                        DropdownMenuItem({ Text("导出原图") }, { more = false; exportOriginal?.invoke() },
+                                            enabled = exportOriginal != null && !taskRunning,
+                                            leadingIcon = { Icon(Icons.Default.Image, null) })
+                                        DropdownMenuItem({ Text("导出") }, { more = false; exportAction?.invoke() },
+                                            enabled = originalLoaded && exportAction != null && !taskRunning && !loading,
+                                            leadingIcon = { Icon(Icons.Default.FileDownload, null) })
+                                        DropdownMenuItem({ Text("还原色彩与水印") }, {
+                                            more = false; comparing = false; selectLut?.invoke(null); selectWatermark?.invoke(null)
+                                        }, enabled = originalLoaded && !downloadOnly && !taskRunning && !loading,
+                                            leadingIcon = { Icon(Icons.Default.Restore, null) })
                                     }
                                 }
                             }
                             InlineStatusCard(inlineTask, dismissInline, retryInline)
                             if (originalLoaded && aiController != null) AiPhotoStatus(aiController, aiPhotoKey) { openTool(PhotoDetailTool.AI) }
                         }
-                        BridgeProgressiveBackdrop(backdrop, Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(146.dp + dockBottom).graphicsLayer { alpha = motion.progress.value * motion.progress.value }, bottom = true, tint = PhotoDetailBackground)
+                        // 模糊只延伸到工具栏上方 28dp，上沿羽化，避免放大照片时出现整块遮挡。
+                        val dockFeather = 28.dp
+                        BridgeProgressiveBackdrop(backdrop, Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                            .height(dockHeight + dockBottom + dockFeather)
+                            .graphicsLayer {
+                                alpha = motion.progress.value * motion.progress.value
+                                compositingStrategy = CompositingStrategy.Offscreen
+                            }.drawWithCache {
+                                val edge = (dockFeather.toPx() / this.size.height).coerceIn(0f, 1f)
+                                val feather = Brush.verticalGradient(0f to Color.Transparent,
+                                    edge * .25f to Color.White.copy(alpha = .15f), edge * .5f to Color.White.copy(alpha = .5f),
+                                    edge * .75f to Color.White.copy(alpha = .85f), edge to Color.White, 1f to Color.White)
+                                onDrawWithContent {
+                                    drawContent()
+                                    drawRect(feather, blendMode = BlendMode.DstIn)
+                                }
+                            }, bottom = true, tint = PhotoDetailBackground)
                         // The sheet takes the dock's place; keep the real visible card rounded on all sides.
                         Box(Modifier.matchParentSize().padding(bottom = panelBottom).clipToBounds()
                             .then(if (!panel.open) Modifier.clearAndSetSemantics { } else Modifier)) {
@@ -1594,17 +1628,19 @@ internal fun PreviewDialog(name: String, size: Long, thumbnail: Bitmap?, bitmap:
                                 val dockItems = when {
                                     downloadOnly -> listOf(BridgeDockItem("download", "下载后播放和编辑", Icons.Default.Download, download != null && !taskRunning, action = true) { download?.invoke() })
                                     !originalLoaded && localRecord == null -> buildList {
-                                        if (download != null) add(BridgeDockItem("save", "保存原片", Icons.Default.Download, !taskRunning && !loading, action = true) { download() })
                                         add(BridgeDockItem("load", "查看原图", Icons.Default.Image, loadOriginal != null && !taskRunning && !loading, action = true) { loadOriginal?.invoke() })
+                                        add(BridgeDockItem("rotate", "旋转", Icons.Default.RotateLeft, !loading && !taskRunning && thumbnail != null, action = true) { selectedDock = "rotate"; rotateLeft() })
+                                        add(BridgeDockItem(PhotoDetailTool.INFO.name, "详情", Icons.Default.Info) { openTool(PhotoDetailTool.INFO) })
                                     }
                                     else -> buildList {
                                         add(BridgeDockItem(PhotoDetailTool.COLOR.name, "色彩", Icons.Default.ColorLens, originalLoaded && selectLut != null && !taskRunning) { openTool(PhotoDetailTool.COLOR) })
                                         add(BridgeDockItem(PhotoDetailTool.WATERMARK.name, "水印", Icons.Default.TextFields, originalLoaded && selectWatermark != null && !taskRunning) { openTool(PhotoDetailTool.WATERMARK) })
                                         if (aiController != null) add(BridgeDockItem(PhotoDetailTool.AI.name, "AI", Icons.Default.AutoAwesome, gpuSource != null && !taskRunning) { openTool(PhotoDetailTool.AI) })
-                                        add(BridgeDockItem("export", "导出", Icons.Default.FileDownload, originalLoaded && exportAction != null && !taskRunning && !loading, action = true) { selectedDock = "export"; exportAction?.invoke() })
+                                        add(BridgeDockItem("rotate", "旋转", Icons.Default.RotateLeft, !loading && !taskRunning && (bitmap != null || thumbnail != null), action = true) { selectedDock = "rotate"; rotateLeft() })
+                                        add(BridgeDockItem(PhotoDetailTool.INFO.name, "详情", Icons.Default.Info) { openTool(PhotoDetailTool.INFO) })
                                     }
                                 }
-                                BridgeDockBar(dockItems, when { downloadOnly -> "download"; !originalLoaded && localRecord == null -> "load"; else -> selectedDock },
+                                BridgeDockBar(dockItems, when { downloadOnly -> "download"; !originalLoaded && localRecord == null && selectedDock != "rotate" && selectedDock != PhotoDetailTool.INFO.name -> "load"; else -> selectedDock },
                                     Modifier.fillMaxWidth().graphicsLayer {
                                         translationY = dockExitPx * panel.dockHiddenFraction
                                         alpha = if (motion.handedOff) 0f else 1f
@@ -2108,7 +2144,7 @@ private fun DownloadsScreen(vm: MainViewModel) {
             inlineRetry = run
             run()
         }
-        PreviewDialog(row.name, row.size, vm.cachedLocalThumbnail(row), watermarkedBitmap ?: gradedBitmap ?: previewBitmap, previewLoading || grading || watermarking || lutLoading, { preview = null; previewBitmap = null; previewSourceBytes = null; previewRotation = 0; previewLut = null; previewLutData = null; previewLutIntensity = PhotoLutDefaultIntensity; gradedBitmap = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {} }, { originalReload++ }, previewBitmap != null, luts, recentLutIds, { entry -> previewLut = entry; previewLutData = null; previewLutIntensity = PhotoLutDefaultIntensity; entry?.let(vm::markLutUsed); Unit }, previewLut?.name, download = null, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 }, gpuSource = previewBitmap, gpuLut = previewLutData, gpuIntensity = previewLutIntensity, setGpuIntensity = { intensityDragging = true; previewLutIntensity = it }, intensityChangeFinished = { intensityDragging = false }, previousPhoto = previousPhoto, nextPhoto = nextPhoto, sourceRotation = previewRotation, selectedLutEntry = previewLut, aiController = vm.aiPhoto, aiPhotoKey = row.uri, previewSource = { previewSources.find(row.uri) }, metadata = photoMetadata, localRecord = row, loadPresetCover = { vm.loadLutCover(it, 160, false).original }, initialTool = if (previewStartsWithInfo) PhotoDetailTool.INFO else null, photoPosition = "${index + 1} / ${images.size}", aiSettingsContent = { profileId, close -> SettingsSheet(vm, focusAi = true, initialProfileId = profileId, dismiss = close) })
+        PreviewDialog(row.name, row.size, vm.cachedLocalThumbnail(row), watermarkedBitmap ?: gradedBitmap ?: previewBitmap, previewLoading || grading || watermarking || lutLoading, { preview = null; previewBitmap = null; previewSourceBytes = null; previewRotation = 0; previewLut = null; previewLutData = null; previewLutIntensity = PhotoLutDefaultIntensity; gradedBitmap = null; selectedWatermark = null; watermarkedBitmap = null; photoMetadata = null; inlineTask = null; inlineRetry = {} }, { originalReload++ }, previewBitmap != null, luts, recentLutIds, { entry -> previewLut = entry; previewLutData = null; previewLutIntensity = PhotoLutDefaultIntensity; entry?.let(vm::markLutUsed); Unit }, previewLut?.name, download = null, watermarks = watermarks, selectWatermark = { preset -> selectedWatermark = preset }, watermarkName = selectedWatermark?.name, exportEdited = startExport, createWatermark = { showWatermarkEditor = true; editingWatermark = null }, inlineTask = inlineTask, dismissInline = { inlineTask = null; inlineRetry = {} }, retryInline = inlineRetry, rotation = if (watermarkedBitmap != null) 0 else previewRotation, rotateLeft = { previewRotation = (previewRotation - 90 + 360) % 360 }, gpuSource = previewBitmap, gpuLut = previewLutData, gpuIntensity = previewLutIntensity, setGpuIntensity = { intensityDragging = true; previewLutIntensity = it }, intensityChangeFinished = { intensityDragging = false }, previousPhoto = previousPhoto, nextPhoto = nextPhoto, sourceRotation = previewRotation, selectedLutEntry = previewLut, aiController = vm.aiPhoto, aiPhotoKey = row.uri, previewSource = { previewSources.find(row.uri) }, metadata = photoMetadata, localRecord = row, exportOriginal = { shareUris(context, listOf(row.uri)) }, loadPresetCover = { vm.loadLutCover(it, 160, false).original }, initialTool = if (previewStartsWithInfo) PhotoDetailTool.INFO else null, photoPosition = "${index + 1} / ${images.size}", aiSettingsContent = { profileId, close -> SettingsSheet(vm, focusAi = true, initialProfileId = profileId, dismiss = close) })
     }
     if (showWatermarkEditor) WatermarkEditorDialog(editingWatermark, { showWatermarkEditor = false }, { preset -> if (editingWatermark == null) vm.addWatermark(preset) else vm.updateWatermark(preset); showWatermarkEditor = false })
     LutPickerSheet(showBatchLutPicker, luts, recentLutIds, { showBatchLutPicker = false }, { entry ->

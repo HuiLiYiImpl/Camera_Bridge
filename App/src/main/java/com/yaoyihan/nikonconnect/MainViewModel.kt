@@ -523,7 +523,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun thumbnailDiskKey(camera: CameraClient, asset: PhotoAsset): String =
-        listOf("v1", camera.cameraDetails.manufacturer, camera.cameraDetails.model, camera.cameraDetails.serialNumber,
+        listOf(if (mediaKindFor(null, asset.name) == MediaKind.RAW_IMAGE) "v2-raw-direction" else "v1",
+            camera.cameraDetails.manufacturer, camera.cameraDetails.model, camera.cameraDetails.serialNumber,
             camera.cameraName, asset.handle, asset.name, asset.size, asset.capturedAt.time,
             asset.imageWidth, asset.imageHeight).joinToString("\u0000")
 

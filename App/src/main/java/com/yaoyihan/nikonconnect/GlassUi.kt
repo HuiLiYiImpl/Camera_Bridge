@@ -57,6 +57,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
@@ -246,6 +247,37 @@ internal fun Modifier.bridgeColorBloom(theme: AppColorTheme): Modifier = drawWit
 internal val BridgeGlassEdge = BorderStroke(1.dp, Brush.linearGradient(listOf(
     Color.White.copy(alpha = .76f), Color.White.copy(alpha = .15f),
     Color.White.copy(alpha = .06f), Color.White.copy(alpha = .38f))))
+
+/** Sample once before opening a popup; graphics layers stay in their owning window. */
+@Composable
+internal fun BridgeGlassDropdownMenu(expanded: Boolean, onDismissRequest: () -> Unit,
+    backdrop: BridgeBackdrop? = LocalBridgeBackdrop.current, modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit) {
+    var snapshot by remember { mutableStateOf<ImageBitmap?>(null) }
+    var sourcePosition by remember { mutableStateOf(Offset.Zero) }
+    var popupOrigin by remember { mutableStateOf(Offset.Zero) }
+    LaunchedEffect(expanded, backdrop) {
+        if (expanded && backdrop != null) {
+            withFrameNanos { }
+            if (backdrop.layer.size.width > 0) {
+                sourcePosition = backdrop.position
+                snapshot = runCatching { backdrop.layer.toImageBitmap() }.getOrNull()
+            }
+        } else snapshot = null
+    }
+    val shape = RoundedCornerShape(20.dp)
+    DropdownMenu(expanded, onDismissRequest, shape = shape, containerColor = Color.Transparent,
+        tonalElevation = 0.dp, shadowElevation = 0.dp) {
+        val popupView = LocalView.current
+        Column(modifier.clip(shape).background(BridgeBackground).onGloballyPositioned {
+            val location = IntArray(2)
+            popupView.getLocationOnScreen(location)
+            popupOrigin = Offset(location[0].toFloat(), location[1].toFloat())
+        }.bridgeFrostedPanel(null, BridgeFrost, opacity = .5f, snapshot = snapshot,
+            snapshotPosition = sourcePosition - popupOrigin)
+            .bridgeColorBloom(LocalBridgeColorTheme.current).border(BridgeGlassEdge, shape), content = content)
+    }
+}
 
 
 /** Native sheets use a frozen background so graphics layers never cross window boundaries. */
