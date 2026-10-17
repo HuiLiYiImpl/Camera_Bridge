@@ -65,4 +65,23 @@ class DownloadTaskLogicTest {
         assertTrue(isUserDownloadCancellation(IllegalStateException("USB disconnected"), true))
         assertFalse(isUserDownloadCancellation(CancellationException("process stopped"), false))
     }
+
+    @Test
+    fun completionUsesSavedFileSizeAndKeepsSourceIdentityForFeedback() {
+        val session = CameraSession("Z 8", "192.168.1.1", 15740)
+        val task = DownloadTask(asset.downloadSourceKey(session), asset, downloadedBytes = 400,
+            totalBytes = 0, bytesPerSecond = 200, remainingSeconds = 5,
+            status = DownloadTaskStatus.DOWNLOADING)
+        val saved = DownloadRecord(asset.name, 512, "content://media/external/images/media/123", 1)
+        val completed = task.completed(saved)
+        assertEquals(task.id, completed.id)
+        assertEquals(task.asset, completed.asset)
+        assertTrue(completed.belongsTo(session))
+        assertEquals(DownloadTaskStatus.COMPLETED, completed.status)
+        assertEquals(saved.uri, completed.completedUri)
+        assertEquals(512L, completed.downloadedBytes)
+        assertEquals(1f, downloadProgress(completed.downloadedBytes, completed.totalBytes, asset.size).second)
+        assertEquals(null, completed.bytesPerSecond)
+        assertEquals(0L, completed.remainingSeconds)
+    }
 }

@@ -1,14 +1,18 @@
 package com.yaoyihan.nikonconnect
 
 import android.app.*
+import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.PowerManager
+import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
 
@@ -29,7 +33,7 @@ class AiPhotoService : Service() {
         scope.launch {
             controller.tasks.collect { tasks ->
                 if (tasks.none { it.active } && latestStartId != 0) stopSelfResult(latestStartId)
-                else runCatching { NotificationManagerCompat.from(this@AiPhotoService).notify(ONGOING_ID, progressNotification()) }
+                else postNotification(this@AiPhotoService, ONGOING_ID, progressNotification())
             }
         }
     }
@@ -61,6 +65,11 @@ class AiPhotoService : Service() {
         private const val PROGRESS_CHANNEL = "ai_image_progress"
         private const val RESULT_CHANNEL = "ai_image_results"
         private const val ONGOING_ID = 3100
+        private fun postNotification(context: Context, id: Int, notification: Notification) {
+            if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context,
+                    Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
+            runCatching { NotificationManagerCompat.from(context).notify(id, notification) }
+        }
         private fun channels(context: Context) {
             context.getSystemService(NotificationManager::class.java).apply {
                 createNotificationChannel(NotificationChannel(PROGRESS_CHANNEL, "AI 图片生成进度", NotificationManager.IMPORTANCE_LOW))
@@ -77,7 +86,7 @@ class AiPhotoService : Service() {
                 .setContentTitle(if (saved == null) "AI 图片处理失败" else "AI 图片已保存到相册")
                 .setContentText("${task.sourceName}：$message").setStyle(NotificationCompat.BigTextStyle().bigText("${task.sourceName}：$message"))
                 .setAutoCancel(true).setContentIntent(pending).build()
-            runCatching { NotificationManagerCompat.from(context).notify(id, notification) }
+            postNotification(context, id, notification)
         }
     }
 }

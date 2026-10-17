@@ -58,6 +58,7 @@ private const val LutGpuLogTag = "LutGlView"
 
 class LutGlView(context: Context) : GLSurfaceView(context) {
     private val lutRenderer = Renderer()
+    var onImageRendered: ((Bitmap) -> Unit)? = null
 
     init {
         setEGLContextClientVersion(3)
@@ -96,6 +97,7 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
         private var imageTexture = 0
         private var lutTexture = 0
         private var uploadedImage: Bitmap? = null
+        private var deliveredImage: Bitmap? = null
         private var uploadedLut: CubeLut? = null
         private var position = 0
         private var imageHandle = 0
@@ -116,6 +118,7 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
         override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
             // A resumed/recreated EGL context no longer owns the previous texture identifiers.
             imageTexture = 0; lutTexture = 0; uploadedImage = null; uploadedLut = null
+            deliveredImage = null
             program = runCatching {
                 linkProgram(compile(GLES30.GL_VERTEX_SHADER, VertexShader), compile(GLES30.GL_FRAGMENT_SHADER, FragmentShader))
             }.getOrElse { error ->
@@ -148,6 +151,9 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
             if (program == 0) return
             val source = image ?: return
             GLES30.glUseProgram(program)
+            // Samplers of different types must use distinct units, even without a LUT.
+            GLES30.glUniform1i(imageHandle, 0)
+            GLES30.glUniform1i(lutHandle, 1)
             if (uploadedImage !== source) {
                 if (imageTexture == 0) imageTexture = genTexture()
                 GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, imageTexture)
@@ -172,12 +178,10 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
             GLES30.glUniform1i(hasLutHandle, if (selected == null) 0 else 1)
             GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, imageTexture)
-            GLES30.glUniform1i(imageHandle, 0)
             if (selected != null) {
                 if (uploadedLut !== selected) uploadLut(selected)
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
                 GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, lutTexture)
-                GLES30.glUniform1i(lutHandle, 1)
                 GLES30.glUniform1f(sizeHandle, selected.size.toFloat())
                 GLES30.glUniform3fv(domainMinHandle, 1, selected.domainMin, 0)
                 GLES30.glUniform3fv(domainMaxHandle, 1, selected.domainMax, 0)
@@ -187,6 +191,10 @@ class LutGlView(context: Context) : GLSurfaceView(context) {
             GLES30.glVertexAttribPointer(position, 2, GLES30.GL_FLOAT, false, 0, vertices)
             GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
             GLES30.glDisableVertexAttribArray(position)
+            if (deliveredImage !== source) {
+                deliveredImage = source
+                post { onImageRendered?.invoke(source) }
+            }
         }
 
         private fun uploadLut(lut: CubeLut) {

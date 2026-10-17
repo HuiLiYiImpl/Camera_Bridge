@@ -96,7 +96,7 @@ fun Context.mediaKind(record: DownloadRecord): MediaKind {
 }
 
 fun String.isVideoName() = mediaKindFor(null, this) == MediaKind.VIDEO
-enum class DownloadTaskStatus { QUEUED, DOWNLOADING, CANCELLING, FAILED }
+enum class DownloadTaskStatus { QUEUED, DOWNLOADING, CANCELLING, FAILED, COMPLETED }
 
 data class DownloadTask(
     val id: String,
@@ -108,6 +108,13 @@ data class DownloadTask(
     val status: DownloadTaskStatus = DownloadTaskStatus.QUEUED,
     val createdAt: Long = System.currentTimeMillis(),
     val errorMessage: String? = null,
+    val completedUri: String? = null,
+)
+
+internal fun DownloadTask.completed(record: DownloadRecord): DownloadTask = copy(
+    downloadedBytes = record.size.coerceAtLeast(0), totalBytes = record.size.coerceAtLeast(0),
+    bytesPerSecond = null, remainingSeconds = 0, status = DownloadTaskStatus.COMPLETED,
+    errorMessage = null, completedUri = record.uri,
 )
 
 enum class EnqueueDownloadResult { CREATED, ALREADY_EXISTS }
@@ -151,6 +158,17 @@ data class LutEntry(
     val favorite: Boolean = false,
     val lastUsedAt: Long = 0,
     val importedAt: Long = System.currentTimeMillis(),
+    val useCount: Long = 0,
+    val coverKey: String = "",
+)
+
+internal fun frequentLuts(entries: List<LutEntry>): List<LutEntry> = entries
+    .sortedWith(compareByDescending<LutEntry> { it.useCount }.thenByDescending { it.lastUsedAt }
+        .thenByDescending { it.importedAt }.thenBy { it.id }).take(4)
+
+internal fun LutEntry.recordSuccessfulUse(now: Long): LutEntry = copy(
+    useCount = if (useCount == Long.MAX_VALUE) useCount else useCount.coerceAtLeast(0) + 1,
+    lastUsedAt = now,
 )
 
 private val LutInputExtensions = setOf("jpg", "jpeg", "png", "nef", "nrw", "cr2", "arw", "dng", "raf")
@@ -233,13 +251,13 @@ class AppStore(context: Context) {
     fun luts(): List<LutEntry> = runCatching {
         val array = JSONArray(prefs.getString("luts", "[]"))
         (0 until array.length()).map { i ->
-            array.getJSONObject(i).let { LutEntry(it.getString("id"), it.getString("name"), runCatching { LutCategory.valueOf(it.optString("category")) }.getOrDefault(LutCategory.OTHER), it.optString("format", "CUBE"), it.optInt("dimension", 0), it.optString("sourceName", it.getString("name")), it.optString("inputColorSpace", "sRGB"), it.optBoolean("favorite", false), it.optLong("lastUsedAt", 0), it.optLong("importedAt", System.currentTimeMillis())) }
+            array.getJSONObject(i).let { LutEntry(it.getString("id"), it.getString("name"), runCatching { LutCategory.valueOf(it.optString("category")) }.getOrDefault(LutCategory.OTHER), it.optString("format", "CUBE"), it.optInt("dimension", 0), it.optString("sourceName", it.getString("name")), it.optString("inputColorSpace", "sRGB"), it.optBoolean("favorite", false), it.optLong("lastUsedAt", 0), it.optLong("importedAt", System.currentTimeMillis()), it.optLong("useCount", 0).coerceAtLeast(0), it.optString("coverKey", "")) }
         }
     }.getOrDefault(emptyList())
 
     fun saveLuts(entries: List<LutEntry>) {
         val array = JSONArray()
-        entries.forEach { array.put(JSONObject().put("id", it.id).put("name", it.name).put("category", it.category.name).put("format", it.format).put("dimension", it.dimension).put("sourceName", it.sourceName).put("inputColorSpace", it.inputColorSpace).put("favorite", it.favorite).put("lastUsedAt", it.lastUsedAt).put("importedAt", it.importedAt)) }
+        entries.forEach { array.put(JSONObject().put("id", it.id).put("name", it.name).put("category", it.category.name).put("format", it.format).put("dimension", it.dimension).put("sourceName", it.sourceName).put("inputColorSpace", it.inputColorSpace).put("favorite", it.favorite).put("lastUsedAt", it.lastUsedAt).put("importedAt", it.importedAt).put("useCount", it.useCount).put("coverKey", it.coverKey)) }
         prefs.edit().putString("luts", array.toString()).apply()
     }
 

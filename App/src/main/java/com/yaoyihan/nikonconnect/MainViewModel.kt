@@ -75,6 +75,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val downloads = MutableStateFlow(store.downloads())
     val luts = MutableStateFlow(store.luts())
     val recentLutIds = MutableStateFlow(store.recentLuts())
+    internal val updatingLutCovers = MutableStateFlow<Set<String>>(emptySet())
     val watermarks = MutableStateFlow(store.watermarks())
     internal val aiPhoto = AiPhotoController.shared(application)
     val diagnosticState = diagnostics.state
@@ -430,6 +431,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         store.saveLuts(luts.value)
     }
 
+    private fun recordLutUse(id: String?) {
+        if (id == null || luts.value.none { it.id == id }) return
+        luts.value = luts.value.map { if (it.id == id) it.recordSuccessfulUse(System.currentTimeMillis()) else it }
+        store.saveLuts(luts.value)
+    }
+
+    private fun recordLutUseOnce(id: String?): () -> Unit {
+        var recorded = false
+        return { if (!recorded) { recorded = true; recordLutUse(id) } }
+    }
+
+    internal fun cachedLutCover(entry: LutEntry, maxEdge: Int, includeEffect: Boolean): LutCover? = LutPreviewImages.cached(getApplication(), entry, maxEdge, includeEffect)
+
+    internal suspend fun loadLutCover(entry: LutEntry, maxEdge: Int, includeEffect: Boolean): LutCover = LutPreviewImages.load(getApplication(), entry, maxEdge, includeEffect) { readLut(entry) }
+
+    internal fun setLutCover(entry: LutEntry, uri: Uri) {
+        if (entry.id in updatingLutCovers.value) return
+        updatingLutCovers.value = updatingLutCovers.value + entry.id
+        viewModelScope.launch {
+            var created: String? = null
+            var committed = false
+            try {
+                created = java.util.UUID.randomUUID().toString()
+                LutPreviewImages.import(getApplication(), uri, readLut(entry), created)
+                val current = luts.value.firstOrNull { it.id == entry.id } ?: return@launch
+                luts.value = luts.value.map { if (it.id == entry.id) it.copy(coverKey = created!!) else it }
+                store.saveLuts(luts.value)
+                committed = true
+                withContext(Dispatchers.IO) { LutPreviewImages.remove(getApplication(), current.coverKey) }
+                showSnackbar("已设置预览图")
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) { showSnackbar("预览图设置失败：${error.message ?: "无法读取图片"}") }
+            finally {
+                if (!committed) created?.let { LutPreviewImages.remove(getApplication(), it) }
+                updatingLutCovers.value = updatingLutCovers.value - entry.id
+            }
+        }
+    }
+
+    internal fun resetLutCover(entry: LutEntry) {
+        if (entry.id in updatingLutCovers.value) return
+        val current = luts.value.firstOrNull { it.id == entry.id } ?: return
+        luts.value = luts.value.map { if (it.id == entry.id) it.copy(coverKey = "") else it }
+        store.saveLuts(luts.value)
+        viewModelScope.launch(Dispatchers.IO) { LutPreviewImages.remove(getApplication(), current.coverKey) }
+        showSnackbar("已恢复默认预览图")
+    }
+
+    internal fun toggleLutFavorite(entry: LutEntry) {
+        luts.value = luts.value.map { if (it.id == entry.id) it.copy(favorite = !it.favorite) else it }
+        store.saveLuts(luts.value)
+    }
+
     fun addWatermark(preset: WatermarkPreset) {
         watermarks.value = watermarks.value + preset
         store.saveWatermarks(watermarks.value)
@@ -490,6 +544,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         thumbnailFailures.clear()
         thumbnailVersion.update { it + 1 }
     }
+
+    fun cachedLocalThumbnail(record: DownloadRecord): Bitmap? = localThumbnailCache.get(record.uri)
 
     suspend fun loadLocalThumbnail(record: DownloadRecord): Bitmap? = withContext(Dispatchers.IO) {
         localThumbnailCache.get(record.uri)?.let { return@withContext it }
@@ -612,7 +668,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         prefs.edit().putString("client_id", it).apply()
                     }
                     notice.value = "正在连接 ${device.name}，如相机提示访问请求，请在相机上确认"
-                    LumixCameraClient(device, identity, "Camera Bridge", { url -> network.openConnection(url) as java.net.HttpURLConnection }, cancelled,
+                    LumixCameraClient(device, identity, getApplication<Application>().getString(R.string.app_name), { url -> network.openConnection(url) as java.net.HttpURLConnection }, cancelled,
                         onProtocolEvent = { message -> logDiagnostic("LUMIX_AUTH_PROGRESS", "CAMERA_AUTHORIZATION", ConnectionTransport.WIFI, message = message) })
                 } else if (target.brand == CameraBrand.SONY) {
                     val device = selectedSony ?: run {
@@ -1391,13 +1447,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 runCatching { binary.outputStream().use { LutBinaryCodec.write(lut, it) } }
             }
         }
-        lutCache.put(entry.id, parsed)
-        parsed
+        val identified = parsed.copy(entryId = entry.id)
+        lutCache.put(entry.id, identified)
+        identified
     }
 
     fun removeLut(entry: LutEntry) {
         if (remotePreviewColor.value.entry?.id == entry.id) selectRemotePreviewLut(null)
         getApplication<Application>().filesDir.resolve("luts").resolve(entry.id).delete()
+        viewModelScope.launch(Dispatchers.IO) {
+            getApplication<Application>().filesDir.resolve("luts").resolve("${entry.id}.nlut").delete()
+            LutPreviewImages.remove(getApplication(), entry.coverKey)
+        }
         luts.value = luts.value.filterNot { it.id == entry.id }
         store.saveLuts(luts.value)
         recentLutIds.value = recentLutIds.value.filterNot { it == entry.id }
@@ -1406,7 +1467,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateLut(entry: LutEntry, name: String = entry.name, category: LutCategory = entry.category) {
-        val updated = entry.copy(name = name.trim().ifBlank { entry.name }, category = category)
+        val current = luts.value.firstOrNull { it.id == entry.id } ?: return
+        val updated = current.copy(name = name.trim().ifBlank { entry.name }, category = category)
         luts.value = luts.value.map { if (it.id == entry.id) updated else it }
         store.saveLuts(luts.value)
         when {
@@ -1430,6 +1492,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val result = runCatching { withContext(Dispatchers.IO) { saveLutBitmap(asset, bitmap, lut.name) } }
         result.onSuccess { record ->
             logDiagnostic("LUT_EXPORT_SUCCEEDED", "LUT_EXPORT", session.value?.transport, message = "LUT export completed: ${record.name}")
+            recordLutUse(lut.entryId)
             recordDownload(record); workflow.value = Workflow.CONNECTED; if (!inline) showTransient("已导出调色图片")
         }.onFailure {
             logDiagnostic("LUT_EXPORT_FAILED", "LUT_EXPORT", session.value?.transport, level = "ERROR", result = "FAILED", message = it.message ?: "LUT export failed", error = it)
@@ -1446,6 +1509,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val result = runCatching { withContext(Dispatchers.IO) { saveLutBitmap(PhotoAsset(0u, record.name, record.size, 0x3801), bitmap, lut.name) } }
         result.onSuccess { output ->
             logDiagnostic("LUT_EXPORT_SUCCEEDED", "LUT_EXPORT", message = "Local LUT export completed: ${output.name}")
+            recordLutUse(lut.entryId)
             recordDownload(output); workflow.value = Workflow.CONNECTED; if (!inline) showTransient("已导出调色图片")
         }.onFailure {
             logDiagnostic("LUT_EXPORT_FAILED", "LUT_EXPORT", level = "ERROR", result = "FAILED", message = it.message ?: "LUT export failed", error = it)
@@ -1460,6 +1524,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         supported: (T) -> Boolean,
         fileName: (T) -> String,
         onFinished: () -> Unit,
+        onFirstSuccess: () -> Unit = {},
         process: suspend (T) -> DownloadRecord,
     ): Job {
         batchEditJob?.takeIf { it.isActive }?.let {
@@ -1479,6 +1544,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         else try {
                             withContext(Dispatchers.IO) { store.addDownload(process(item)) }
                             completed++
+                            if (completed == 1) onFirstSuccess()
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (error: Exception) {
@@ -1491,7 +1557,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     downloads.value = withContext(Dispatchers.IO) { store.downloads() }
                     val message = "已导出 $completed 张，失败 ${failed.size} 张，跳过 $unsupported 个不支持的文件"
                     if (failed.isNotEmpty()) {
-                        pageRetry = { launchBatchEdits(failed.toList(), title, supported, fileName, onFinished, process); Unit }
+                        pageRetry = { launchBatchEdits(failed.toList(), title, supported, fileName, onFinished, onFirstSuccess, process); Unit }
                         showPageError(message)
                     } else {
                         pageRetry = null
@@ -1510,7 +1576,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun downloadAllWithLut(assets: List<PhotoAsset>, lut: CubeLut, onFinished: () -> Unit = {}): Job {
         val sourceSession = session.value
-        return launchBatchEdits(assets, "套用预设", { it.name.supportsLutInput() }, { it.name }, onFinished) { asset ->
+        return launchBatchEdits(assets, "套用预设", { it.name.supportsLutInput() }, { it.name }, onFinished, recordLutUseOnce(lut.entryId)) { asset ->
             check(asset.downloadSourceKey(session.value) == asset.downloadSourceKey(sourceSession)) { "请连接创建任务时的原相机后重试" }
             val active = client ?: error("相机连接已断开")
             val bytes = active.download(asset) { _, _ -> }
@@ -1519,7 +1585,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun applyLutToDownloads(records: List<DownloadRecord>, lut: CubeLut, onFinished: () -> Unit = {}): Job =
-        launchBatchEdits(records, "套用预设", { it.name.supportsLutInput() && !it.name.isVideoName() }, { it.name }, onFinished) { record ->
+        launchBatchEdits(records, "套用预设", { it.name.supportsLutInput() && !it.name.isVideoName() }, { it.name }, onFinished, recordLutUseOnce(lut.entryId)) { record ->
             val bytes = getApplication<Application>().contentResolver.openInputStream(Uri.parse(record.uri))?.use { it.readBytes() }
                 ?: error("无法读取 ${record.name}")
             renderAndSaveOriginal(PhotoAsset(0u, record.name, record.size, 0x3801), bytes, lut, null, lut.name, config.value.jpegQuality, PhotoMetadata(capturedAt = Date(record.completedAt)))
@@ -1536,7 +1602,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         lutIntensity: Float = 1f,
         inline: Boolean = false,
         onFinished: (Result<DownloadRecord>) -> Unit = {},
-    ): Job = launchEditedExport(asset.name, session.value?.transport, inline, onFinished) {
+    ): Job = launchEditedExport(asset.name, session.value?.transport, inline, onFinished, lut?.entryId) {
         val bytes = sourceBytes ?: (client ?: error("相机连接已断开")).download(asset) { _, _ -> }
         renderAndSaveOriginal(
             asset = asset,
@@ -1562,7 +1628,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         lutIntensity: Float = 1f,
         inline: Boolean = false,
         onFinished: (Result<DownloadRecord>) -> Unit = {},
-    ): Job = launchEditedExport(record.name, null, inline, onFinished) {
+    ): Job = launchEditedExport(record.name, null, inline, onFinished, lutEntry?.id) {
         if (getApplication<Application>().mediaKind(record) == MediaKind.VIDEO) error("视频暂不支持调色和水印")
         val bytes = sourceBytes ?: getApplication<Application>().contentResolver.openInputStream(Uri.parse(record.uri))?.use { it.readBytes() }
             ?: error("无法读取 ${record.name}")
@@ -1619,6 +1685,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 temp?.delete()
                 result.onSuccess { output ->
                     recordDownload(output)
+                    recordLutUse(lut?.entryId)
                     logDiagnostic("VIDEO_EXPORT_SUCCEEDED", "VIDEO_EXPORT", message = "Video export completed: ${output.name}")
                     showSnackbar(if (config.value.autoExport) "视频已导出到相册" else "视频已保存到下载目录")
                 }.onFailure { error ->
@@ -1681,6 +1748,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         transport: ConnectionTransport?,
         inline: Boolean,
         onFinished: (Result<DownloadRecord>) -> Unit,
+        lutId: String? = null,
         export: suspend () -> DownloadRecord,
     ): Job = viewModelScope.launch {
         editMutex.withLock {
@@ -1693,6 +1761,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val result = runCatching { withContext(Dispatchers.IO) { export() } }
                 result.onSuccess { record ->
                     recordDownload(record)
+                    recordLutUse(lutId)
                     workflow.value = if (session.value == null) Workflow.WAITING else Workflow.CONNECTED
                     logDiagnostic("WATERMARK_EXPORT_SUCCEEDED", "EDIT_EXPORT", transport, message = "Edit export completed: ${record.name}")
                     if (!inline) showTransient("已导出编辑图片")
@@ -1757,7 +1826,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val sourceSession = session.value
         val title = if (lut == null) "添加水印" else "调色 + 水印"
         val suffix = if (lut == null) "Watermark" else "${lut.name}_Watermark"
-        return launchBatchEdits(assets, title, { it.name.supportsLutInput() }, { it.name }, onFinished) { asset ->
+        return launchBatchEdits(assets, title, { it.name.supportsLutInput() }, { it.name }, onFinished, recordLutUseOnce(lut?.entryId)) { asset ->
             check(asset.downloadSourceKey(session.value) == asset.downloadSourceKey(sourceSession)) { "请连接创建任务时的原相机后重试" }
             val active = client ?: error("相机连接已断开")
             val bytes = active.download(asset) { _, _ -> }
@@ -1768,7 +1837,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun processLocalEdits(records: List<DownloadRecord>, lut: CubeLut?, preset: WatermarkPreset, onFinished: () -> Unit): Job {
         val title = if (lut == null) "添加水印" else "调色 + 水印"
         val suffix = if (lut == null) "Watermark" else "${lut.name}_Watermark"
-        return launchBatchEdits(records, title, { it.name.supportsLutInput() && !it.name.isVideoName() }, { it.name }, onFinished) { record ->
+        return launchBatchEdits(records, title, { it.name.supportsLutInput() && !it.name.isVideoName() }, { it.name }, onFinished, recordLutUseOnce(lut?.entryId)) { record ->
             val bytes = getApplication<Application>().contentResolver.openInputStream(Uri.parse(record.uri))?.use { it.readBytes() }
                 ?: error("无法读取 ${record.name}")
             renderAndSaveOriginal(PhotoAsset(0u, record.name, record.size, 0x3801), bytes, lut, preset, suffix, preset.quality, PhotoMetadata(capturedAt = Date(record.completedAt)))
@@ -1933,13 +2002,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     showSnackbar("已取消下载")
                 } else {
                     recordDownload(record)
+                    // 文件保存成功后留出对勾反馈时间；独立清理，不阻塞下一个下载。
+                    _downloadTasks.update { tasks -> tasks.map { if (it.id == task.id) it.completed(record) else it } }
+                    viewModelScope.launch {
+                        delay(1_500)
+                        _downloadTasks.update { tasks -> tasks.filterNot { it.id == task.id && it.status == DownloadTaskStatus.COMPLETED } }
+                    }
                     val kind = mediaKindFor(null, record.name)
                     if (kind != MediaKind.VIDEO) {
                         withContext(Dispatchers.IO) {
                             loadDownloadThumbnail(getApplication(), record.uri, kind)
                         }?.let { keepSharperThumbnail(task.asset.handle, it) }
                     }
-                    _downloadTasks.update { it.filterNot { taskItem -> taskItem.id == task.id } }
                     showSnackbar("下载完成，可到下载页查看")
                 }
                 clearDownloadNotif()

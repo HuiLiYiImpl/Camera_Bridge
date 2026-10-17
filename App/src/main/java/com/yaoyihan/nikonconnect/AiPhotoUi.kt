@@ -48,6 +48,18 @@ internal fun AiStyleDialog(
     controller: AiPhotoController, photoKey: String, name: String, source: Bitmap, rotation: Int,
     share: (DownloadRecord) -> Unit, settingsContent: @Composable (String?, () -> Unit) -> Unit, dismiss: () -> Unit,
 ) {
+    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = dismiss, sheetState = sheet, containerColor = BridgeSurface, contentColor = BridgeWhite) {
+        AiStylePanel(controller, photoKey, name, source, rotation, share, settingsContent, dismiss,
+            Modifier.fillMaxWidth().heightIn(max = 640.dp))
+    }
+}
+
+@Composable
+internal fun AiStylePanel(
+    controller: AiPhotoController, photoKey: String, name: String, source: Bitmap, rotation: Int,
+    share: (DownloadRecord) -> Unit, settingsContent: @Composable (String?, () -> Unit) -> Unit, dismiss: () -> Unit, modifier: Modifier = Modifier, embedded: Boolean = false,
+) {
     val context = LocalContext.current
     val config by controller.config.collectAsState()
     val busy by controller.configBusy.collectAsState()
@@ -73,17 +85,16 @@ internal fun AiStyleDialog(
             error = "保存相册需要存储权限，尚未提交生成"
         } else submit()
     }
-    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    ModalBottomSheet(onDismissRequest = dismiss, sheetState = sheet, containerColor = BridgeSurface, contentColor = BridgeWhite) {
+    Column(modifier) {
         Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text("选择 AI 风格", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                Text(if (embedded) config.profileName else "选择 AI 风格", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text("后台处理中 $active/3", color = BridgeWhite.copy(alpha = .6f), style = MaterialTheme.typography.bodySmall)
             }
             IconButton({ settings = true }) { Icon(Icons.Default.Settings, "默认配置与供应商", tint = BridgeWhite) }
-            IconButton(dismiss) { Icon(Icons.Default.Close, "关闭", tint = BridgeWhite) }
+            if (!embedded) IconButton(dismiss) { Icon(Icons.Default.Close, "关闭", tint = BridgeWhite) }
         }
-        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 480.dp), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
+        LazyColumn(Modifier.fillMaxWidth().weight(1f), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)) {
             item {
                 Text(config.profileName, color = BridgeWhite.copy(alpha = .8f), style = MaterialTheme.typography.bodyMedium)
@@ -139,7 +150,7 @@ internal fun AiStyleDialog(
             Icon(Icons.Default.AutoAwesome, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp))
             Text(if (config.key.isBlank()) "配置 API" else "生成并保存相册")
         }
-        Spacer(Modifier.navigationBarsPadding().imePadding())
+        if (!embedded) Spacer(Modifier.navigationBarsPadding().imePadding())
     }
     if (settings) settingsContent(config.profileId.takeIf { config.key.isBlank() }) { settings = false }
     if (skillInfo) AiSkillInfoDialog(style) { skillInfo = false }

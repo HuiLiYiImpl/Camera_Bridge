@@ -98,10 +98,8 @@ private fun RemotePreviewPresetPanel(vm: MainViewModel, fullscreen: Boolean, onD
                     if (color.entry != null) {
                         Text("预览强度 ${(color.intensity * 100).roundToInt()}%", color = BridgeWhite.copy(alpha = .8f),
                             fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp))
-                        Slider(value = color.intensity, onValueChange = vm::setRemotePreviewIntensity,
-                            enabled = !color.loading, modifier = Modifier.fillMaxWidth().height(32.dp),
-                            colors = SliderDefaults.colors(thumbColor = BridgeEmber, activeTrackColor = BridgeEmber,
-                                inactiveTrackColor = BridgeWhite.copy(alpha = .2f)))
+                        BridgeSlider(value = color.intensity, onValueChange = vm::setRemotePreviewIntensity,
+                            enabled = !color.loading, modifier = Modifier.fillMaxWidth().height(32.dp))
                     }
                 }
             }

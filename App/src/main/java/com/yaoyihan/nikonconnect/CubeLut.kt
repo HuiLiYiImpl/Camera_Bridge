@@ -12,6 +12,7 @@ data class CubeLut(
     val values: FloatArray,
     val domainMin: FloatArray,
     val domainMax: FloatArray,
+    val entryId: String? = null,
 )
 
 object CubeLuts {
